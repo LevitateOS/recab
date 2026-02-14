@@ -1,0 +1,11 @@
+[package]
+name = "recab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "A/B slot + boot-selection manager for LevitateOS-style immutable systems"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
