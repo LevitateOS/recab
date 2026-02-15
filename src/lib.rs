@@ -29,3 +29,4 @@ impl Slot {
 pub fn status() -> Result<()> {
     Ok(())
 }
+
