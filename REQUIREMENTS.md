@@ -9,7 +9,7 @@ selection and commit/rollback manager for LevitateOS-style immutable systems.
 
 `recab` is intentionally small: it does not build filesystem trees, download
 packages, or manage recipes. It is the slot state machine glue called by higher
-level tooling (installers, `recipe`, checkpoint harnesses).
+level tooling (installers, `recipe`, stage harnesses).
 
 ---
 
@@ -39,8 +39,8 @@ level tooling (installers, `recipe`, checkpoint harnesses).
 - Stage a trial boot of the inactive slot ("try")
 - Commit the booted slot as good ("commit") or roll back ("rollback")
 
-This exists to support the repo's checkpoint model (notably `CP7` in
-`checkpoints.md`) and the repo-wide A/B default plan (`docs/ab-default-plan.md`).
+This exists to support the repo's stage model (notably `Stage 07` in
+`stages.md`) and the repo-wide A/B default plan (`docs/ab-default-plan.md`).
 
 ### 1.2 Scope
 
@@ -290,7 +290,7 @@ Primary sources for these requirements:
 
 - `tools/recab/README.md` and `tools/recab/CLAUDE.md` (tool scope and intent)
 - `QUALITY.md` (repo-wide CLI/tooling quality expectations)
-- `checkpoints.md` (CP7 Slot B Trial Boot)
+- `stages.md` (Stage 07 Slot B Trial Boot)
 - `docs/ab-default-plan.md` (repo-wide A/B default plan)
 - `tools/recipe/OS_UPGRADES_BRAINDUMP.md` (recipe + A/B upgrade flow)
 - `RalphOS/planning.md` (A/B-only appliances and trial boot + commit model)
@@ -308,19 +308,19 @@ in implementation/tests as each requirement is implemented.
 | REQ-DESIGN-010 | `tools/recab/CLAUDE.md`, `QUALITY.md` | TODO | TODO |
 | REQ-DESIGN-011 | `tools/recab/CLAUDE.md`, `QUALITY.md` | TODO | TODO |
 | REQ-DESIGN-020 | `QUALITY.md` | TODO | TODO |
-| REQ-DESIGN-030 | `RalphOS/planning.md`, `checkpoints.md` | TODO | TODO |
-| REQ-SM-001 | `docs/ab-default-plan.md`, `checkpoints.md` | TODO | TODO |
-| REQ-SM-010 | `docs/ab-default-plan.md`, `checkpoints.md` | TODO | TODO |
-| REQ-SM-011 | `docs/ab-default-plan.md`, `checkpoints.md` | TODO | TODO |
-| REQ-SM-012 | `docs/ab-default-plan.md`, `checkpoints.md` | TODO | TODO |
-| REQ-SM-020 | `docs/ab-default-plan.md`, `checkpoints.md` | TODO | TODO |
+| REQ-DESIGN-030 | `RalphOS/planning.md`, `stages.md` | TODO | TODO |
+| REQ-SM-001 | `docs/ab-default-plan.md`, `stages.md` | TODO | TODO |
+| REQ-SM-010 | `docs/ab-default-plan.md`, `stages.md` | TODO | TODO |
+| REQ-SM-011 | `docs/ab-default-plan.md`, `stages.md` | TODO | TODO |
+| REQ-SM-012 | `docs/ab-default-plan.md`, `stages.md` | TODO | TODO |
+| REQ-SM-020 | `docs/ab-default-plan.md`, `stages.md` | TODO | TODO |
 | REQ-CLI-001 | `tools/recab/src/main.rs`, `tools/recab/README.md` | TODO | TODO |
 | REQ-CLI-002 | `tools/recab/README.md` | TODO | TODO |
 | REQ-CLI-003 | `tools/recab/README.md`, `docs/ab-default-plan.md` | TODO | TODO |
-| REQ-CLI-004 | `docs/ab-default-plan.md`, `checkpoints.md` | TODO | TODO |
+| REQ-CLI-004 | `docs/ab-default-plan.md`, `stages.md` | TODO | TODO |
 | REQ-CLI-005 | `docs/ab-default-plan.md` | TODO | TODO |
 | REQ-CLI-010 | `QUALITY.md` | TODO | TODO |
-| REQ-CLI-011 | `checkpoints.md` | TODO | TODO |
+| REQ-CLI-011 | `stages.md` | TODO | TODO |
 | REQ-LIB-001 | `tools/recab/README.md` | TODO | TODO |
 | REQ-LIB-002 | `tools/recab/src/lib.rs`, `tools/recab/src/main.rs` | TODO | TODO |
 | REQ-LIB-003 | `tools/recab/README.md` | TODO | TODO |
@@ -328,7 +328,7 @@ in implementation/tests as each requirement is implemented.
 | REQ-BACKEND-002 | `docs/ab-default-plan.md` | TODO | TODO |
 | REQ-BACKEND-010 | `docs/ab-default-plan.md`, `IuppiterOS/AB_IMMUTABLE.md` | TODO | TODO |
 | REQ-BACKEND-011 | `IuppiterOS/AB_IMMUTABLE.md` | TODO | TODO |
-| REQ-BACKEND-012 | `docs/ab-default-plan.md`, `checkpoints.md` | TODO | TODO |
+| REQ-BACKEND-012 | `docs/ab-default-plan.md`, `stages.md` | TODO | TODO |
 | REQ-PERSIST-001 | `tools/recab/README.md`, `docs/ab-default-plan.md` | TODO | TODO |
 | REQ-PERSIST-002 | `QUALITY.md` | TODO | TODO |
 | REQ-AUDIT-001 | `RalphOS/planning.md` | TODO | TODO |
