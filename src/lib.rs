@@ -1030,6 +1030,8 @@ mod tests {
         prefix: String,
         set_default_calls: Vec<Slot>,
         set_trial_calls: Vec<Slot>,
+        fail_set_default: bool,
+        fail_set_trial: bool,
     }
 
     impl MockBackend {
@@ -1040,6 +1042,8 @@ mod tests {
                 prefix: "iuppiter".to_string(),
                 set_default_calls: Vec::new(),
                 set_trial_calls: Vec::new(),
+                fail_set_default: false,
+                fail_set_trial: false,
             }
         }
     }
@@ -1055,6 +1059,9 @@ mod tests {
 
         fn set_default_slot(&self, slot: Slot) -> Result<()> {
             let mut inner = self.lock().expect("lock");
+            if inner.fail_set_default {
+                return Err(anyhow!("forced backend failure in set_default_slot"));
+            }
             inner.default = Some(slot);
             inner.set_default_calls.push(slot);
             Ok(())
@@ -1062,6 +1069,9 @@ mod tests {
 
         fn set_trial_slot(&self, slot: Slot) -> Result<()> {
             let mut inner = self.lock().expect("lock");
+            if inner.fail_set_trial {
+                return Err(anyhow!("forced backend failure in set_trial_slot"));
+            }
             inner.set_trial_calls.push(slot);
             Ok(())
         }
@@ -1240,5 +1250,115 @@ mod tests {
 
         let err = tagged_err(ErrorClass::PartialUpdate, "state restore failed");
         assert_eq!(stable_exit_code(&err), EXIT_CODE_PARTIAL_UPDATE);
+    }
+
+    #[test]
+    fn set_next_reverts_state_when_backend_trial_write_fails() {
+        let temp = tempdir().expect("tempdir");
+        let store = TempStore::new(temp.path());
+        let backend = std::sync::Mutex::new(MockBackend::new(Slot::A, Some(Slot::A)));
+
+        let original = PersistentState {
+            schema: STATE_SCHEMA_VERSION,
+            known_good_slot: Some(Slot::A),
+            pending_trial_slot: None,
+            last_operation: Some("seed".to_string()),
+            last_transition_unix: Some(42),
+        };
+        store.save(&original).expect("seed state");
+
+        {
+            let mut inner = backend.lock().expect("lock");
+            inner.fail_set_trial = true;
+        }
+
+        let err = set_next_with(&backend, &store, Slot::B).expect_err("set-next should fail");
+        assert!(
+            format!("{err:#}").contains("restored previous recab state snapshot"),
+            "error should include state-restore context"
+        );
+
+        let loaded = store.load().expect("load");
+        assert_eq!(loaded.known_good_slot, original.known_good_slot);
+        assert_eq!(loaded.pending_trial_slot, original.pending_trial_slot);
+        assert_eq!(loaded.last_operation, original.last_operation);
+        assert_eq!(loaded.last_transition_unix, original.last_transition_unix);
+    }
+
+    #[test]
+    fn commit_reverts_state_when_backend_default_write_fails() {
+        let temp = tempdir().expect("tempdir");
+        let store = TempStore::new(temp.path());
+        let backend = std::sync::Mutex::new(MockBackend::new(Slot::B, Some(Slot::A)));
+
+        let original = PersistentState {
+            schema: STATE_SCHEMA_VERSION,
+            known_good_slot: Some(Slot::A),
+            pending_trial_slot: Some(Slot::B),
+            last_operation: Some("set-next-B".to_string()),
+            last_transition_unix: Some(11),
+        };
+        store.save(&original).expect("seed state");
+
+        {
+            let mut inner = backend.lock().expect("lock");
+            inner.fail_set_default = true;
+        }
+
+        let err = commit_with(&backend, &store).expect_err("commit should fail");
+        assert!(
+            format!("{err:#}").contains("restored previous recab state snapshot"),
+            "error should include state-restore context"
+        );
+
+        let loaded = store.load().expect("load");
+        assert_eq!(loaded.known_good_slot, original.known_good_slot);
+        assert_eq!(loaded.pending_trial_slot, original.pending_trial_slot);
+        assert_eq!(loaded.last_operation, original.last_operation);
+        assert_eq!(loaded.last_transition_unix, original.last_transition_unix);
+    }
+
+    #[test]
+    fn rollback_reverts_state_when_backend_default_write_fails() {
+        let temp = tempdir().expect("tempdir");
+        let store = TempStore::new(temp.path());
+        let backend = std::sync::Mutex::new(MockBackend::new(Slot::B, Some(Slot::B)));
+
+        let original = PersistentState {
+            schema: STATE_SCHEMA_VERSION,
+            known_good_slot: Some(Slot::A),
+            pending_trial_slot: Some(Slot::B),
+            last_operation: Some("set-next-B".to_string()),
+            last_transition_unix: Some(11),
+        };
+        store.save(&original).expect("seed state");
+
+        {
+            let mut inner = backend.lock().expect("lock");
+            inner.fail_set_default = true;
+        }
+
+        let err = rollback_with(&backend, &store).expect_err("rollback should fail");
+        assert!(
+            format!("{err:#}").contains("restored previous recab state snapshot"),
+            "error should include state-restore context"
+        );
+
+        let loaded = store.load().expect("load");
+        assert_eq!(loaded.known_good_slot, original.known_good_slot);
+        assert_eq!(loaded.pending_trial_slot, original.pending_trial_slot);
+        assert_eq!(loaded.last_operation, original.last_operation);
+        assert_eq!(loaded.last_transition_unix, original.last_transition_unix);
+    }
+
+    #[test]
+    fn validate_uefi_paths_fails_without_efivars() {
+        let temp = tempdir().expect("tempdir");
+        let efi = temp.path().join("efi");
+        fs::create_dir_all(&efi).expect("efi dir");
+
+        let err = validate_uefi_paths(&efi, &temp.path().join("missing-efivars"))
+            .expect_err("expected missing efivars error");
+        assert_eq!(stable_exit_code(&err), EXIT_CODE_BACKEND_UNAVAILABLE);
     }
 }
