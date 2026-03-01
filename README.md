@@ -24,8 +24,11 @@ Status: implemented with a systemd-boot backend and persistent local state.
 
 - `status` reports active/inactive slot, default slot, known-good slot, trial-pending state, and next boot target.
 - `set-next` uses `bootctl set-oneshot` to stage a one-shot trial boot.
+  One-shot trial plus an already-stable default entry provides bounded-attempt fallback.
 - `commit` sets the currently active slot as known-good and default (`bootctl set-default` + `loader.conf` update).
 - `rollback` sets previously known-good slot as default.
+- `set-next` refuses to run if loader default is not aligned to known-good fallback.
+  Run `recab commit` first to repair fallback invariants.
 
 ## Persistence
 
@@ -34,9 +37,26 @@ Status: implemented with a systemd-boot backend and persistent local state.
 
 State writes are atomic (`temp file + rename`).
 
+## Backend Preconditions
+
+`recab` currently targets a `systemd-boot` backend and fails fast unless host
+UEFI runtime and efivars are available:
+
+- `/sys/firmware/efi`
+- `/sys/firmware/efi/efivars`
+
 ## Security
 
 - Mutating operations (`set-next`, `commit`, `rollback`) require root.
+
+## Exit Codes
+
+- `0`: success
+- `1`: generic failure
+- `13`: permission failure (root required for mutating operations)
+- `20`: backend unavailable/misconfigured (non-UEFI, missing efivars, missing `bootctl`)
+- `21`: state or slot-detection failure (missing known-good/default/prefix/entries)
+- `22`: mutation safety failure (operation failed and state-restore failed)
 
 ## Environment Overrides
 
@@ -45,6 +65,8 @@ State writes are atomic (`temp file + rename`).
 - `RECAB_AUDIT_PATH` (default `/var/lib/recab/audit.log`)
 - `RECAB_OS_RELEASE_PATH` (default `/etc/os-release`)
 - `RECAB_PROC_CMDLINE_PATH` (default `/proc/cmdline`)
+- `RECAB_SYS_FIRMWARE_EFI_PATH` (default `/sys/firmware/efi`)
+- `RECAB_EFIVARS_PATH` (default `/sys/firmware/efi/efivars`)
 - `RECAB_BOOTCTL_BIN` (default `bootctl`)
 - `RECAB_ENTRY_PREFIX` (override inferred `<prefix>-a.conf` / `<prefix>-b.conf`)
 

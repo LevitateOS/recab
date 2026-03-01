@@ -22,9 +22,87 @@ const STATE_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_BOOT_ROOT: &str = "/boot";
 const DEFAULT_OS_RELEASE: &str = "/etc/os-release";
 const DEFAULT_PROC_CMDLINE: &str = "/proc/cmdline";
+const DEFAULT_SYS_FIRMWARE_EFI: &str = "/sys/firmware/efi";
+const DEFAULT_EFIVARS_PATH: &str = "/sys/firmware/efi/efivars";
 const DEFAULT_STATE_PATH: &str = "/var/lib/recab/state.json";
 const DEFAULT_AUDIT_PATH: &str = "/var/lib/recab/audit.log";
 const DEFAULT_BOOTCTL_BIN: &str = "bootctl";
+
+pub const EXIT_CODE_GENERIC: u8 = 1;
+pub const EXIT_CODE_PERMISSION: u8 = 13;
+pub const EXIT_CODE_BACKEND_UNAVAILABLE: u8 = 20;
+pub const EXIT_CODE_STATE_OR_DETECTION: u8 = 21;
+pub const EXIT_CODE_PARTIAL_UPDATE: u8 = 22;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorClass {
+    Permission,
+    BackendUnavailable,
+    StateOrDetection,
+    PartialUpdate,
+}
+
+impl ErrorClass {
+    fn code(self) -> u8 {
+        match self {
+            ErrorClass::Permission => EXIT_CODE_PERMISSION,
+            ErrorClass::BackendUnavailable => EXIT_CODE_BACKEND_UNAVAILABLE,
+            ErrorClass::StateOrDetection => EXIT_CODE_STATE_OR_DETECTION,
+            ErrorClass::PartialUpdate => EXIT_CODE_PARTIAL_UPDATE,
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            ErrorClass::Permission => "RECAB_ERR_PERMISSION",
+            ErrorClass::BackendUnavailable => "RECAB_ERR_BACKEND",
+            ErrorClass::StateOrDetection => "RECAB_ERR_STATE",
+            ErrorClass::PartialUpdate => "RECAB_ERR_PARTIAL_UPDATE",
+        }
+    }
+}
+
+fn tagged_err(class: ErrorClass, message: impl Into<String>) -> anyhow::Error {
+    anyhow!("[{}] {}", class.tag(), message.into())
+}
+
+fn has_class_tag(err: &anyhow::Error, class: ErrorClass) -> bool {
+    let tag = class.tag();
+    err.chain().any(|cause| cause.to_string().contains(tag))
+}
+
+/// Stable exit-code mapping for recab CLI and callers.
+pub fn stable_exit_code(err: &anyhow::Error) -> u8 {
+    for class in [
+        ErrorClass::Permission,
+        ErrorClass::BackendUnavailable,
+        ErrorClass::PartialUpdate,
+        ErrorClass::StateOrDetection,
+    ] {
+        if has_class_tag(err, class) {
+            return class.code();
+        }
+    }
+
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    if msg.contains("must run as root") || msg.contains("requires root privileges") {
+        return EXIT_CODE_PERMISSION;
+    }
+    if msg.contains("systemd-boot backend requires")
+        || msg.contains("missing '/sys/firmware/efi'")
+        || msg.contains("missing efivarfs")
+    {
+        return EXIT_CODE_BACKEND_UNAVAILABLE;
+    }
+    if msg.contains("unable to determine active slot")
+        || msg.contains("unable to determine a/b entry prefix")
+        || msg.contains("known-good slot missing")
+        || msg.contains("loader default slot")
+    {
+        return EXIT_CODE_STATE_OR_DETECTION;
+    }
+    EXIT_CODE_GENERIC
+}
 
 /// System slot identifier (A/B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -110,7 +188,7 @@ fn status_with<B: BootBackend, S: StateStore>(backend: &B, store: &S) -> Result<
     let active = backend.active_slot()?;
     let default = backend.default_slot()?;
     let entry_prefix = backend.entry_prefix()?;
-    let state = store.load()?;
+    let state = load_state(store)?;
     Ok(compose_status(active, default, &state, entry_prefix))
 }
 
@@ -121,90 +199,155 @@ fn set_next_with<B: BootBackend, S: StateStore>(
 ) -> Result<Status> {
     let active = backend.active_slot()?;
     let default_before = backend.default_slot()?;
-    let mut state = store.load()?;
-    let previous = state.clone();
+    let entry_prefix = backend.entry_prefix()?;
+    let previous = load_state(store)?;
+    let mut next_state = previous.clone();
+
+    let fallback_slot = previous
+        .known_good_slot
+        .or(default_before)
+        .unwrap_or(active);
 
     if active == slot {
-        state.pending_trial_slot = None;
-        state.last_operation = Some("set-next-noop-active".to_string());
-        state.last_transition_unix = Some(now_unix_secs()?);
-        store.save(&state)?;
-        store.append_audit(&AuditEvent::new(
-            "set-next-noop-active",
+        next_state.pending_trial_slot = None;
+        next_state.last_operation = Some("set-next-noop-active".to_string());
+        next_state.last_transition_unix = Some(now_unix_secs()?);
+        save_state(store, &next_state, "set-next-noop-active")?;
+        append_audit_best_effort(
+            store,
+            &AuditEvent::new("set-next-noop-active", active, &previous, &next_state)?,
+        );
+        return Ok(compose_status(
             active,
-            &previous,
-            &state,
-        )?)?;
-        return status_with(backend, store);
+            default_before,
+            &next_state,
+            entry_prefix,
+        ));
     }
 
-    backend.set_trial_slot(slot).with_context(|| {
+    if previous.pending_trial_slot == Some(slot) {
+        return Ok(compose_status(
+            active,
+            default_before,
+            &previous,
+            entry_prefix,
+        ));
+    }
+
+    if default_before != Some(fallback_slot) {
+        return Err(tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "cannot stage trial boot: loader default slot ({}) does not match known-good slot ({fallback_slot}).\n\
+Run 'recab commit' to set a stable fallback default before 'recab set-next {slot}'.",
+                default_before
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        ));
+    }
+
+    next_state.known_good_slot = Some(fallback_slot);
+    next_state.pending_trial_slot = Some(slot);
+    next_state.last_operation = Some(format!("set-next-{}", slot.as_letter()));
+    next_state.last_transition_unix = Some(now_unix_secs()?);
+    save_state(store, &next_state, "set-next")?;
+
+    if let Err(err) = backend.set_trial_slot(slot).with_context(|| {
         format!(
             "failed to stage trial boot for slot {} via systemd-boot backend",
             slot
         )
-    })?;
-
-    if state.known_good_slot.is_none() {
-        state.known_good_slot = Some(default_before.unwrap_or(active));
+    }) {
+        return Err(revert_state_or_escalate(store, &previous, "set-next", err));
     }
-    state.pending_trial_slot = Some(slot);
-    state.last_operation = Some(format!("set-next-{}", slot.as_letter()));
-    state.last_transition_unix = Some(now_unix_secs()?);
-    store.save(&state)?;
-    store.append_audit(&AuditEvent::new("set-next", active, &previous, &state)?)?;
 
-    status_with(backend, store)
+    append_audit_best_effort(
+        store,
+        &AuditEvent::new("set-next", active, &previous, &next_state)?,
+    );
+
+    Ok(compose_status(
+        active,
+        default_before,
+        &next_state,
+        entry_prefix,
+    ))
 }
 
 fn commit_with<B: BootBackend, S: StateStore>(backend: &B, store: &S) -> Result<Status> {
     let active = backend.active_slot()?;
-    let mut state = store.load()?;
-    let previous = state.clone();
+    let entry_prefix = backend.entry_prefix()?;
+    let previous = load_state(store)?;
+    let mut next_state = previous.clone();
 
-    backend.set_default_slot(active).with_context(|| {
+    next_state.known_good_slot = Some(active);
+    next_state.pending_trial_slot = None;
+    next_state.last_operation = Some(format!("commit-{}", active.as_letter()));
+    next_state.last_transition_unix = Some(now_unix_secs()?);
+    save_state(store, &next_state, "commit")?;
+
+    if let Err(err) = backend.set_default_slot(active).with_context(|| {
         format!(
             "failed to set slot {} as default via systemd-boot backend",
             active
         )
-    })?;
+    }) {
+        return Err(revert_state_or_escalate(store, &previous, "commit", err));
+    }
 
-    state.known_good_slot = Some(active);
-    state.pending_trial_slot = None;
-    state.last_operation = Some(format!("commit-{}", active.as_letter()));
-    state.last_transition_unix = Some(now_unix_secs()?);
-    store.save(&state)?;
-    store.append_audit(&AuditEvent::new("commit", active, &previous, &state)?)?;
-
-    status_with(backend, store)
+    append_audit_best_effort(
+        store,
+        &AuditEvent::new("commit", active, &previous, &next_state)?,
+    );
+    Ok(compose_status(
+        active,
+        Some(active),
+        &next_state,
+        entry_prefix,
+    ))
 }
 
 fn rollback_with<B: BootBackend, S: StateStore>(backend: &B, store: &S) -> Result<Status> {
     let active = backend.active_slot()?;
-    let mut state = store.load()?;
-    let previous = state.clone();
+    let entry_prefix = backend.entry_prefix()?;
+    let previous = load_state(store)?;
+    let mut next_state = previous.clone();
 
-    let known_good = state.known_good_slot.ok_or_else(|| {
-        anyhow!(
-            "cannot rollback: known-good slot missing from state '{}'",
-            store.state_path().display()
+    let known_good = next_state.known_good_slot.ok_or_else(|| {
+        tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "cannot rollback: known-good slot missing from state '{}'",
+                store.state_path().display()
+            ),
         )
     })?;
 
-    backend.set_default_slot(known_good).with_context(|| {
+    next_state.pending_trial_slot = None;
+    next_state.last_operation = Some(format!("rollback-to-{}", known_good.as_letter()));
+    next_state.last_transition_unix = Some(now_unix_secs()?);
+    save_state(store, &next_state, "rollback")?;
+
+    if let Err(err) = backend.set_default_slot(known_good).with_context(|| {
         format!(
             "failed to set known-good slot {} as default for rollback",
             known_good
         )
-    })?;
+    }) {
+        return Err(revert_state_or_escalate(store, &previous, "rollback", err));
+    }
 
-    state.pending_trial_slot = None;
-    state.last_operation = Some(format!("rollback-to-{}", known_good.as_letter()));
-    state.last_transition_unix = Some(now_unix_secs()?);
-    store.save(&state)?;
-    store.append_audit(&AuditEvent::new("rollback", active, &previous, &state)?)?;
-
-    status_with(backend, store)
+    append_audit_best_effort(
+        store,
+        &AuditEvent::new("rollback", active, &previous, &next_state)?,
+    );
+    Ok(compose_status(
+        active,
+        Some(known_good),
+        &next_state,
+        entry_prefix,
+    ))
 }
 
 fn compose_status(
@@ -230,9 +373,61 @@ fn ensure_root() -> Result<()> {
     // SAFETY: geteuid has no preconditions and does not dereference pointers.
     let euid = unsafe { libc::geteuid() };
     if euid != 0 {
-        bail!("must run as root for mutating recab operations");
+        return Err(tagged_err(
+            ErrorClass::Permission,
+            "must run as root for mutating recab operations",
+        ));
     }
     Ok(())
+}
+
+fn load_state<S: StateStore>(store: &S) -> Result<PersistentState> {
+    store.load().map_err(|err| {
+        tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "failed loading recab state '{}': {err:#}",
+                store.state_path().display()
+            ),
+        )
+    })
+}
+
+fn save_state<S: StateStore>(store: &S, state: &PersistentState, operation: &str) -> Result<()> {
+    store.save(state).map_err(|err| {
+        tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "failed writing recab state during {operation} to '{}': {err:#}",
+                store.state_path().display()
+            ),
+        )
+    })
+}
+
+fn append_audit_best_effort<S: StateStore>(store: &S, event: &AuditEvent) {
+    let _ = store.append_audit(event);
+}
+
+fn revert_state_or_escalate<S: StateStore>(
+    store: &S,
+    previous: &PersistentState,
+    operation: &str,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    match save_state(store, previous, &format!("{operation}-revert")) {
+        Ok(()) => cause.context(format!(
+            "{operation} aborted; restored previous recab state snapshot"
+        )),
+        Err(revert_err) => tagged_err(
+            ErrorClass::PartialUpdate,
+            format!(
+                "{operation} failed and state restore also failed.\n\
+primary error: {cause:#}\n\
+state-restore error: {revert_err:#}"
+            ),
+        ),
+    }
 }
 
 fn now_unix_secs() -> Result<u64> {
@@ -398,6 +593,8 @@ struct SystemdBootBackend {
     entries_dir: PathBuf,
     os_release_path: PathBuf,
     proc_cmdline_path: PathBuf,
+    sys_firmware_efi_path: PathBuf,
+    efivars_path: PathBuf,
     bootctl_bin: String,
 }
 
@@ -414,6 +611,12 @@ impl SystemdBootBackend {
         let proc_cmdline_path = std::env::var("RECAB_PROC_CMDLINE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(DEFAULT_PROC_CMDLINE));
+        let sys_firmware_efi_path = std::env::var("RECAB_SYS_FIRMWARE_EFI_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_SYS_FIRMWARE_EFI));
+        let efivars_path = std::env::var("RECAB_EFIVARS_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_EFIVARS_PATH));
         let bootctl_bin =
             std::env::var("RECAB_BOOTCTL_BIN").unwrap_or_else(|_| DEFAULT_BOOTCTL_BIN.to_string());
 
@@ -422,8 +625,14 @@ impl SystemdBootBackend {
             entries_dir,
             os_release_path,
             proc_cmdline_path,
+            sys_firmware_efi_path,
+            efivars_path,
             bootctl_bin,
         }
+    }
+
+    fn ensure_uefi_ready(&self) -> Result<()> {
+        validate_uefi_paths(&self.sys_firmware_efi_path, &self.efivars_path)
     }
 
     fn entry_filename_for(&self, slot: Slot) -> Result<String> {
@@ -525,12 +734,15 @@ impl SystemdBootBackend {
     fn ensure_entry_exists(&self, entry: &str) -> Result<()> {
         let path = self.entries_dir.join(entry);
         if !path.is_file() {
-            bail!(
-                "required systemd-boot entry missing: '{}'.\n\
+            return Err(tagged_err(
+                ErrorClass::StateOrDetection,
+                format!(
+                    "required systemd-boot entry missing: '{}'.\n\
 Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf).",
-                path.display(),
-                self.entries_dir.display()
-            );
+                    path.display(),
+                    self.entries_dir.display()
+                ),
+            ));
         }
         Ok(())
     }
@@ -579,11 +791,15 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
 
 impl BootBackend for SystemdBootBackend {
     fn active_slot(&self) -> Result<Slot> {
+        self.ensure_uefi_ready()?;
         if let Ok(forced) = std::env::var("RECAB_ACTIVE_SLOT") {
             return match forced.to_ascii_uppercase().as_str() {
                 "A" => Ok(Slot::A),
                 "B" => Ok(Slot::B),
-                _ => bail!("RECAB_ACTIVE_SLOT must be 'A' or 'B'"),
+                _ => Err(tagged_err(
+                    ErrorClass::StateOrDetection,
+                    "RECAB_ACTIVE_SLOT must be 'A' or 'B'",
+                )),
             };
         }
 
@@ -595,15 +811,19 @@ impl BootBackend for SystemdBootBackend {
             return Ok(default_slot);
         }
 
-        bail!(
-            "unable to determine active slot from '{}' or loader default '{}'.\n\
+        Err(tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "unable to determine active slot from '{}' or loader default '{}'.\n\
 Set RECAB_ACTIVE_SLOT=A|B to override detection in constrained environments.",
-            self.proc_cmdline_path.display(),
-            self.loader_conf_path.display()
-        )
+                self.proc_cmdline_path.display(),
+                self.loader_conf_path.display()
+            ),
+        ))
     }
 
     fn default_slot(&self) -> Result<Option<Slot>> {
+        self.ensure_uefi_ready()?;
         let Some(entry) = self.parse_loader_default_entry()? else {
             return Ok(None);
         };
@@ -611,6 +831,7 @@ Set RECAB_ACTIVE_SLOT=A|B to override detection in constrained environments.",
     }
 
     fn set_default_slot(&self, slot: Slot) -> Result<()> {
+        self.ensure_uefi_ready()?;
         let entry = self.entry_filename_for(slot)?;
         self.ensure_entry_exists(&entry)?;
         self.update_loader_default(&entry)?;
@@ -623,12 +844,16 @@ Set RECAB_ACTIVE_SLOT=A|B to override detection in constrained environments.",
     }
 
     fn set_trial_slot(&self, slot: Slot) -> Result<()> {
+        self.ensure_uefi_ready()?;
         if !self.bootctl_available() {
-            bail!(
-                "systemd-boot backend requires '{}' in PATH for trial boot (set-next).\n\
+            return Err(tagged_err(
+                ErrorClass::BackendUnavailable,
+                format!(
+                    "systemd-boot backend requires '{}' in PATH for trial boot (set-next).\n\
 Install systemd-boot userspace tools and retry, or ensure RECAB_BOOTCTL_BIN points to bootctl.",
-                self.bootctl_bin
-            );
+                    self.bootctl_bin
+                ),
+            ));
         }
         let entry = self.entry_filename_for(slot)?;
         self.ensure_entry_exists(&entry)?;
@@ -638,9 +863,13 @@ Install systemd-boot userspace tools and retry, or ensure RECAB_BOOTCTL_BIN poin
     }
 
     fn entry_prefix(&self) -> Result<String> {
+        self.ensure_uefi_ready()?;
         if let Ok(prefix) = std::env::var("RECAB_ENTRY_PREFIX") {
             if prefix.trim().is_empty() {
-                bail!("RECAB_ENTRY_PREFIX is set but empty");
+                return Err(tagged_err(
+                    ErrorClass::StateOrDetection,
+                    "RECAB_ENTRY_PREFIX is set but empty",
+                ));
             }
             return Ok(prefix);
         }
@@ -661,11 +890,14 @@ Install systemd-boot userspace tools and retry, or ensure RECAB_BOOTCTL_BIN poin
             return Ok(prefix);
         }
 
-        bail!(
-            "unable to determine A/B entry prefix in '{}'. Expected '<prefix>-a.conf' and '<prefix>-b.conf'.\n\
+        Err(tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "unable to determine A/B entry prefix in '{}'. Expected '<prefix>-a.conf' and '<prefix>-b.conf'.\n\
 Set RECAB_ENTRY_PREFIX explicitly (for example: RECAB_ENTRY_PREFIX=iuppiter).",
-            self.entries_dir.display()
-        )
+                self.entries_dir.display()
+            ),
+        ))
     }
 }
 
@@ -761,6 +993,30 @@ fn os_release_id(path: &Path) -> Result<Option<String>> {
 fn entry_pair_exists(entries_dir: &Path, prefix: &str) -> bool {
     entries_dir.join(format!("{prefix}-a.conf")).is_file()
         && entries_dir.join(format!("{prefix}-b.conf")).is_file()
+}
+
+fn validate_uefi_paths(sys_firmware_efi_path: &Path, efivars_path: &Path) -> Result<()> {
+    if !sys_firmware_efi_path.is_dir() {
+        return Err(tagged_err(
+            ErrorClass::BackendUnavailable,
+            format!(
+                "systemd-boot backend requires UEFI runtime, but '{}' is missing.\n\
+This host does not appear to be booted in UEFI mode.",
+                sys_firmware_efi_path.display()
+            ),
+        ));
+    }
+    if !efivars_path.is_dir() {
+        return Err(tagged_err(
+            ErrorClass::BackendUnavailable,
+            format!(
+                "systemd-boot backend requires mounted efivarfs, but '{}' is missing.\n\
+Mount efivarfs or boot under UEFI before running recab.",
+                efivars_path.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -933,5 +1189,56 @@ mod tests {
         let after_rollback = rollback_with(&backend, &store).expect("rollback");
         assert_eq!(after_rollback.default_slot, Some(Slot::B));
         assert_eq!(after_rollback.known_good_slot, Some(Slot::B));
+    }
+
+    #[test]
+    fn set_next_is_idempotent_when_same_trial_already_pending() {
+        let temp = tempdir().expect("tempdir");
+        let store = TempStore::new(temp.path());
+        let backend = std::sync::Mutex::new(MockBackend::new(Slot::A, Some(Slot::A)));
+
+        let first = set_next_with(&backend, &store, Slot::B).expect("first set-next");
+        assert_eq!(first.next_boot, Some(Slot::B));
+
+        let second = set_next_with(&backend, &store, Slot::B).expect("second set-next");
+        assert_eq!(second.next_boot, Some(Slot::B));
+
+        let inner = backend.lock().expect("lock");
+        assert_eq!(inner.set_trial_calls, vec![Slot::B]);
+    }
+
+    #[test]
+    fn set_next_requires_default_to_match_known_good_for_fallback() {
+        let temp = tempdir().expect("tempdir");
+        let store = TempStore::new(temp.path());
+        let backend = std::sync::Mutex::new(MockBackend::new(Slot::A, Some(Slot::B)));
+
+        let mut seeded = store.load().expect("load");
+        seeded.known_good_slot = Some(Slot::A);
+        store.save(&seeded).expect("save");
+
+        let err = set_next_with(&backend, &store, Slot::B).expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("loader default slot"));
+    }
+
+    #[test]
+    fn validate_uefi_paths_fails_without_efi_runtime() {
+        let temp = tempdir().expect("tempdir");
+        let efivars = temp.path().join("efivars");
+        fs::create_dir_all(&efivars).expect("efivars dir");
+
+        let err = validate_uefi_paths(&temp.path().join("missing-efi"), &efivars)
+            .expect_err("expected missing efi error");
+        assert_eq!(stable_exit_code(&err), EXIT_CODE_BACKEND_UNAVAILABLE);
+    }
+
+    #[test]
+    fn stable_exit_code_maps_tagged_errors() {
+        let err = tagged_err(ErrorClass::Permission, "must run as root");
+        assert_eq!(stable_exit_code(&err), EXIT_CODE_PERMISSION);
+
+        let err = tagged_err(ErrorClass::PartialUpdate, "state restore failed");
+        assert_eq!(stable_exit_code(&err), EXIT_CODE_PARTIAL_UPDATE);
     }
 }

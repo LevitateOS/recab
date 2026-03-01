@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process::ExitCode;
 
-use recab::{Slot, Status};
+use recab::{stable_exit_code, Slot, Status};
 
 #[derive(Parser)]
 #[command(name = "recab")]
@@ -54,7 +54,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("recab: {err:#}");
-            ExitCode::from(exit_code_for_error(&err))
+            ExitCode::from(stable_exit_code(&err))
         }
     }
 }
@@ -112,21 +112,4 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
     );
     println!("entry_prefix: {}", st.entry_prefix);
     Ok(())
-}
-
-fn exit_code_for_error(err: &anyhow::Error) -> u8 {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    if msg.contains("must run as root") || msg.contains("requires root privileges") {
-        return 13;
-    }
-    if msg.contains("systemd-boot backend requires") {
-        return 20;
-    }
-    if msg.contains("unable to determine active slot")
-        || msg.contains("unable to determine a/b entry prefix")
-        || msg.contains("known-good slot missing")
-    {
-        return 21;
-    }
-    1
 }
