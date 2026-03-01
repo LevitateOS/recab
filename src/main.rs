@@ -1,9 +1,11 @@
-use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use std::process::ExitCode;
+
+use recab::{Slot, Status};
 
 #[derive(Parser)]
 #[command(name = "recab")]
-#[command(about = "A/B slot + boot-selection manager (scaffold)")]
+#[command(about = "A/B slot + boot-selection manager")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -13,18 +15,22 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show detected A/B status
-    Status,
+    Status {
+        /// Emit machine-readable status JSON.
+        #[arg(long)]
+        json: bool,
+    },
 
-    /// Mark a slot as the next boot target (trial boot semantics TBD)
+    /// Stage a one-shot trial boot for a slot.
     SetNext {
-        #[arg(value_enum)]
+        #[arg(value_enum, ignore_case = true)]
         slot: SlotArg,
     },
 
-    /// Commit the currently booted slot as "good" (backend TBD)
+    /// Commit currently booted slot as known-good and default.
     Commit,
 
-    /// Roll back to the previously known-good slot (backend TBD)
+    /// Configure next boot to previously known-good slot.
     Rollback,
 }
 
@@ -34,24 +40,93 @@ enum SlotArg {
     B,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    match cli.cmd {
-        Command::Status => {
-            recab::status()?;
-            println!("recab: TODO implement status backend");
-        }
-        Command::SetNext { slot } => {
-            println!("recab: TODO set-next slot {:?}", slot);
-        }
-        Command::Commit => {
-            println!("recab: TODO commit current slot");
-        }
-        Command::Rollback => {
-            println!("recab: TODO rollback");
+impl From<SlotArg> for Slot {
+    fn from(value: SlotArg) -> Self {
+        match value {
+            SlotArg::A => Slot::A,
+            SlotArg::B => Slot::B,
         }
     }
+}
 
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("recab: {err:#}");
+            ExitCode::from(exit_code_for_error(&err))
+        }
+    }
+}
+
+fn run() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    match cli.cmd {
+        Command::Status { json } => {
+            let st = recab::status()?;
+            print_status(&st, json)?;
+        }
+        Command::SetNext { slot } => {
+            recab::set_next(slot.into())?;
+        }
+        Command::Commit => {
+            recab::commit()?;
+        }
+        Command::Rollback => {
+            recab::rollback()?;
+        }
+    }
     Ok(())
+}
+
+fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
+    if json {
+        let payload = serde_json::to_string_pretty(st)?;
+        println!("{payload}");
+        return Ok(());
+    }
+
+    println!("active: {}", st.active_slot);
+    println!("inactive: {}", st.inactive_slot);
+    println!(
+        "known_good: {}",
+        st.known_good_slot
+            .map(|slot| slot.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "default: {}",
+        st.default_slot
+            .map(|slot| slot.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    println!(
+        "trial_pending: {}",
+        if st.trial_pending { "yes" } else { "no" }
+    );
+    println!(
+        "next_boot: {}",
+        st.next_boot
+            .map(|slot| slot.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    println!("entry_prefix: {}", st.entry_prefix);
+    Ok(())
+}
+
+fn exit_code_for_error(err: &anyhow::Error) -> u8 {
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    if msg.contains("must run as root") || msg.contains("requires root privileges") {
+        return 13;
+    }
+    if msg.contains("systemd-boot backend requires") {
+        return 20;
+    }
+    if msg.contains("unable to determine active slot")
+        || msg.contains("unable to determine a/b entry prefix")
+        || msg.contains("known-good slot missing")
+    {
+        return 21;
+    }
+    1
 }
