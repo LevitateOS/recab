@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -747,9 +747,49 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
         Ok(())
     }
 
-    fn detect_slot_from_cmdline(&self) -> Option<Slot> {
-        let cmdline = fs::read_to_string(&self.proc_cmdline_path).ok()?;
-        slot_from_cmdline(&cmdline)
+    fn detect_slot_from_cmdline(&self) -> Result<Option<Slot>> {
+        let cmdline = match fs::read_to_string(&self.proc_cmdline_path) {
+            Ok(cmdline) => cmdline,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(tagged_err(
+                    ErrorClass::StateOrDetection,
+                    format!(
+                        "failed reading kernel cmdline '{}': {err}",
+                        self.proc_cmdline_path.display()
+                    ),
+                ))
+            }
+        };
+
+        if let Some(slot) = slot_from_cmdline(&cmdline) {
+            return Ok(Some(slot));
+        }
+
+        let Some(root_selector) = root_selector_from_cmdline(&cmdline) else {
+            return Ok(None);
+        };
+        if !root_selector.is_slot_mapping_candidate() {
+            return Ok(None);
+        }
+
+        let prefix = self.entry_prefix()?;
+        let slot = slot_from_entry_roots(&self.entries_dir, &prefix, &root_selector)?;
+        if slot.is_some() {
+            return Ok(slot);
+        }
+
+        Err(tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "unable to map active root selector '{root_selector}' to A/B entries under '{}' (prefix '{}').\n\
+Expected matching root=... options in '{}-a.conf' and '{}-b.conf'.",
+                self.entries_dir.display(),
+                prefix,
+                prefix,
+                prefix
+            ),
+        ))
     }
 
     fn parse_loader_default_entry(&self) -> Result<Option<String>> {
@@ -803,7 +843,7 @@ impl BootBackend for SystemdBootBackend {
             };
         }
 
-        if let Some(slot) = self.detect_slot_from_cmdline() {
+        if let Some(slot) = self.detect_slot_from_cmdline()? {
             return Ok(slot);
         }
 
@@ -910,6 +950,131 @@ fn slot_from_cmdline(cmdline: &str) -> Option<Slot> {
         return Some(Slot::B);
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RootSelector {
+    PartUuid(String),
+    Uuid(String),
+    Label(String),
+    DevicePath(String),
+}
+
+impl RootSelector {
+    fn parse(raw: &str) -> Option<Self> {
+        let token = raw.trim().trim_matches('"').trim_matches('\'').trim();
+        if token.is_empty() {
+            return None;
+        }
+
+        let lower = token.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("partuuid=") {
+            return Some(Self::PartUuid(value.to_string()));
+        }
+        if let Some(value) = lower.strip_prefix("/dev/disk/by-partuuid/") {
+            return Some(Self::PartUuid(value.to_string()));
+        }
+        if let Some(value) = lower.strip_prefix("uuid=") {
+            return Some(Self::Uuid(value.to_string()));
+        }
+        if let Some(value) = lower.strip_prefix("/dev/disk/by-uuid/") {
+            return Some(Self::Uuid(value.to_string()));
+        }
+        if let Some(value) = lower.strip_prefix("label=") {
+            return Some(Self::Label(value.to_string()));
+        }
+        if let Some(value) = lower.strip_prefix("/dev/disk/by-label/") {
+            return Some(Self::Label(value.to_string()));
+        }
+        Some(Self::DevicePath(lower))
+    }
+
+    fn is_slot_mapping_candidate(&self) -> bool {
+        !matches!(self, Self::DevicePath(_))
+    }
+}
+
+impl std::fmt::Display for RootSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RootSelector::PartUuid(value) => write!(f, "PARTUUID={value}"),
+            RootSelector::Uuid(value) => write!(f, "UUID={value}"),
+            RootSelector::Label(value) => write!(f, "LABEL={value}"),
+            RootSelector::DevicePath(value) => f.write_str(value),
+        }
+    }
+}
+
+fn root_selector_from_cmdline(cmdline: &str) -> Option<RootSelector> {
+    for token in cmdline.split_whitespace() {
+        if let Some(value) = token.strip_prefix("root=") {
+            return RootSelector::parse(value);
+        }
+    }
+    None
+}
+
+fn root_selector_from_entry_content(content: &str) -> Option<RootSelector> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let mut parts = trimmed.split_whitespace();
+        if parts.next() != Some("options") {
+            continue;
+        }
+
+        for token in parts {
+            if let Some(value) = token.strip_prefix("root=") {
+                return RootSelector::parse(value);
+            }
+        }
+    }
+    None
+}
+
+fn slot_from_entry_roots(
+    entries_dir: &Path,
+    prefix: &str,
+    target: &RootSelector,
+) -> Result<Option<Slot>> {
+    let mut matched: Option<Slot> = None;
+    for slot in [Slot::A, Slot::B] {
+        let entry_path = entries_dir.join(format!("{prefix}-{}.conf", slot.as_entry_suffix()));
+        if !entry_path.is_file() {
+            continue;
+        }
+        let content = fs::read_to_string(&entry_path)
+            .with_context(|| format!("reading entry '{}'", entry_path.display()))?;
+        let Some(entry_root) = root_selector_from_entry_content(&content) else {
+            continue;
+        };
+        if entry_root != *target {
+            continue;
+        }
+
+        if let Some(existing) = matched {
+            if existing != slot {
+                return Err(tagged_err(
+                    ErrorClass::StateOrDetection,
+                    format!(
+                        "ambiguous root selector '{target}' matches both '{}' and '{}' under '{}'",
+                        format!("{prefix}-{}.conf", existing.as_entry_suffix()),
+                        entry_path
+                            .file_name()
+                            .and_then(OsStr::to_str)
+                            .unwrap_or("<unknown>"),
+                        entries_dir.display()
+                    ),
+                ));
+            }
+        } else {
+            matched = Some(slot);
+        }
+    }
+    Ok(matched)
 }
 
 fn loader_default_entry_from_content(content: &str) -> Option<String> {
@@ -1131,6 +1296,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_root_selector_from_cmdline_handles_partuuid_and_device_paths() {
+        assert_eq!(
+            root_selector_from_cmdline("quiet root=PARTUUID=ABCD-1234 ro"),
+            Some(RootSelector::PartUuid("abcd-1234".to_string()))
+        );
+        assert_eq!(
+            root_selector_from_cmdline("root=/dev/disk/by-partuuid/DEAD-BEEF rw"),
+            Some(RootSelector::PartUuid("dead-beef".to_string()))
+        );
+        assert_eq!(
+            root_selector_from_cmdline("root=/dev/sda2 rw"),
+            Some(RootSelector::DevicePath("/dev/sda2".to_string()))
+        );
+    }
+
+    #[test]
     fn parse_loader_default_entry() {
         let raw = "# comment\ntimeout 3\ndefault iuppiter-a.conf\neditor 0\n";
         assert_eq!(
@@ -1199,6 +1380,96 @@ mod tests {
         let after_rollback = rollback_with(&backend, &store).expect("rollback");
         assert_eq!(after_rollback.default_slot, Some(Slot::B));
         assert_eq!(after_rollback.known_good_slot, Some(Slot::B));
+    }
+
+    #[test]
+    fn active_slot_uses_cmdline_root_selector_mapping_before_loader_default() {
+        let temp = tempdir().expect("tempdir");
+        let boot_root = temp.path().join("boot");
+        let entries_dir = boot_root.join("loader/entries");
+        fs::create_dir_all(&entries_dir).expect("entries dir");
+
+        fs::write(
+            boot_root.join("loader/loader.conf"),
+            "default iuppiter-a.conf\n",
+        )
+        .expect("loader.conf");
+        fs::write(
+            entries_dir.join("iuppiter-a.conf"),
+            "title A\nlinux /vmlinuz\noptions root=PARTUUID=1111-aaaa ro\n",
+        )
+        .expect("entry a");
+        fs::write(
+            entries_dir.join("iuppiter-b.conf"),
+            "title B\nlinux /vmlinuz\noptions root=PARTUUID=2222-bbbb ro\n",
+        )
+        .expect("entry b");
+
+        let os_release = temp.path().join("os-release");
+        fs::write(&os_release, "ID=iuppiter\n").expect("os-release");
+        let proc_cmdline = temp.path().join("cmdline");
+        fs::write(&proc_cmdline, "console=ttyS0 root=PARTUUID=2222-bbbb ro\n").expect("cmdline");
+        let efi = temp.path().join("efi");
+        let efivars = efi.join("efivars");
+        fs::create_dir_all(&efivars).expect("efi paths");
+
+        let backend = SystemdBootBackend {
+            loader_conf_path: boot_root.join("loader/loader.conf"),
+            entries_dir,
+            os_release_path: os_release,
+            proc_cmdline_path: proc_cmdline,
+            sys_firmware_efi_path: efi,
+            efivars_path: efivars,
+            bootctl_bin: "bootctl".to_string(),
+        };
+
+        assert_eq!(backend.active_slot().expect("active slot"), Slot::B);
+    }
+
+    #[test]
+    fn active_slot_errors_when_root_selector_cannot_be_mapped_to_entries() {
+        let temp = tempdir().expect("tempdir");
+        let boot_root = temp.path().join("boot");
+        let entries_dir = boot_root.join("loader/entries");
+        fs::create_dir_all(&entries_dir).expect("entries dir");
+
+        fs::write(
+            boot_root.join("loader/loader.conf"),
+            "default iuppiter-a.conf\n",
+        )
+        .expect("loader.conf");
+        fs::write(
+            entries_dir.join("iuppiter-a.conf"),
+            "title A\nlinux /vmlinuz\noptions root=PARTUUID=1111-aaaa ro\n",
+        )
+        .expect("entry a");
+        fs::write(
+            entries_dir.join("iuppiter-b.conf"),
+            "title B\nlinux /vmlinuz\noptions root=PARTUUID=2222-bbbb ro\n",
+        )
+        .expect("entry b");
+
+        let os_release = temp.path().join("os-release");
+        fs::write(&os_release, "ID=iuppiter\n").expect("os-release");
+        let proc_cmdline = temp.path().join("cmdline");
+        fs::write(&proc_cmdline, "console=ttyS0 root=PARTUUID=9999-ffff ro\n").expect("cmdline");
+        let efi = temp.path().join("efi");
+        let efivars = efi.join("efivars");
+        fs::create_dir_all(&efivars).expect("efi paths");
+
+        let backend = SystemdBootBackend {
+            loader_conf_path: boot_root.join("loader/loader.conf"),
+            entries_dir,
+            os_release_path: os_release,
+            proc_cmdline_path: proc_cmdline,
+            sys_firmware_efi_path: efi,
+            efivars_path: efivars,
+            bootctl_bin: "bootctl".to_string(),
+        };
+
+        let err = backend.active_slot().expect_err("active-slot should fail");
+        assert_eq!(stable_exit_code(&err), EXIT_CODE_STATE_OR_DETECTION);
+        assert!(format!("{err:#}").contains("unable to map active root selector"));
     }
 
     #[test]

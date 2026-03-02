@@ -49,6 +49,33 @@ UEFI runtime and efivars are available:
 
 - Mutating operations (`set-next`, `commit`, `rollback`) require root.
 
+## E2E on `/dev/sdc` (Destructive)
+
+`recab` includes ignored integration tests that exercise a full A/B lifecycle
+using real `/dev/sdc` partitions and real PARTUUIDs.
+
+- File: `tools/recab/tests/e2e_sdc.rs`
+- Scope:
+  - repartition `/dev/sdc` as GPT with 2 ext4 partitions (`system-a`, `system-b`)
+  - verify `status -> set-next -> commit -> rollback`
+  - validate audit/state updates and bootctl command sequencing
+- Safety gates:
+  - must run as root
+  - must set `RECAB_E2E_SDC_ACK=ERASE_SDC`
+  - target device must be `/dev/sdc`
+  - refuses to run if `/dev/sdc` has mounted filesystems
+- Trace output:
+  - writes a step-by-step markdown trace (commands, outputs, file snapshots)
+  - default path: `/tmp/recab-<test>-<pid>.trace.md`
+  - override path with `RECAB_E2E_TRACE_OUT=<path>`
+
+Run:
+
+```bash
+cd tools/recab
+sudo RECAB_E2E_SDC_ACK=ERASE_SDC cargo test --test e2e_sdc -- --ignored --nocapture
+```
+
 ## Exit Codes
 
 - `0`: success
