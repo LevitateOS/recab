@@ -8,7 +8,7 @@
 
 This is intended to be the "slot state machine" glue for the repo's homegrown
 A/B model, and to be called by higher-level tooling (e.g. installers, `recipe`,
-and stage harnesses).
+and scenario harnesses).
 
 Status: implemented with a systemd-boot backend and persistent local state.
 
