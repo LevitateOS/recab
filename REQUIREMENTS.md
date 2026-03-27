@@ -9,7 +9,7 @@ selection and commit/rollback manager for LevitateOS-style immutable systems.
 
 `recab` is intentionally small: it does not build filesystem trees, download
 packages, or manage recipes. It is the slot state machine glue called by higher
-level tooling (installers, `recipe`, stage harnesses).
+level tooling (installers, `recipe`, checkpoint harnesses).
 
 ---
 
@@ -39,8 +39,8 @@ level tooling (installers, `recipe`, stage harnesses).
 - Stage a trial boot of the inactive slot ("try")
 - Commit the booted slot as good ("commit") or roll back ("rollback")
 
-This exists to support the repo's stage model (notably `Stage 07` in
-`stages.md`) and the repo-wide A/B default plan (`docs/ab-default-plan.md`).
+This exists to support the repo's checkpoint ladder (notably `07Update` in
+`checkpoints.md`) and the repo-wide A/B default plan (`docs/ab-default-plan.md`).
 
 ### 1.2 Scope
 
@@ -290,7 +290,7 @@ Primary sources for these requirements:
 
 - `tools/recab/README.md` and `tools/recab/CLAUDE.md` (tool scope and intent)
 - `QUALITY.md` (repo-wide CLI/tooling quality expectations)
-- `stages.md` (Stage 07 Slot B Trial Boot)
+- `checkpoints.md` (07Update Slot B Trial Boot)
 - `docs/ab-default-plan.md` (repo-wide A/B default plan)
 - `tools/recipe/OS_UPGRADES_BRAINDUMP.md` (recipe + A/B upgrade flow)
 - `RalphOS/planning.md` (A/B-only appliances and trial boot + commit model)
@@ -308,19 +308,19 @@ in implementation/tests as each requirement is implemented.
 | REQ-DESIGN-010 | `tools/recab/CLAUDE.md`, `QUALITY.md` | Conservative preconditions in `set_next_with`, `ensure_entry_exists`, `ensure_uefi_ready` | `tests::set_next_requires_default_to_match_known_good_for_fallback`; `tests::validate_uefi_paths_fails_without_efi_runtime` |
 | REQ-DESIGN-011 | `tools/recab/CLAUDE.md`, `QUALITY.md` | Non-interactive CLI in `tools/recab/src/main.rs` (`clap` parsing only; no prompts) | `cargo check -p recab`; manual run paths |
 | REQ-DESIGN-020 | `QUALITY.md` | Idempotent `set-next` handling in `set_next_with` when same trial slot already pending | `tests::set_next_is_idempotent_when_same_trial_already_pending` |
-| REQ-DESIGN-030 | `RalphOS/planning.md`, `stages.md` | Architecture-neutral Rust code in `tools/recab/src/*.rs` (no x86_64-only branches) | `cargo check -p recab` on host; target-agnostic code review |
-| REQ-SM-001 | `docs/ab-default-plan.md`, `stages.md` | Conceptual stable/trial states represented by `PersistentState` + `compose_status` | `tests::set_next_commit_rollback_flow` |
-| REQ-SM-010 | `docs/ab-default-plan.md`, `stages.md` | `set_next_with` sets `pending_trial_slot` and writes trial transition state | `tests::set_next_commit_rollback_flow` |
-| REQ-SM-011 | `docs/ab-default-plan.md`, `stages.md` | `commit_with` clears `pending_trial_slot`, sets `known_good_slot`, and default entry | `tests::set_next_commit_rollback_flow` |
-| REQ-SM-012 | `docs/ab-default-plan.md`, `stages.md` | `rollback_with` targets `known_good_slot` as next/default boot | `tests::set_next_commit_rollback_flow` |
-| REQ-SM-020 | `docs/ab-default-plan.md`, `stages.md` | Trial path uses `bootctl set-oneshot` and requires default aligned to known-good fallback (`set_next_with`) | `tests::set_next_requires_default_to_match_known_good_for_fallback`; code review of `set_trial_slot` |
+| REQ-DESIGN-030 | `RalphOS/planning.md`, `checkpoints.md` | Architecture-neutral Rust code in `tools/recab/src/*.rs` (no x86_64-only branches) | `cargo check -p recab` on host; target-agnostic code review |
+| REQ-SM-001 | `docs/ab-default-plan.md`, `checkpoints.md` | Conceptual stable/trial states represented by `PersistentState` + `compose_status` | `tests::set_next_commit_rollback_flow` |
+| REQ-SM-010 | `docs/ab-default-plan.md`, `checkpoints.md` | `set_next_with` sets `pending_trial_slot` and writes trial transition state | `tests::set_next_commit_rollback_flow` |
+| REQ-SM-011 | `docs/ab-default-plan.md`, `checkpoints.md` | `commit_with` clears `pending_trial_slot`, sets `known_good_slot`, and default entry | `tests::set_next_commit_rollback_flow` |
+| REQ-SM-012 | `docs/ab-default-plan.md`, `checkpoints.md` | `rollback_with` targets `known_good_slot` as next/default boot | `tests::set_next_commit_rollback_flow` |
+| REQ-SM-020 | `docs/ab-default-plan.md`, `checkpoints.md` | Trial path uses `bootctl set-oneshot` and requires default aligned to known-good fallback (`set_next_with`) | `tests::set_next_requires_default_to_match_known_good_for_fallback`; code review of `set_trial_slot` |
 | REQ-CLI-001 | `tools/recab/src/main.rs`, `tools/recab/README.md` | `Command::{Status,SetNext,Commit,Rollback}` in `tools/recab/src/main.rs` | `cargo check -p recab`; CLI parser build verification |
 | REQ-CLI-002 | `tools/recab/README.md` | `print_status` emits active/inactive/trial/next/default/known-good | `cargo check -p recab`; manual `recab status` inspection |
 | REQ-CLI-003 | `tools/recab/README.md`, `docs/ab-default-plan.md` | `Command::SetNext` -> `recab::set_next` -> backend one-shot trial | `tests::set_next_commit_rollback_flow` |
-| REQ-CLI-004 | `docs/ab-default-plan.md`, `stages.md` | `Command::Commit` -> `recab::commit` (`known_good` + default slot update) | `tests::set_next_commit_rollback_flow` |
+| REQ-CLI-004 | `docs/ab-default-plan.md`, `checkpoints.md` | `Command::Commit` -> `recab::commit` (`known_good` + default slot update) | `tests::set_next_commit_rollback_flow` |
 | REQ-CLI-005 | `docs/ab-default-plan.md` | `Command::Rollback` -> `recab::rollback` (known-good default target) | `tests::set_next_commit_rollback_flow` |
 | REQ-CLI-010 | `QUALITY.md` | Success path is quiet for mutating commands; failures emit actionable stderr in `main` | `cargo check -p recab`; manual CLI behavior check |
-| REQ-CLI-011 | `stages.md` | `recab status --json` in `Command::Status { json }` + `print_status` JSON branch | `cargo check -p recab`; manual `status --json` output |
+| REQ-CLI-011 | `checkpoints.md` | `recab status --json` in `Command::Status { json }` + `print_status` JSON branch | `cargo check -p recab`; manual `status --json` output |
 | REQ-LIB-001 | `tools/recab/README.md` | Public library functions in `tools/recab/src/lib.rs` | `cargo check -p recab`; CLI consumes library functions |
 | REQ-LIB-002 | `tools/recab/src/lib.rs`, `tools/recab/src/main.rs` | Public `Slot`, `Status`, `set_next`, `commit`, `rollback` exported from library | `cargo check -p recab`; `tests::set_next_commit_rollback_flow` |
 | REQ-LIB-003 | `tools/recab/README.md` | Separation via `BootBackend` + `StateStore` traits vs pure state structures | `tests` module `MockBackend` + `TempStore` |
@@ -328,7 +328,7 @@ in implementation/tests as each requirement is implemented.
 | REQ-BACKEND-002 | `docs/ab-default-plan.md` | `BootBackend` methods cover read active/default + set trial/default | `tests::set_next_commit_rollback_flow` |
 | REQ-BACKEND-010 | `docs/ab-default-plan.md`, `IuppiterOS/AB_IMMUTABLE.md` | `SystemdBootBackend` implementation in `tools/recab/src/lib.rs` | `cargo check -p recab`; backend unit coverage via helper tests |
 | REQ-BACKEND-011 | `IuppiterOS/AB_IMMUTABLE.md` | `ensure_uefi_ready` + `validate_uefi_paths` hard-fail on missing UEFI/efivars | `tests::validate_uefi_paths_fails_without_efi_runtime` |
-| REQ-BACKEND-012 | `docs/ab-default-plan.md`, `stages.md` | `set_trial_slot` uses `bootctl set-oneshot`; fallback invariant enforced in `set_next_with` | `tests::set_next_requires_default_to_match_known_good_for_fallback` |
+| REQ-BACKEND-012 | `docs/ab-default-plan.md`, `checkpoints.md` | `set_trial_slot` uses `bootctl set-oneshot`; fallback invariant enforced in `set_next_with` | `tests::set_next_requires_default_to_match_known_good_for_fallback` |
 | REQ-PERSIST-001 | `tools/recab/README.md`, `docs/ab-default-plan.md` | `PersistentState` tracks known-good + pending trial + last transition; persisted in `JsonStateStore` | `tests::state_store_roundtrip_and_atomic_write`; `tests::set_next_commit_rollback_flow` |
 | REQ-PERSIST-002 | `QUALITY.md` | Atomic writes via `write_json_atomic` (`temp + rename`) | `tests::state_store_roundtrip_and_atomic_write` |
 | REQ-AUDIT-001 | `RalphOS/planning.md` | `AuditEvent` + `append_audit` JSONL records operation/timestamp/slot/state delta | `tests::set_next_commit_rollback_flow` (audit path exercised on transitions) |
