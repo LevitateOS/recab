@@ -297,4 +297,4 @@ Primary sources for these requirements:
 
 ### 11.3 Validation
 
-Unit tests are prohibited. Use `cargo check -p recab`, focused CLI integration checks (`cargo test -p recab --test cli`), or the explicit real-disk lifecycle check in `tests/e2e_sdc.rs` as appropriate. Real-disk checks retain their destructive-operation acknowledgement requirements. No maintained traceability matrix or minimum coverage gate is required during development.
+Unit tests are prohibited. Use `cargo check -p recab` or the explicit real-disk lifecycle check in `tests/e2e_sdc.rs` as appropriate. Real-disk checks retain their destructive-operation acknowledgement requirements. No maintained traceability matrix or minimum coverage gate is required during development.
