@@ -9,7 +9,7 @@ selection and commit/rollback manager for LevitateOS-style immutable systems.
 
 `recab` is intentionally small: it does not build filesystem trees, download
 packages, or manage recipes. It is the slot state machine glue called by higher
-level tooling (installers, `recipe`, checkpoint harnesses).
+level tooling (installers, `recipe`, integration/e2e harnesses).
 
 ---
 
@@ -39,8 +39,7 @@ level tooling (installers, `recipe`, checkpoint harnesses).
 - Stage a trial boot of the inactive slot ("try")
 - Commit the booted slot as good ("commit") or roll back ("rollback")
 
-This exists to support the repo's checkpoint ladder (notably `07Update` in
-`checkpoints.md`) and the repo-wide A/B default plan (`docs/ab-default-plan.md`).
+This supports A/B update and rollback validation described in `architecture.md` and the repo-wide A/B default plan (`docs/ab-default-plan.md`).
 
 ### 1.2 Scope
 
@@ -289,7 +288,7 @@ Primary sources for these requirements:
 
 - `tools/recab/README.md` and `tools/recab/CLAUDE.md` (tool scope and intent)
 - `QUALITY.md` (repo-wide CLI/tooling quality expectations)
-- `checkpoints.md` (07Update Slot B Trial Boot)
+- `architecture.md` (A/B update and rollback validation)
 - `docs/ab-default-plan.md` (repo-wide A/B default plan)
 - `tools/recipe/OS_UPGRADES_BRAINDUMP.md` (recipe + A/B upgrade flow)
 
