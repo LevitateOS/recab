@@ -292,8 +292,6 @@ Primary sources for these requirements:
 - `checkpoints.md` (07Update Slot B Trial Boot)
 - `docs/ab-default-plan.md` (repo-wide A/B default plan)
 - `tools/recipe/OS_UPGRADES_BRAINDUMP.md` (recipe + A/B upgrade flow)
-- `RalphOS/planning.md` (A/B-only appliances and trial boot + commit model)
-- `IuppiterOS/AB_IMMUTABLE.md` (A/B delta for disk images)
 
 ### 11.3 Validation
 

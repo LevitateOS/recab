@@ -934,7 +934,7 @@ Install systemd-boot userspace tools and retry, or ensure RECAB_BOOTCTL_BIN poin
             ErrorClass::StateOrDetection,
             format!(
                 "unable to determine A/B entry prefix in '{}'. Expected '<prefix>-a.conf' and '<prefix>-b.conf'.\n\
-Set RECAB_ENTRY_PREFIX explicitly (for example: RECAB_ENTRY_PREFIX=iuppiter).",
+Set RECAB_ENTRY_PREFIX explicitly (for example: RECAB_ENTRY_PREFIX=levitate).",
                 self.entries_dir.display()
             ),
         ))

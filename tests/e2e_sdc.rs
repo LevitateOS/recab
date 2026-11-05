@@ -13,7 +13,7 @@ const DEVICE_DEFAULT: &str = "/dev/sdc";
 const ACK_ENV: &str = "RECAB_E2E_SDC_ACK";
 const ACK_VALUE: &str = "ERASE_SDC";
 const TRACE_OUT_ENV: &str = "RECAB_E2E_TRACE_OUT";
-const BOOT_PREFIX: &str = "iuppiter";
+const BOOT_PREFIX: &str = "levitate";
 
 struct TraceLog {
     path: PathBuf,
@@ -529,8 +529,8 @@ fn e2e_sdc_full_ab_lifecycle() {
     assert!(
         loader_conf
             .lines()
-            .any(|line| line.trim() == "default iuppiter-b.conf"),
-        "expected loader.conf default to iuppiter-b.conf, got:\n{}",
+            .any(|line| line.trim() == "default levitate-b.conf"),
+        "expected loader.conf default to levitate-b.conf, got:\n{}",
         loader_conf
     );
     snapshot_runtime_artifacts(&layout, &mut trace, "artifact-snapshot-after-commit");
@@ -554,8 +554,8 @@ fn e2e_sdc_full_ab_lifecycle() {
 
     trace.step("assert-bootctl-and-audit");
     let bootctl_log = fs::read_to_string(&layout.bootctl_log).expect("bootctl log");
-    assert!(bootctl_log.contains("set-oneshot iuppiter-b.conf"));
-    assert!(bootctl_log.contains("set-default iuppiter-b.conf"));
+    assert!(bootctl_log.contains("set-oneshot levitate-b.conf"));
+    assert!(bootctl_log.contains("set-default levitate-b.conf"));
 
     let audit_raw = fs::read_to_string(&layout.audit_path).expect("audit");
     let ops = audit_raw
