@@ -27,6 +27,7 @@ impl Tree {
             )
             .unwrap();
         }
+        fs::write(root.join("boot/vmlinuz"), "kernel").unwrap();
         fs::write(root.join("os-release"), "ID=lev\n").unwrap();
         let bootctl = root.join("bootctl");
         fs::write(
@@ -153,11 +154,24 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
     let status = tree.status();
     assert_eq!(status["active_slot"], "B");
     assert_eq!(status["default_slot"], "A");
+    assert_eq!(status["trial_pending"], false, "the boot took the one-shot entry");
+    assert_eq!(status["committed"], false);
+    assert_eq!(status["next_boot"], "A", "an uncommitted trial falls back");
     tree.ok(&["commit"]);
     let status = tree.status();
     assert_eq!(status["default_slot"], "B");
     assert_eq!(status["known_good_slot"], "B");
+    assert_eq!(status["committed"], true);
+    assert_eq!(status["rollback_slot"], "A");
     assert!(read(&tree.path("boot/loader/loader.conf")).starts_with("default lev-b.conf\n"));
+
+    // Rollback from a committed slot returns to the slot that was good before.
+    tree.ok(&["rollback"]);
+    assert_eq!(tree.status()["default_slot"], "A");
+    tree.boot_into("a");
+    let status = tree.status();
+    assert_eq!(status["committed"], true);
+    assert_eq!(status["rollback_slot"], "B");
 
     let ops: Vec<String> = read(&tree.path("state/audit.log"))
         .lines()
@@ -168,7 +182,24 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
                 .to_string()
         })
         .collect();
-    assert_eq!(ops, ["commit", "set-next", "rollback", "set-next", "commit"]);
+    assert_eq!(
+        ops,
+        ["commit", "set-next", "rollback", "set-next", "commit", "rollback"]
+    );
+}
+
+#[test]
+#[ignore = "needs root: recab mutations check for root"]
+fn set_next_refuses_a_slot_without_its_kernel() {
+    let tree = Tree::new();
+    fs::write(
+        tree.path("boot/loader/entries/lev-b.conf"),
+        "title b\nlinux /lev-b/vmlinuz\noptions root=/dev/fake-b rw\n",
+    )
+    .unwrap();
+    let out = tree.recab(&["set-next", "B"]);
+    assert_eq!(out.status.code(), Some(21), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!tree.has_efivar("LoaderEntryOneShot"));
 }
 
 #[test]

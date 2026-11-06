@@ -2,11 +2,14 @@
 //!
 //! recab is intentionally small:
 //! - detect active/inactive slot
+//! - write a prebuilt system into the inactive slot (`stage`)
 //! - stage a trial boot for inactive slot
 //! - commit active slot as known-good
 //! - rollback next boot to known-good slot
 //!
 //! Backend: systemd-boot entries + local persistent state.
+
+mod stage;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -138,16 +141,24 @@ impl std::fmt::Display for Slot {
 pub struct Status {
     pub active_slot: Slot,
     pub inactive_slot: Slot,
+    /// A one-shot trial boot is set in the firmware and not yet taken.
     pub trial_pending: bool,
+    /// The slot the next boot starts: the trial slot, else the default.
     pub next_boot: Option<Slot>,
     pub default_slot: Option<Slot>,
     pub known_good_slot: Option<Slot>,
+    /// The running slot is the known-good slot. After a trial boot this is
+    /// false until `recab commit`; an uncommitted slot is left on next boot.
+    pub committed: bool,
+    /// The slot `recab rollback` would select, if any.
+    pub rollback_slot: Option<Slot>,
     pub entry_prefix: String,
 }
 
 /// Where recab reads and writes. Every path can be redirected with its
 /// `RECAB_*` variable, which is how recab runs against a scratch tree.
 struct Config {
+    boot_root: PathBuf,
     loader_conf: PathBuf,
     entries_dir: PathBuf,
     os_release: PathBuf,
@@ -178,6 +189,7 @@ impl Config {
             Err(_) => None,
         };
         Ok(Self {
+            boot_root: boot_root.clone(),
             loader_conf: boot_root.join("loader/loader.conf"),
             entries_dir: boot_root.join("loader/entries"),
             os_release: path("RECAB_OS_RELEASE_PATH", "/etc/os-release"),
@@ -264,6 +276,8 @@ struct Boot {
     active: Slot,
     /// The slot systemd-boot boots by default.
     default: Option<Slot>,
+    /// The slot of a one-shot entry systemd-boot has not taken yet.
+    oneshot: Option<Slot>,
 }
 
 impl Boot {
@@ -278,15 +292,22 @@ impl Boot {
         };
         let prefix = entry_prefix(config, default_entry.as_deref())?;
         let active = active_slot(config, &prefix)?;
-        let default = default_entry
-            .as_deref()
-            .and_then(parse_entry_name)
-            .filter(|(entry_prefix, _)| *entry_prefix == prefix)
-            .map(|(_, slot)| slot);
+        let slot_of = |entry: Option<String>| {
+            entry
+                .as_deref()
+                .and_then(parse_entry_name)
+                .filter(|(entry_prefix, _)| *entry_prefix == prefix)
+                .map(|(_, slot)| slot)
+        };
+        let default = slot_of(default_entry);
+        // systemd-boot removes the variable when it boots the entry, so it is
+        // the record of whether a trial is still to come.
+        let oneshot = slot_of(config.loader_efivar("LoaderEntryOneShot"));
         Ok(Self {
             prefix,
             active,
             default,
+            oneshot,
         })
     }
 
@@ -300,6 +321,21 @@ fn known_good(state: &PersistentState, boot: &Boot) -> Option<Slot> {
     state.known_good_slot.or(boot.default)
 }
 
+fn committed(state: &PersistentState, boot: &Boot) -> bool {
+    known_good(state, boot) == Some(boot.active)
+}
+
+/// What rollback selects: from an uncommitted slot, or to cancel a pending
+/// trial, the known-good slot; from a committed slot, the slot that was good
+/// before it.
+fn rollback_target(state: &PersistentState, boot: &Boot) -> Option<Slot> {
+    if !committed(state, boot) || boot.oneshot.is_some() {
+        known_good(state, boot)
+    } else {
+        state.previous_good_slot
+    }
+}
+
 /// Query current A/B state from the boot configuration and recab's state.
 /// Only reads, so it works anywhere the files are readable.
 pub fn status() -> Result<Status> {
@@ -309,12 +345,63 @@ pub fn status() -> Result<Status> {
     Ok(Status {
         active_slot: boot.active,
         inactive_slot: boot.active.other(),
-        trial_pending: state.pending_trial_slot.is_some(),
-        next_boot: state.pending_trial_slot,
+        trial_pending: boot.oneshot.is_some(),
+        next_boot: boot.oneshot.or(boot.default),
         default_slot: boot.default,
         known_good_slot: known_good(&state, &boot),
+        committed: committed(&state, &boot),
+        rollback_slot: rollback_target(&state, &boot),
         entry_prefix: boot.prefix,
     })
+}
+
+/// Write a prebuilt system into the inactive slot: format it, extract the
+/// rootfs image, carry the machine's configuration over, and install the
+/// slot's kernel and boot entry. The slot is not booted until `set_next`.
+pub fn stage(request: &StageRequest) -> Result<()> {
+    let config = Config::from_env()?;
+    let boot = Boot::read(&config)?;
+    let previous = load_state(&config)?;
+    let slot = boot.active.other();
+
+    if !committed(&previous, &boot) {
+        return Err(tagged_err(
+            ErrorClass::StateOrDetection,
+            format!(
+                "slot {} is running uncommitted, so slot {slot} is the fallback; staging over it would leave no known-good system.\n\
+Run 'recab commit' to keep slot {}, or reboot into slot {slot}.",
+                boot.active, boot.active
+            ),
+        ));
+    }
+    if boot.oneshot == Some(slot) {
+        return Err(tagged_err(
+            ErrorClass::StateOrDetection,
+            format!("a trial boot of slot {slot} is pending; run 'recab rollback' to cancel it before staging slot {slot} again"),
+        ));
+    }
+    require_root("stage")?;
+
+    stage::write_slot(&config, &boot, slot, request)?;
+
+    let mut next = previous.clone();
+    next.known_good_slot = Some(boot.active);
+    if next.pending_trial_slot == Some(slot) {
+        next.pending_trial_slot = None;
+    }
+    if next.previous_good_slot == Some(slot) {
+        next.previous_good_slot = None;
+    }
+    record(&config, &boot, Operation::Stage(slot), previous, next)
+}
+
+/// The prebuilt system `stage` writes.
+#[derive(Debug, Clone)]
+pub struct StageRequest {
+    /// EROFS rootfs image, extracted with recstrap.
+    pub rootfs: PathBuf,
+    pub kernel: PathBuf,
+    pub initrd: Option<PathBuf>,
 }
 
 /// Configure a one-shot trial boot of the inactive `slot`.
@@ -341,6 +428,7 @@ enum Request {
 /// A state transition; its names are used in the state file and audit log.
 #[derive(Debug, Clone, Copy)]
 enum Operation {
+    Stage(Slot),
     SetNext(Slot),
     Commit(Slot),
     Rollback(Slot),
@@ -350,12 +438,16 @@ impl Operation {
     /// The slot the operation selects.
     fn slot(self) -> Slot {
         match self {
-            Operation::SetNext(slot) | Operation::Commit(slot) | Operation::Rollback(slot) => slot,
+            Operation::Stage(slot)
+            | Operation::SetNext(slot)
+            | Operation::Commit(slot)
+            | Operation::Rollback(slot) => slot,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
+            Operation::Stage(_) => "stage",
             Operation::SetNext(_) => "set-next",
             Operation::Commit(_) => "commit",
             Operation::Rollback(_) => "rollback",
@@ -365,11 +457,23 @@ impl Operation {
     /// `last_operation` in the state file.
     fn label(self) -> String {
         match self {
+            Operation::Stage(slot) => format!("stage-{slot}"),
             Operation::SetNext(slot) => format!("set-next-{slot}"),
             Operation::Commit(slot) => format!("commit-{slot}"),
             Operation::Rollback(slot) => format!("rollback-to-{slot}"),
         }
     }
+}
+
+fn require_root(operation: &str) -> Result<()> {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(tagged_err(
+            ErrorClass::Permission,
+            format!("{operation} must run as root"),
+        ));
+    }
+    Ok(())
 }
 
 fn change(request: Request) -> Result<()> {
@@ -388,6 +492,17 @@ fn change(request: Request) -> Result<()> {
             ));
         }
         Request::SetNext(slot) => {
+            let entry = boot.entry(slot);
+            ensure_entry_exists(&config, &entry)?;
+            if let Some(missing) = missing_boot_file(&config, &entry)? {
+                return Err(tagged_err(
+                    ErrorClass::StateOrDetection,
+                    format!(
+                        "slot {slot} is not bootable: its entry '{entry}' names '{missing}', which is not on the boot partition.\n\
+Write a system into slot {slot} with 'recab stage' first."
+                    ),
+                ));
+            }
             let fallback = known_good(&previous, &boot).unwrap_or(boot.active);
             if boot.default != Some(fallback) {
                 return Err(tagged_err(
@@ -406,34 +521,42 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
         }
         Request::Commit => {
             let mut next = previous.clone();
+            let good = known_good(&previous, &boot);
+            if good != Some(boot.active) {
+                // The slot that was good until now is what rollback returns to.
+                next.previous_good_slot = good;
+            }
             next.known_good_slot = Some(boot.active);
             next.pending_trial_slot = None;
             (Operation::Commit(boot.active), next)
         }
         Request::Rollback => {
-            let target = known_good(&previous, &boot).ok_or_else(|| {
-                tagged_err(
-                    ErrorClass::StateOrDetection,
+            let target = rollback_target(&previous, &boot).ok_or_else(|| {
+                let reason = if committed(&previous, &boot) {
                     format!(
-                        "cannot rollback: no known-good slot in state '{}' and no default slot",
+                        "slot {} is committed and no other slot has been known-good since it was written",
+                        boot.active
+                    )
+                } else {
+                    format!(
+                        "no known-good slot in state '{}' and no default slot",
                         config.state_path.display()
-                    ),
-                )
+                    )
+                };
+                tagged_err(ErrorClass::StateOrDetection, format!("cannot rollback: {reason}"))
             })?;
             let mut next = previous.clone();
+            if target != boot.active && committed(&previous, &boot) {
+                // Leaving a committed slot: it stays a slot to roll back to.
+                next.previous_good_slot = Some(boot.active);
+            }
             next.known_good_slot = Some(target);
             next.pending_trial_slot = None;
             (Operation::Rollback(target), next)
         }
     };
 
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } != 0 {
-        return Err(tagged_err(
-            ErrorClass::Permission,
-            format!("{} must run as root", operation.name()),
-        ));
-    }
+    require_root(operation.name())?;
     config.ensure_can_change_boot()?;
 
     // What the transition writes: the default entry (loader.conf and the
@@ -446,6 +569,7 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
             Some(entry.clone()),
             vec![vec!["set-default".to_string(), entry]],
         ),
+        Operation::Stage(_) => unreachable!("stage changes no boot selection"),
     };
     if new_default.is_some() && config.loader_efivar("LoaderEntryOneShot").is_some() {
         commands.push(vec!["set-oneshot".to_string(), String::new()]);
@@ -463,23 +587,47 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
     next.last_operation = Some(operation.label());
     next.last_transition_unix = Some(now_unix_secs()?);
     apply_change(&config, operation, &previous, &next, new_default.as_deref(), &commands)?;
+    audit(&config, &boot, operation, previous, next);
+    Ok(())
+}
 
+/// Save the state after an operation that changed no boot selection.
+fn record(
+    config: &Config,
+    boot: &Boot,
+    operation: Operation,
+    previous: PersistentState,
+    mut next: PersistentState,
+) -> Result<()> {
+    next.last_operation = Some(operation.label());
+    next.last_transition_unix = Some(now_unix_secs()?);
+    save_state(config, &next, operation.name())?;
+    audit(config, boot, operation, previous, next);
+    Ok(())
+}
+
+fn audit(
+    config: &Config,
+    boot: &Boot,
+    operation: Operation,
+    before: PersistentState,
+    after: PersistentState,
+) {
     let event = AuditEvent {
         schema: STATE_SCHEMA_VERSION,
-        timestamp_unix: next.last_transition_unix.unwrap_or_default(),
+        timestamp_unix: after.last_transition_unix.unwrap_or_default(),
         operation: operation.name(),
         active_slot: boot.active,
-        before: previous,
-        after: next,
+        before,
+        after,
     };
-    if let Err(err) = append_audit(&config, &event) {
+    if let Err(err) = append_audit(config, &event) {
         eprintln!(
             "recab: warning: {} succeeded but the audit log '{}' was not written: {err:#}",
             operation.name(),
             config.audit_path.display()
         );
     }
-    Ok(())
 }
 
 /// Write the new state and loader.conf, then run bootctl. A failure before
@@ -569,6 +717,31 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
     Ok(())
 }
 
+/// The first file an entry boots (`linux` or `efi`) that is missing from the
+/// boot partition, if any.
+fn missing_boot_file(config: &Config, entry: &str) -> Result<Option<String>> {
+    let path = config.entries_dir.join(entry);
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("reading entry '{}'", path.display()))?;
+    Ok(entry_boot_files(&content)
+        .into_iter()
+        .find(|file| !config.boot_root.join(file.trim_start_matches('/')).is_file()))
+}
+
+/// The files a systemd-boot entry loads from the boot partition.
+fn entry_boot_files(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            match parts.next() {
+                Some("linux" | "efi" | "initrd") => parts.next().map(str::to_string),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 fn now_unix_secs() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -580,6 +753,10 @@ fn now_unix_secs() -> Result<u64> {
 struct PersistentState {
     schema: u32,
     known_good_slot: Option<Slot>,
+    /// The slot that was known-good before `known_good_slot`, while it still
+    /// holds that system: what rollback from a committed slot returns to.
+    #[serde(default)]
+    previous_good_slot: Option<Slot>,
     pending_trial_slot: Option<Slot>,
     last_operation: Option<String>,
     last_transition_unix: Option<u64>,
@@ -590,6 +767,7 @@ impl Default for PersistentState {
         Self {
             schema: STATE_SCHEMA_VERSION,
             known_good_slot: None,
+            previous_good_slot: None,
             pending_trial_slot: None,
             last_operation: None,
             last_transition_unix: None,
