@@ -1,6 +1,7 @@
 //! recab against a scratch boot tree: slot entries whose `root=` names fake
-//! devices, a `/proc/cmdline` stand-in, and a fake `bootctl` that writes the
-//! systemd-boot EFI variables in their real format. Mutations need root.
+//! devices, a `/proc/cmdline` stand-in, a fake `bootctl` that writes the
+//! systemd-boot EFI variables in their real format, and a fake `systemctl`
+//! whose startup state the test sets. Mutations need root.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -46,6 +47,23 @@ if [ -z "$2" ]; then rm -f "$file"; else {{ printf '\007\000\000\000'; printf '%
         )
         .unwrap();
         fs::set_permissions(&bootctl, fs::Permissions::from_mode(0o755)).unwrap();
+        let systemctl = root.join("systemctl");
+        fs::write(
+            &systemctl,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  "is-system-running --wait") cat '{root}/system-state' ;;
+  list-units*) cat '{root}/failed-units' 2>/dev/null ;;
+  "--no-block reboot") echo reboot >> '{root}/reboot.log' ;;
+esac
+"#,
+                root = root.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.join("system-state"), "running\n").unwrap();
         let tree = Self { dir };
         tree.boot_into("a");
         tree
@@ -73,6 +91,7 @@ if [ -z "$2" ]; then rm -f "$file"; else {{ printf '\007\000\000\000'; printf '%
             .env("RECAB_SYS_FIRMWARE_EFI_PATH", self.path("efi"))
             .env("RECAB_EFIVARS_PATH", self.path("efi/efivars"))
             .env("RECAB_BOOTCTL_BIN", self.path("bootctl"))
+            .env("RECAB_SYSTEMCTL_BIN", self.path("systemctl"))
             .output()
             .unwrap()
     }
@@ -192,14 +211,95 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
 #[ignore = "needs root: recab mutations check for root"]
 fn set_next_refuses_a_slot_without_its_kernel() {
     let tree = Tree::new();
+    tree.ok(&["commit"]);
     fs::write(
         tree.path("boot/loader/entries/lev-b.conf"),
         "title b\nlinux /lev-b/vmlinuz\noptions root=/dev/fake-b rw\n",
     )
     .unwrap();
     let out = tree.recab(&["set-next", "B"]);
-    assert_eq!(out.status.code(), Some(21), "{}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(21), "{stderr}");
+    assert!(stderr.contains("not bootable"), "{stderr}");
     assert!(!tree.has_efivar("LoaderEntryOneShot"));
+}
+
+/// A committed slot is not a trial: `trial` leaves it alone, without root.
+#[test]
+fn trial_leaves_a_committed_slot_alone() {
+    let tree = Tree::new();
+    fs::create_dir_all(tree.path("boot/loader")).unwrap();
+    fs::write(tree.path("boot/loader/loader.conf"), "default lev-a.conf\n").unwrap();
+    fs::write(tree.path("system-state"), "degraded\n").unwrap();
+    tree.ok(&["trial", "--timeout", "5"]);
+    assert!(!tree.path("reboot.log").exists());
+}
+
+#[test]
+#[ignore = "needs root: recab mutations check for root"]
+fn trial_commits_a_healthy_trial_and_reboots_out_of_a_failed_one() {
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+
+    // Healthy: committed, no reboot.
+    tree.ok(&["set-next", "B"]);
+    tree.boot_into("b");
+    let out = tree.recab(&["trial", "--timeout", "5"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("committed slot B"));
+    let status = tree.status();
+    assert_eq!(status["committed"], true);
+    assert_eq!(status["default_slot"], "B");
+    assert!(!tree.path("reboot.log").exists());
+
+    // Degraded: not committed, reboot into the known-good slot B.
+    tree.ok(&["set-next", "A"]);
+    tree.boot_into("a");
+    fs::write(tree.path("system-state"), "degraded\n").unwrap();
+    fs::write(tree.path("failed-units"), "broken.service loaded failed failed Broken\n").unwrap();
+    let out = tree.recab(&["trial", "--timeout", "5"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(23), "{stderr}");
+    assert!(stderr.contains("broken.service") && stderr.contains("Rebooting into slot B"), "{stderr}");
+    assert_eq!(read(&tree.path("reboot.log")), "reboot\n");
+    let status = tree.status();
+    assert_eq!(status["committed"], false);
+    assert_eq!(status["next_boot"], "B");
+}
+
+#[test]
+#[ignore = "needs root: recab mutations check for root"]
+fn trial_that_never_finishes_starting_fails() {
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+    tree.ok(&["set-next", "B"]);
+    tree.boot_into("b");
+    fs::write(
+        tree.path("systemctl"),
+        format!(
+            "#!/bin/sh\ncase \"$*\" in \"is-system-running --wait\") sleep 30 ;; \"--no-block reboot\") echo reboot >> '{}' ;; esac\n",
+            tree.path("reboot.log").display()
+        ),
+    )
+    .unwrap();
+    let out = tree.recab(&["trial", "--timeout", "1"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(23), "{stderr}");
+    assert!(stderr.contains("did not finish starting"), "{stderr}");
+    assert!(tree.path("reboot.log").exists());
+}
+
+#[test]
+fn install_unit_writes_and_enables_the_trial_service() {
+    let tree = Tree::new();
+    tree.ok(&["install-unit", "--root", tree.path("target").to_str().unwrap()]);
+    let unit = read(&tree.path("target/etc/systemd/system/recab-trial.service"));
+    assert!(unit.contains("ExecStart=/usr/bin/recab trial"), "{unit}");
+    let link = fs::read_link(tree.path(
+        "target/etc/systemd/system/sysinit.target.wants/recab-trial.service",
+    ))
+    .unwrap();
+    assert_eq!(link, Path::new("/etc/systemd/system/recab-trial.service"));
 }
 
 #[test]
@@ -207,18 +307,20 @@ fn set_next_refuses_a_slot_without_its_kernel() {
 fn failed_bootctl_restores_state_and_loader_conf() {
     let tree = Tree::new();
     tree.ok(&["commit"]);
+    tree.ok(&["set-next", "B"]);
     let loader = read(&tree.path("boot/loader/loader.conf"));
     let state = read(&tree.path("state/state.json"));
 
+    // Cancelling the trial fails at set-default: nothing changed.
     fs::write(tree.path("fail-set-default"), "").unwrap();
     let out = tree.recab(&["rollback"]);
-    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(read(&tree.path("boot/loader/loader.conf")), loader);
     assert_eq!(read(&tree.path("state/state.json")), state);
+    assert!(tree.has_efivar("LoaderEntryOneShot"));
 
     // A failure after a firmware variable changed is a partial update.
     fs::remove_file(tree.path("fail-set-default")).unwrap();
-    tree.ok(&["set-next", "B"]);
     fs::write(tree.path("fail-set-oneshot"), "").unwrap();
     let out = tree.recab(&["rollback"]);
     assert_eq!(

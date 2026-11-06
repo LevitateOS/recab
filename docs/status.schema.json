@@ -8,7 +8,7 @@
       "$ref": "#/$defs/Slot"
     },
     "committed": {
-      "description": "The running slot is the known-good slot. After a trial boot this is\nfalse until `recab commit`; an uncommitted slot is left on next boot.",
+      "description": "The running slot is the known-good slot. After a trial boot this is\nfalse until it is committed; an uncommitted slot is left on next boot.",
       "type": "boolean"
     },
     "default_slot": {

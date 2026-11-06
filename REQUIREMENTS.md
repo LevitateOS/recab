@@ -1,8 +1,8 @@
 # recab Requirements
 
-**Version:** 0.1.0  
+**Version:** 0.2.0  
 **Status:** Draft  
-**Last Updated:** 2026-02-14
+**Last Updated:** 2026-11-06
 
 This document defines the requirements for `recab`: an A/B (slot-based) boot
 selection and commit/rollback manager for LevitateOS-style immutable systems.
@@ -95,7 +95,8 @@ prompts in the default path).
 ### 3.3 Idempotency
 
 **REQ-DESIGN-020**: `recab` operations SHOULD be idempotent where possible.
-Example: setting next slot to the already-pending slot should succeed without
+Example: setting next slot to the already-pending slot, or committing a slot
+that is committed, the default and has no trial pending, should succeed without
 changing meaningfully observable state.
 
 ### 3.4 Cross-Architecture
@@ -142,7 +143,20 @@ trial slot fails to boot successfully or fails to be committed as good within a
 bounded number of boot attempts.
 
 Note: this requirement implies bootloader-level support (or equivalent) because
-userspace cannot run when the system does not boot.
+userspace cannot run when the system does not boot. recab gives one attempt
+(a one-shot entry over a known-good default); fallback happens at the next
+reboot, so REQ-SM-022 makes failed trials reboot.
+
+**REQ-SM-021**: With `recab-trial.service` enabled, a trial boot whose startup
+ends with no failed unit MUST be committed without operator action, and one
+whose startup ends any other way, or does not end within a bounded time, MUST
+NOT be committed.
+
+**REQ-SM-022**: A failed trial MUST reboot into the known-good slot: a trial
+`recab trial` judges failed (REQ-SM-021) is rebooted by it, and slot entries
+`recab stage` writes carry `panic=` so a panicking kernel reboots. A kernel or
+PID 1 that hangs without panicking is outside this requirement: it needs a
+hardware watchdog, which recab does not configure.
 
 ---
 
@@ -157,6 +171,8 @@ userspace cannot run when the system does not boot.
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
+- `recab trial` (decides a trial boot; run by `recab-trial.service`)
+- `recab install-unit [--root DIR]` (installs and enables that service)
 
 **REQ-CLI-002**: `recab status` MUST report, at minimum:
 
@@ -177,7 +193,8 @@ good slot on next reboot.
 ### 5.2 Output Rules
 
 **REQ-CLI-010**: Commands MUST be quiet on success (no extraneous logs), and MUST
-print actionable errors to stderr on failure.
+print actionable errors to stderr on failure. `recab trial` prints one line when
+it commits, as the journal's record of the decision.
 
 **REQ-CLI-011**: `recab status` SHOULD support a machine-readable output mode
 (for example `--json`) suitable for scripts and test harnesses.
@@ -195,10 +212,12 @@ can call without invoking the CLI.
 
 - A `Slot` type (A/B)
 - A `Status`-like structure that represents the same information as `recab status`
-- Functions to `set_next(slot)`, `commit()`, and `rollback()`
+- Functions to `set_next(slot)`, `commit()`, and `rollback()`, and `stage()` and
+  `trial()`
 
 **REQ-LIB-003**: The library MUST separate pure state representation from the
-backend implementation used to read/write boot metadata.
+backend implementation used to read/write boot metadata. (`src/state.rs` plans
+every transition without I/O; `src/systemd_boot.rs` reads and applies it.)
 
 ---
 
@@ -239,7 +258,10 @@ semantics in a way that satisfies `REQ-SM-020` (automatic fallback).
 - determining the previously known-good slot for rollback
 - recording the last requested transition (set-next/commit/rollback)
 
-**REQ-PERSIST-002**: Persistent state writes MUST be atomic (temp file + rename).
+**REQ-PERSIST-002**: Persistent state writes MUST be atomic and durable: a temp
+file flushed to disk, renamed over the target, and the directory flushed. The
+same applies to `loader.conf` and to the entries and kernels `stage` writes
+(where the FAT ESP allows: its renames are not guaranteed atomic).
 
 ### 8.2 Audit Metadata
 
@@ -256,7 +278,9 @@ such as:
 
 ### 9.1 Exit Codes
 
-**REQ-ERR-001**: The CLI MUST use stable, documented exit codes.
+**REQ-ERR-001**: The CLI MUST use stable, documented exit codes (README, "Exit
+Codes"): 13 permission, 20 backend unavailable, 21 refused or undetectable
+state, 22 partial update, 23 failed trial.
 
 **REQ-ERR-002**: Error output MUST include enough context for operators and
 automation to determine whether the failure is actionable vs a hard stop.
@@ -270,8 +294,9 @@ partially updated state.
 
 ## 10. Security
 
-**REQ-SEC-001**: `recab` MUST refuse to perform mutating operations unless run
-with sufficient privileges (root).
+**REQ-SEC-001**: `recab` MUST refuse to perform mutating operations (`stage`,
+`set-next`, `commit`, `rollback`, and `trial` when it commits) unless run with
+sufficient privileges (root).
 
 **REQ-SEC-002**: `recab` MUST NOT accept arbitrary slot identifiers. Slot inputs
 MUST be validated and restricted to `A` or `B`.
