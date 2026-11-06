@@ -10,20 +10,27 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use crate::init_system::InitSystem;
 use crate::state::PersistentState;
 use crate::store::{copy_durable, read_optional, write_durable, Store};
 use crate::systemd_boot::{loader_with_default, SystemdBoot, PANIC_OPTION};
-use crate::{tagged_err, unit, ErrorClass, InitRequest, Slot};
+use crate::{tagged_err, ErrorClass, InitRequest, Slot};
 
 pub(crate) fn run(request: &InitRequest) -> Result<()> {
     let root = &request.root;
     let boot_root = root.join("boot");
-    if !boot_root.join("loader").is_dir() {
+    // `bootctl install` creates loader/; installers that copy systemd-boot's
+    // EFI binary themselves do not.
+    let systemd_boot = ["EFI/systemd/systemd-bootx64.efi", "EFI/BOOT/BOOTX64.EFI", "EFI/systemd/systemd-bootaa64.efi", "EFI/BOOT/BOOTAA64.EFI"]
+        .iter()
+        .any(|rel| boot_root.join(rel).is_file());
+    if !systemd_boot {
         bail!(
-            "'{}' has no loader/ directory; install systemd-boot on the target's ESP first (bootctl install)",
+            "'{}' has no systemd-boot EFI binary; install systemd-boot on the target's ESP first",
             boot_root.display()
         );
     }
+    let init = InitSystem::installed_in(root)?;
     let (id, name) = os_identity(root)?;
     let partuuids = [
         (Slot::A, partuuid(&request.slot_a)?),
@@ -72,16 +79,15 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
         ..PersistentState::default()
     };
     Store::under(root).save(&state, "init")?;
-    unit::install(root)?;
+    init.install_trial_service(root)?;
 
     // A previous install may have left systemd-boot variables naming the
     // other slot; they win over loader.conf. Point them at slot A.
     let backend = SystemdBoot::at_boot_root(&boot_root)?;
     if backend.efivars_available() {
-        let esp = format!("--esp-path={}", boot_root.display());
         backend
-            .bootctl(&[&esp, "set-default", &default_entry])
-            .and_then(|()| backend.bootctl(&[&esp, "set-oneshot", ""]))
+            .set_loader_efivar("LoaderEntryDefault", Some(&default_entry))
+            .and_then(|()| backend.set_loader_efivar("LoaderEntryOneShot", None))
             .context("pointing systemd-boot's firmware variables at slot A")?;
     }
     Ok(())

@@ -1,7 +1,8 @@
 //! recab against a scratch boot tree: slot entries whose `root=` names fake
-//! devices, a `/proc/cmdline` stand-in, a fake `bootctl` that writes the
-//! systemd-boot EFI variables in their real format, and a fake `systemctl`
-//! whose startup state the test sets. No disk is touched.
+//! devices, a `/proc/cmdline` stand-in, an efivars directory where recab
+//! writes systemd-boot's variables in their real format, a fake `systemctl`
+//! whose startup state the test sets, and a fake OpenRC state directory.
+//! No disk is touched.
 //!
 //! recab's mutations need root; unprivileged runs get it inside a user
 //! namespace (`unshare --user --map-root-user`), which only affects the
@@ -40,21 +41,6 @@ impl Tree {
         fs::write(root.join("boot/vmlinuz"), "kernel").unwrap();
         fs::write(root.join("os-release"), "ID=lev\n").unwrap();
         executable(
-            &root.join("bootctl"),
-            &format!(
-                r#"#!/bin/sh
-[ "$1" = --version ] && {{ echo 'bootctl 255'; exit 0; }}
-case "$1" in --esp-path=*) shift ;; esac
-echo "$*" >> '{root}/bootctl.log'
-[ -e '{root}/fail-'"$1" ] && {{ echo simulated failure >&2; exit 1; }}
-case "$1" in set-default) var=LoaderEntryDefault ;; set-oneshot) var=LoaderEntryOneShot ;; esac
-file='{root}/efi/efivars/'$var-{GUID}
-if [ -z "$2" ]; then rm -f "$file"; else {{ printf '\007\000\000\000'; printf '%s\000' "$2" | iconv -f UTF-8 -t UTF-16LE; }} > "$file"; fi
-"#,
-                root = root.display(),
-            ),
-        );
-        executable(
             &root.join("systemctl"),
             &format!(
                 r#"#!/bin/sh
@@ -67,6 +53,14 @@ esac
                 root = root.display(),
             ),
         );
+        executable(
+            &root.join("reboot"),
+            &format!("#!/bin/sh\necho reboot >> '{}/reboot.log'\n", root.display()),
+        );
+        executable(&root.join("rc-status"), "#!/bin/sh\n");
+        fs::create_dir_all(root.join("openrc/starting")).unwrap();
+        fs::create_dir_all(root.join("openrc/failed")).unwrap();
+        fs::write(root.join("openrc/softlevel"), "default\n").unwrap();
         fs::write(root.join("system-state"), "running\n").unwrap();
         let tree = Self { dir };
         tree.boot_into("a");
@@ -101,6 +95,18 @@ esac
         }
     }
 
+    /// Make writing the EFI variable `name` fail: a directory stands where
+    /// the variable file would be written.
+    fn block_efivar(&self, name: &str, blocked: bool) {
+        let path = self.path(&format!("efi/efivars/{name}-{GUID}"));
+        if blocked {
+            let _ = fs::remove_file(&path);
+            fs::create_dir_all(path.join("blocker")).unwrap();
+        } else {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+
     fn command(&self, as_root: bool) -> Command {
         // SAFETY: geteuid has no preconditions.
         let mut cmd = if as_root && unsafe { libc::geteuid() } != 0 {
@@ -118,8 +124,10 @@ esac
             .env("RECAB_PROC_CMDLINE_PATH", self.path("cmdline"))
             .env("RECAB_SYS_FIRMWARE_EFI_PATH", self.path("efi"))
             .env("RECAB_EFIVARS_PATH", self.path("efi/efivars"))
-            .env("RECAB_BOOTCTL_BIN", self.path("bootctl"))
-            .env("RECAB_SYSTEMCTL_BIN", self.path("systemctl"));
+            .env("RECAB_INIT_SYSTEM", "systemd")
+            .env("RECAB_SYSTEMCTL_BIN", self.path("systemctl"))
+            .env("RECAB_OPENRC_DIR", self.path("openrc"))
+            .env("RECAB_RC_STATUS_BIN", self.path("rc-status"));
         cmd
     }
 
@@ -148,6 +156,12 @@ esac
     fn status(&self) -> serde_json::Value {
         let out = self.ok(&["status", "--json"]);
         serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    fn efivar(&self, name: &str) -> Option<String> {
+        let bytes = fs::read(self.path(&format!("efi/efivars/{name}-{GUID}"))).ok()?;
+        let units: Vec<u16> = bytes[4..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|u| *u != 0).collect();
+        String::from_utf16(&units).ok()
     }
 
     fn has_efivar(&self, name: &str) -> bool {
@@ -247,24 +261,25 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
 }
 
 #[test]
-fn failed_bootctl_leaves_the_state_alone() {
+fn a_failed_firmware_write_leaves_the_state_alone() {
+    // Committing a trial fails at the firmware default: loader.conf is put
+    // back and nothing changed.
+    let tree = Tree::trial_of_b();
+    let loader = tree.read("boot/loader/loader.conf");
+    let state = tree.read("state/state.json");
+    tree.block_efivar("LoaderEntryDefault", true);
+    tree.fails(&["commit"], 1, "unchanged");
+    assert_eq!(tree.read("boot/loader/loader.conf"), loader);
+    assert_eq!(tree.read("state/state.json"), state);
+
+    // With a trial pending, the one-shot is cleared first; the default then
+    // fails: a partial update whose next boot is the old, safe default.
     let tree = Tree::new();
     tree.ok(&["commit"]);
     tree.ok(&["set-next", "B"]);
     let loader = tree.read("boot/loader/loader.conf");
     let state = tree.read("state/state.json");
-
-    // Cancelling the trial fails before anything changed.
-    fs::write(tree.path("fail-set-oneshot"), "").unwrap();
-    tree.fails(&["rollback"], 1, "unchanged");
-    assert_eq!(tree.read("boot/loader/loader.conf"), loader);
-    assert_eq!(tree.read("state/state.json"), state);
-    assert!(tree.has_efivar("LoaderEntryOneShot"));
-
-    // The one-shot is cleared first; set-default then fails: a partial
-    // update whose next boot is the old, safe default.
-    fs::remove_file(tree.path("fail-set-oneshot")).unwrap();
-    fs::write(tree.path("fail-set-default"), "").unwrap();
+    tree.block_efivar("LoaderEntryDefault", true);
     tree.fails(&["rollback"], 22, "one-shot boot was cleared");
     assert_eq!(tree.read("boot/loader/loader.conf"), loader, "loader.conf is put back");
     assert_eq!(tree.read("state/state.json"), state, "the state is written last");
@@ -407,7 +422,8 @@ fn install_unit_writes_and_enables_the_trial_service() {
 fn init_sets_up_the_boot_layout_of_an_installed_system() {
     let tree = Tree::new();
     let target = tree.path("target");
-    fs::create_dir_all(target.join("boot/loader")).unwrap();
+    fs::create_dir_all(target.join("boot/EFI/systemd")).unwrap();
+    fs::write(target.join("boot/EFI/systemd/systemd-bootx64.efi"), "efi").unwrap();
     fs::create_dir_all(target.join("etc")).unwrap();
     fs::write(target.join("etc/os-release"), "NAME=\"Lev OS\"\nID=lev\n").unwrap();
     fs::write(tree.path("kernel"), "new kernel").unwrap();
@@ -440,7 +456,7 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
     assert_eq!(state["known_good_slot"], "A");
     assert!(tree.path("target/etc/systemd/system/sysinit.target.wants/recab-trial.service").symlink_metadata().is_ok());
     // The stale firmware default from an earlier install now names slot A.
-    assert!(tree.read("bootctl.log").contains("set-default lev-a.conf"));
+    assert_eq!(tree.efivar("LoaderEntryDefault").as_deref(), Some("lev-a.conf"));
 }
 
 /// Fields a newer recab wrote survive an older recab's write.
@@ -459,4 +475,62 @@ fn state_keeps_fields_it_does_not_know() {
     assert_eq!(state["schema"], 2);
     assert_eq!(state["future_field"], serde_json::json!([1, 2]));
     assert_eq!(state["pending_trial_slot"], "B");
+}
+
+/// OpenRC: startup is done when the default runlevel is entered with
+/// nothing starting; a service in `failed/` fails the trial; recab reboots
+/// with OpenRC's reboot; trials carry no initramfs or systemd options.
+#[test]
+fn openrc_trials_commit_when_healthy_and_reboot_when_a_service_failed() {
+    let openrc = |tree: &Tree, args: &[&str]| {
+        tree.command(true)
+            .env("RECAB_INIT_SYSTEM", "openrc")
+            .env("RECAB_REBOOT_BIN", tree.path("reboot"))
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+    assert!(openrc(&tree, &["set-next", "B"]).status.success());
+    let entry = tree.read("boot/loader/entries/lev-b.conf");
+    assert!(!entry.contains("rd.emergency=reboot"), "OpenRC trials need no initramfs options: {entry}");
+    tree.boot_into("b");
+    let out = openrc(&tree, &["trial", "--timeout", "5"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(tree.status()["committed"], true);
+
+    tree.ok(&["set-next", "A"]);
+    tree.boot_into("a");
+    fs::write(tree.path("openrc/failed/sshd"), "").unwrap();
+    let out = openrc(&tree, &["trial", "--timeout", "5"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(23), "{stderr}");
+    assert!(stderr.contains("sshd") && stderr.contains("Rebooting into slot B"), "{stderr}");
+    assert_eq!(tree.read("reboot.log"), "reboot\n");
+
+    // Still starting when the deadline passes: failed.
+    let tree = Tree::trial_of_b();
+    fs::write(tree.path("openrc/starting/networking"), "").unwrap();
+    let out = openrc(&tree, &["trial", "--timeout", "1"]);
+    assert_eq!(out.status.code(), Some(23), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn install_unit_writes_and_enables_the_openrc_service() {
+    let tree = Tree::new();
+    let target = tree.path("target");
+    fs::create_dir_all(target.join("sbin")).unwrap();
+    fs::write(target.join("sbin/openrc-run"), "").unwrap();
+    let out = tree
+        .command(true)
+        .env_remove("RECAB_INIT_SYSTEM")
+        .args(["install-unit", "--root", target.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let service = tree.read("target/etc/init.d/recab-trial");
+    assert!(service.starts_with("#!/sbin/openrc-run") && service.contains("/usr/bin/recab trial"), "{service}");
+    let link = fs::read_link(tree.path("target/etc/runlevels/boot/recab-trial")).unwrap();
+    assert_eq!(link, Path::new("/etc/init.d/recab-trial"));
 }

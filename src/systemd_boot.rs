@@ -1,13 +1,15 @@
 //! The systemd-boot backend: which slot booted and which boots next (slot
 //! entries, loader.conf and systemd-boot's EFI variables), changing that
-//! selection with bootctl, and each slot's entry and kernel files on the ESP.
+//! selection by writing those variables, and each slot's entry and kernel
+//! files on the ESP. It needs no `bootctl`, so it works where only
+//! systemd-boot's EFI binary is installed.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::error::{tagged_err, ErrorClass};
 use crate::state::{BootChange, Selection};
@@ -21,12 +23,17 @@ const LOADER_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
 /// entry recab writes: a trial that panics reboots into the default slot.
 pub(crate) const PANIC_OPTION: &str = "panic=10";
 
-/// Kernel options a slot's entry carries while it is scheduled as a trial
-/// and before it is committed: the initramfs reboots instead of opening an
-/// emergency shell, and a crashing PID 1 reboots instead of freezing. They
-/// leave the entry when it becomes the default, so a committed slot that
-/// fails gets a shell to repair it rather than a reboot loop.
-pub(crate) const TRIAL_OPTIONS: &[&str] = &["rd.emergency=reboot", "systemd.crash_action=reboot"];
+/// Every kernel option any init system uses as a trial option (see
+/// `InitSystem::trial_options`): an entry that becomes the default loses
+/// all of them.
+const ALL_TRIAL_OPTIONS: &[&str] = &["rd.emergency=reboot", "systemd.crash_action=reboot"];
+
+/// EFI variable attributes: non-volatile, boot-service and runtime access.
+const EFI_VARIABLE_ATTRIBUTES: u32 = 0x7;
+/// `statfs` magic of efivarfs.
+const EFIVARFS_MAGIC: i64 = 0xde5e81e4;
+/// `FS_IMMUTABLE_FL`, which efivarfs sets on variables.
+const FS_IMMUTABLE_FL: libc::c_int = 0x10;
 
 const KERNEL_FILE: &str = "vmlinuz";
 const INITRD_FILE: &str = "initramfs.img";
@@ -41,7 +48,6 @@ pub(crate) struct SystemdBoot {
     proc_cmdline: PathBuf,
     sys_firmware_efi: PathBuf,
     efivars: PathBuf,
-    bootctl: String,
     /// The slot entries' name prefix, when not inferred.
     entry_prefix: Option<String>,
 }
@@ -96,13 +102,12 @@ impl SystemdBoot {
             proc_cmdline: path("RECAB_PROC_CMDLINE_PATH", "/proc/cmdline"),
             sys_firmware_efi: path("RECAB_SYS_FIRMWARE_EFI_PATH", "/sys/firmware/efi"),
             efivars: path("RECAB_EFIVARS_PATH", "/sys/firmware/efi/efivars"),
-            bootctl: std::env::var("RECAB_BOOTCTL_BIN").unwrap_or_else(|_| "bootctl".to_string()),
             entry_prefix,
         })
     }
 
     pub fn read(&self) -> Result<Boot> {
-        // systemd-boot tries the firmware variable bootctl set-default writes,
+        // systemd-boot tries the LoaderEntryDefault firmware variable,
         // then loader.conf's `default`, skipping entries it cannot boot.
         let efivar_default = self.loader_efivar("LoaderEntryDefault");
         let conf_default = read_optional(&self.loader_conf)?.as_deref().and_then(loader_default);
@@ -139,8 +144,8 @@ impl SystemdBoot {
         (sel_prefix == def_prefix).then_some(selected != default)
     }
 
-    /// Changing the boot selection needs a UEFI system with efivarfs and
-    /// bootctl, which writes the firmware variables systemd-boot obeys.
+    /// Changing the boot selection needs a UEFI system with efivarfs, where
+    /// the variables systemd-boot obeys are written.
     pub fn ensure_can_change(&self) -> Result<()> {
         for (dir, missing) in [
             (&self.sys_firmware_efi, "this host does not appear to be booted in UEFI mode"),
@@ -156,39 +161,26 @@ impl SystemdBoot {
                 ));
             }
         }
-        let available = Command::new(&self.bootctl)
-            .arg("--version")
-            .output()
-            .is_ok_and(|output| output.status.success());
-        if !available {
-            return Err(tagged_err(
-                ErrorClass::BackendUnavailable,
-                format!(
-                    "changing the boot selection needs '{}' (systemd-boot's bootctl); install it or point RECAB_BOOTCTL_BIN at it",
-                    self.bootctl
-                ),
-            ));
-        }
         Ok(())
     }
 
-    /// Write `change`. A one-shot entry first gets the trial options. For a
+    /// Write `change`. A one-shot entry first gets `trial_options`. For a
     /// new default, a pending one-shot is cleared first (so the riskier boot
     /// is the one dropped), the entry loses the trial options, then
     /// loader.conf and the firmware variable name it.
-    pub fn apply(&self, boot: &Boot, change: BootChange) -> Result<(), ApplyError> {
+    pub fn apply(&self, boot: &Boot, change: BootChange, trial_options: &[&str]) -> Result<(), ApplyError> {
         match change {
             BootChange::None => Ok(()),
             BootChange::OneShot(slot) => {
                 let entry = self.entry_for(boot, slot).map_err(ApplyError::Untouched)?;
-                self.set_trial_options(&entry, true).map_err(ApplyError::Untouched)?;
-                self.bootctl(&["set-oneshot", &entry]).map_err(ApplyError::Untouched)
+                self.set_trial_options(&entry, trial_options).map_err(ApplyError::Untouched)?;
+                self.set_loader_efivar("LoaderEntryOneShot", Some(&entry)).map_err(ApplyError::Untouched)
             }
             BootChange::Default(slot) => {
                 let entry = self.entry_for(boot, slot).map_err(ApplyError::Untouched)?;
                 let mut cleared_oneshot = false;
                 if self.loader_efivar("LoaderEntryOneShot").is_some() {
-                    self.bootctl(&["set-oneshot", ""]).map_err(ApplyError::Untouched)?;
+                    self.set_loader_efivar("LoaderEntryOneShot", None).map_err(ApplyError::Untouched)?;
                     cleared_oneshot = true;
                 }
                 // From here a failure leaves the one-shot cleared and the old
@@ -202,13 +194,13 @@ impl SystemdBoot {
                         ApplyError::Untouched(cause)
                     }
                 };
-                self.set_trial_options(&entry, false).map_err(failed)?;
+                self.set_trial_options(&entry, &[]).map_err(failed)?;
                 let before = read_optional(&self.loader_conf).map_err(failed)?;
                 let content = loader_with_default(before.as_deref(), &entry);
                 write_durable(&self.loader_conf, content.as_bytes())
                     .with_context(|| format!("writing '{}'", self.loader_conf.display()))
                     .map_err(failed)?;
-                if let Err(cause) = self.bootctl(&["set-default", &entry]) {
+                if let Err(cause) = self.set_loader_efivar("LoaderEntryDefault", Some(&entry)) {
                     let restore = match &before {
                         Some(content) => write_durable(&self.loader_conf, content.as_bytes()),
                         None => fs::remove_file(&self.loader_conf).map_err(Into::into),
@@ -250,14 +242,12 @@ Write a system into slot {slot} with 'recab stage' first."
             .find(|file| !self.boot_root.join(file.trim_start_matches('/')).is_file())
     }
 
-    /// Add or remove [`TRIAL_OPTIONS`] on the entry's `options`.
-    fn set_trial_options(&self, entry: &str, on: bool) -> Result<()> {
+    /// Make `trial_options` the entry's only trial options (none: a default).
+    fn set_trial_options(&self, entry: &str, trial_options: &[&str]) -> Result<()> {
         let content = self.entry_content(entry)?;
         let updated = entry_with_options(&content, |options| {
-            options.retain(|o| !TRIAL_OPTIONS.contains(&o.as_str()));
-            if on {
-                options.extend(TRIAL_OPTIONS.iter().map(|o| o.to_string()));
-            }
+            options.retain(|o| !ALL_TRIAL_OPTIONS.contains(&o.as_str()));
+            options.extend(trial_options.iter().map(|o| o.to_string()));
         });
         if updated == content {
             return Ok(());
@@ -310,13 +300,14 @@ Write a system into slot {slot} with 'recab stage' first."
 
     /// Install the slot's kernel (and initrd) in its ESP directory and point
     /// its entry at them. The entry gets `panic=` and, the slot being
-    /// uncommitted, the trial options.
+    /// uncommitted, `trial_options`.
     pub fn install_slot_boot_files(
         &self,
         boot: &Boot,
         slot: Slot,
         kernel: &Path,
         initrd: Option<&Path>,
+        trial_options: &[&str],
     ) -> Result<()> {
         let entry = self.entry_for(boot, slot)?;
         let content = self.entry_content(&entry)?;
@@ -336,8 +327,8 @@ Write a system into slot {slot} with 'recab stage' first."
             if !options.iter().any(|o| o.starts_with("panic=")) {
                 options.push(PANIC_OPTION.to_string());
             }
-            options.retain(|o| !TRIAL_OPTIONS.contains(&o.as_str()));
-            options.extend(TRIAL_OPTIONS.iter().map(|o| o.to_string()));
+            options.retain(|o| !ALL_TRIAL_OPTIONS.contains(&o.as_str()));
+            options.extend(trial_options.iter().map(|o| o.to_string()));
         });
         let path = self.entries_dir.join(&entry);
         write_durable(&path, content.as_bytes())
@@ -372,22 +363,44 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
         self.sys_firmware_efi.is_dir() && self.efivars.is_dir()
     }
 
-    pub(crate) fn bootctl(&self, args: &[&str]) -> Result<()> {
-        let output = Command::new(&self.bootctl)
-            .args(args)
-            .output()
-            .with_context(|| format!("running '{}' with args {:?}", self.bootctl, args))?;
-        if output.status.success() {
-            return Ok(());
+    /// Set (or, with `None`, remove) a systemd-boot EFI variable holding an
+    /// entry name, as bootctl does: efivarfs marks variables immutable, so
+    /// that flag is cleared first, and a variable is replaced by writing
+    /// attributes and value in one write.
+    pub(crate) fn set_loader_efivar(&self, name: &str, value: Option<&str>) -> Result<()> {
+        let path = self.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
+        let context = || format!("writing the EFI variable '{}'", path.display());
+        if path.exists() {
+            clear_immutable(&path).with_context(context)?;
         }
-        bail!(
-            "{} {:?} failed (exit {}): {}\n{}",
-            self.bootctl,
-            args,
-            output.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let Some(value) = value else {
+            return match fs::remove_file(&path) {
+                Err(err) if err.kind() != ErrorKind::NotFound => Err(anyhow!(err)).with_context(context),
+                _ => Ok(()),
+            };
+        };
+        let mut bytes = EFI_VARIABLE_ATTRIBUTES.to_le_bytes().to_vec();
+        for unit in value.encode_utf16().chain([0]) {
+            bytes.extend(unit.to_le_bytes());
+        }
+        if !on_efivarfs(&self.efivars) {
+            // A plain directory (a scratch tree): replace the file.
+            return fs::write(&path, &bytes).with_context(context);
+        }
+        use std::io::Write;
+        // efivarfs replaces a variable with each complete write; it is never
+        // truncated.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(context)?;
+        let written = file.write(&bytes).with_context(context)?;
+        if written != bytes.len() {
+            return Err(anyhow!("short write ({written} of {} bytes)", bytes.len())).with_context(context);
+        }
+        Ok(())
     }
 
     /// A systemd-boot EFI variable holding an entry name, if set.
@@ -733,4 +746,38 @@ fn root_selector_from_entry_content(content: &str) -> Option<RootSelector> {
         .filter(|rest| rest.starts_with(char::is_whitespace))
         .collect();
     root_selector_from_cmdline(&options.join(" "))
+}
+
+fn on_efivarfs(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a zeroed statfs is a valid out-parameter; `path` is NUL-terminated.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    unsafe { libc::statfs(path.as_ptr(), &mut stat) == 0 && stat.f_type as i64 == EFIVARFS_MAGIC }
+}
+
+/// Clear `FS_IMMUTABLE_FL`; filesystems without file flags have nothing to clear.
+fn clear_immutable(path: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let file = fs::File::open(path)?;
+    let mut flags: libc::c_int = 0;
+    // SAFETY: FS_IOC_GETFLAGS/SETFLAGS read and write one int on an open fd.
+    unsafe {
+        if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) != 0 {
+            let err = std::io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP) => Ok(()),
+                _ => Err(err),
+            };
+        }
+        if flags & FS_IMMUTABLE_FL != 0 {
+            flags &= !FS_IMMUTABLE_FL;
+            if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
 }

@@ -11,15 +11,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::init_system::InitSystem;
 use crate::store::write_durable;
 use crate::systemd_boot::{Boot, SystemdBoot};
-use crate::{tagged_err, unit, ErrorClass, Slot, StageRequest};
+use crate::{tagged_err, ErrorClass, Slot, StageRequest};
 
-/// Machine configuration a new system keeps from the running one: identity,
-/// locale and time. Everything else under /etc comes from the new image,
-/// except what [`ACCOUNT_FILES`] and [`OVERLAID_DIRS`] merge.
+/// Machine configuration every new system keeps from the running one:
+/// identity, locale and time. Everything else under /etc comes from the new
+/// image, except the accounts ([`ACCOUNT_FILES`]) and what the init system
+/// keeps ([`InitSystem::carried`]).
 const CARRIED_FILES: &[&str] = &[
     "etc/hostname",
+    "etc/hosts",
     "etc/machine-id",
     "etc/subuid",
     "etc/subgid",
@@ -32,10 +35,6 @@ const CARRIED_FILES: &[&str] = &[
 /// and groups) plus the running system's, whose own entries win (passwords,
 /// shells, group members).
 const ACCOUNT_FILES: &[&str] = &["etc/passwd", "etc/group", "etc/shadow", "etc/gshadow"];
-/// Directories whose running-system contents are copied over the image's,
-/// adding what the machine enabled or configured without removing what the
-/// new image enables.
-const OVERLAID_DIRS: &[&str] = &["etc/systemd/system", "etc/NetworkManager/system-connections"];
 /// SSH host keys, so the machine keeps its SSH identity.
 const SSH_DIR: &str = "etc/ssh";
 const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
@@ -69,6 +68,7 @@ pub(crate) fn write_slot(
     slot: Slot,
     request: &StageRequest,
     target: &Target,
+    init: InitSystem,
 ) -> Result<()> {
     let device = &target.device;
     let running_root = Path::new("/");
@@ -91,12 +91,12 @@ pub(crate) fn write_slot(
         &["--quiet", "--rootfs", path_str(&request.rootfs)?, path_str(&mount_point)?],
     )
     .context("extracting the rootfs image into the slot")?;
-    carry_configuration(running_root, &mount_point)?;
-    if unit::enabled(running_root) {
-        // The unit as the new image's recab writes it: run that recab in the
-        // new root, so its own version of the unit is installed.
+    carry_configuration(running_root, &mount_point, init)?;
+    if init.trial_service_enabled(running_root) {
+        // The service as the new image's recab writes it: run that recab in
+        // the new root, so its own version is installed.
         run("chroot", &[path_str(&mount_point)?, "/usr/bin/recab", "install-unit"])
-            .context("installing the new system's recab-trial.service")?;
+            .context("installing the new system's trial service")?;
     }
     let partuuid = output("blkid", &["-s", "PARTUUID", "-o", "value", path_str(device)?])?;
     write_fstab(
@@ -104,10 +104,16 @@ pub(crate) fn write_slot(
         &mount_point.join("etc/fstab"),
         &partuuid,
     )?;
-    run("sync", &["-f", path_str(&mount_point)?])?;
+    sync_filesystem(&mount_point)?;
     mounted.unmount()?;
 
-    backend.install_slot_boot_files(boot, slot, &request.kernel, request.initrd.as_deref())
+    backend.install_slot_boot_files(
+        boot,
+        slot,
+        &request.kernel,
+        request.initrd.as_deref(),
+        init.trial_options(),
+    )
 }
 
 fn check_inputs(request: &StageRequest) -> Result<()> {
@@ -144,32 +150,83 @@ fn ensure_unmounted(device: &Path) -> Result<()> {
 }
 
 /// Copy the machine configuration from the running root into the new one.
-fn carry_configuration(from: &Path, to: &Path) -> Result<()> {
-    for rel in CARRIED_FILES {
+fn carry_configuration(from: &Path, to: &Path, init: InitSystem) -> Result<()> {
+    let carried = init.carried();
+    for rel in CARRIED_FILES.iter().chain(carried.files) {
         let source = from.join(rel);
         if source.symlink_metadata().is_ok() {
-            copy_preserving(&source, &to.join(rel))?;
+            copy_tree(&source, &to.join(rel))?;
         }
     }
     for rel in ACCOUNT_FILES {
         merge_accounts(&from.join(rel), &to.join(rel))?;
     }
-    for rel in OVERLAID_DIRS {
+    for rel in carried.dirs {
         let source = from.join(rel);
         if source.is_dir() {
-            let dest = to.join(rel);
-            fs::create_dir_all(&dest).with_context(|| format!("creating '{}'", dest.display()))?;
-            // `source/.` copies the contents into `dest`, replacing same-named
-            // entries and keeping the others.
-            run("cp", &["-a", "--remove-destination", &format!("{}/.", path_str(&source)?), path_str(&dest)?])?;
+            copy_tree(&source, &to.join(rel))?;
         }
     }
     if let Ok(entries) = fs::read_dir(from.join(SSH_DIR)) {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().starts_with(SSH_HOST_KEY_PREFIX) {
-                copy_preserving(&entry.path(), &to.join(SSH_DIR).join(entry.file_name()))?;
+                copy_tree(&entry.path(), &to.join(SSH_DIR).join(entry.file_name()))?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Copy `source` to `dest` keeping symlinks, permissions and owners. A
+/// directory's entries are copied into `dest`, replacing same-named ones
+/// and keeping the others (as `cp -a source/. dest`); anything else
+/// replaces `dest`. Done here rather than with `cp`, whose options differ
+/// between GNU coreutils and busybox.
+fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
+    use std::os::unix::fs::{lchown, MetadataExt};
+    let meta = fs::symlink_metadata(source).with_context(|| format!("reading '{}'", source.display()))?;
+    let context = || format!("copying '{}' to '{}'", source.display(), dest.display());
+    let existing = fs::symlink_metadata(dest).ok();
+    if meta.is_dir() {
+        if existing.as_ref().is_some_and(|e| !e.is_dir()) {
+            fs::remove_file(dest).with_context(context)?;
+        }
+        fs::create_dir_all(dest).with_context(context)?;
+        for entry in fs::read_dir(source).with_context(context)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
+        }
+    } else {
+        match existing {
+            Some(e) if e.is_dir() => fs::remove_dir_all(dest).with_context(context)?,
+            Some(_) => fs::remove_file(dest).with_context(context)?,
+            None => {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).with_context(context)?;
+                }
+            }
+        }
+        if meta.file_type().is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(source)?, dest).with_context(context)?;
+        } else {
+            fs::copy(source, dest).with_context(context)?;
+        }
+    }
+    lchown(dest, Some(meta.uid()), Some(meta.gid())).with_context(context)?;
+    if !meta.file_type().is_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dest, fs::Permissions::from_mode(meta.mode() & 0o7777)).with_context(context)?;
+    }
+    Ok(())
+}
+
+/// Flush the filesystem holding `path` to disk.
+fn sync_filesystem(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let dir = fs::File::open(path).with_context(|| format!("opening '{}'", path.display()))?;
+    // SAFETY: syncfs on a file descriptor this function owns.
+    if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("syncing '{}'", path.display()));
     }
     Ok(())
 }
@@ -183,7 +240,7 @@ fn merge_accounts(running: &Path, image: &Path) -> Result<()> {
         return Ok(());
     };
     let Ok(image_content) = fs::read_to_string(image) else {
-        return copy_preserving(running, image);
+        return copy_tree(running, image);
     };
     let name = |line: &str| line.split(':').next().unwrap_or("").to_string();
     let running_lines: Vec<&str> = running_content.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -272,16 +329,6 @@ impl Drop for Mounted {
             }
         }
     }
-}
-
-fn copy_preserving(source: &Path, dest: &Path) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating '{}'", parent.display()))?;
-    }
-    run(
-        "cp",
-        &["-a", "--remove-destination", "--no-target-directory", path_str(source)?, path_str(dest)?],
-    )
 }
 
 fn path_str(path: &Path) -> Result<&str> {

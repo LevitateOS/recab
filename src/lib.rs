@@ -12,12 +12,11 @@
 
 mod error;
 mod init;
+mod init_system;
 mod stage;
 mod state;
 mod store;
 mod systemd_boot;
-mod trial;
-mod unit;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -28,7 +27,7 @@ pub use error::{
     stable_exit_code, EXIT_CODE_BACKEND_UNAVAILABLE, EXIT_CODE_GENERIC, EXIT_CODE_PARTIAL_UPDATE,
     EXIT_CODE_PERMISSION, EXIT_CODE_STATE_OR_DETECTION, EXIT_CODE_TRIAL_FAILED,
 };
-pub use unit::UNIT_NAME;
+pub use init_system::InitSystem;
 
 use error::{tagged_err, ErrorClass};
 use state::{
@@ -37,7 +36,6 @@ use state::{
 };
 use store::{Lock, Store};
 use systemd_boot::{ApplyError, Boot, SystemdBoot};
-use trial::Systemd;
 
 /// System slot identifier (A/B).
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
@@ -218,6 +216,7 @@ pub fn stage(request: &StageRequest) -> Result<()> {
         .expect("stage always writes the inactive slot");
     require_root("stage")?;
     let slot = sys.boot.selection.active.other();
+    let init = InitSystem::running()?;
     let target = stage::check(&sys.backend, &sys.boot, slot, request)?;
     // Recorded before the slot is touched: from here its old system is gone,
     // so nothing may roll back to it, even if the write fails.
@@ -225,7 +224,7 @@ pub fn stage(request: &StageRequest) -> Result<()> {
     sys.store.save(&next, "stage")?;
     sys.store
         .audit(transition.operation, sys.boot.selection.active, &sys.state, &next);
-    stage::write_slot(&sys.backend, &sys.boot, slot, request, &target)
+    stage::write_slot(&sys.backend, &sys.boot, slot, request, &target, init)
 }
 
 /// Configure a one-shot trial boot of the inactive `slot`.
@@ -248,20 +247,18 @@ pub fn rollback() -> Result<()> {
 /// unit failed; otherwise not committed, the known-good slot made the next
 /// boot, and the machine rebooted into it.
 pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
-    let systemd = Systemd::from_env();
-    let startup = systemd.wait_for_startup(timeout)?;
+    let init = InitSystem::running()?;
+    let (startup, failed) = init.wait_for_startup(timeout)?;
     let problem = match &startup {
         Startup::Running => String::new(),
         Startup::Failed(state) => format!("finished starting in state '{state}'"),
         Startup::TimedOut => format!("did not finish starting within {}s", timeout.as_secs()),
         Startup::Inconclusive(_) => return Ok(TrialOutcome::NotATrial),
     };
-    let failed = match &startup {
-        Startup::Running => String::new(),
-        _ => match systemd.failed_units() {
-            units if units.is_empty() => String::new(),
-            units => format!(" (failed units: {})", units.join(", ")),
-        },
+    let failed = if failed.is_empty() {
+        String::new()
+    } else {
+        format!(" (failed: {})", failed.join(", "))
     };
     let fail = |message: String| tagged_err(ErrorClass::TrialFailed, message);
 
@@ -276,7 +273,7 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
                 return Err(err);
             }
             require_root("trial")?;
-            systemd.reboot()?;
+            init.reboot()?;
             return Err(fail(format!(
                 "this one-shot trial boot {problem}{failed}, and the slots could not be read ({err:#}); rebooting into the default entry"
             )));
@@ -333,7 +330,7 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
                 drop(sys);
                 rollback()?;
             }
-            systemd.reboot()?;
+            init.reboot()?;
             Err(fail(format!(
                 "the trial boot of slot {active} {detail}; not committing it. Rebooting into slot {fallback}."
             )))
@@ -341,10 +338,10 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     }
 }
 
-/// Install and enable `recab-trial.service` under `root` (`/` for this
-/// system, or an install target).
+/// Install and enable the trial service of the init system under `root`
+/// (`/` for this system, or an install target).
 pub fn install_unit(root: &Path) -> Result<()> {
-    unit::install(root)
+    InitSystem::installed_in(root)?.install_trial_service(root)
 }
 
 fn require_root(operation: &str) -> Result<()> {
@@ -394,7 +391,9 @@ fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentSt
 
     let mut next = stamped(&transition)?;
     annotate(&mut next);
-    match sys.backend.apply(&sys.boot, transition.boot) {
+    // Without a known init system a trial still gets panic=, not its options.
+    let trial_options = InitSystem::running().map(|init| init.trial_options()).unwrap_or(&[]);
+    match sys.backend.apply(&sys.boot, transition.boot, trial_options) {
         Ok(()) => {}
         Err(ApplyError::Untouched(cause)) => {
             return Err(cause.context(format!("{name} aborted; the boot selection is unchanged")));
