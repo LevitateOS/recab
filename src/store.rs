@@ -13,6 +13,12 @@ use crate::Slot;
 pub(crate) struct Store {
     pub state_path: PathBuf,
     pub audit_path: PathBuf,
+    lock_path: PathBuf,
+}
+
+/// Held for one recab run that changes anything, so runs never interleave.
+pub(crate) struct Lock {
+    _file: File,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,7 +39,43 @@ impl Store {
         Self {
             state_path: path("RECAB_STATE_PATH", "/var/lib/recab/state.json"),
             audit_path: path("RECAB_AUDIT_PATH", "/var/lib/recab/audit.log"),
+            lock_path: path("RECAB_LOCK_PATH", "/run/lock/recab.lock"),
         }
+    }
+
+    /// The store of a system mounted at `root` (for `recab init`).
+    pub fn under(root: &Path) -> Self {
+        Self {
+            state_path: root.join("var/lib/recab/state.json"),
+            audit_path: root.join("var/lib/recab/audit.log"),
+            lock_path: root.join("run/lock/recab.lock"),
+        }
+    }
+
+    /// Wait for, then hold, the exclusive recab lock.
+    pub fn lock(&self) -> Result<Lock> {
+        use std::os::fd::AsRawFd;
+        if let Some(parent) = self.lock_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating '{}'", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock_path)
+            .with_context(|| format!("opening lock '{}'", self.lock_path.display()))?;
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(anyhow!(std::io::Error::last_os_error())
+                .context(format!("locking '{}'", self.lock_path.display())));
+        }
+        Ok(Lock { _file: file })
+    }
+
+    /// recab has written state here.
+    pub fn exists(&self) -> bool {
+        self.state_path.is_file()
     }
 
     pub fn load(&self) -> Result<PersistentState> {
@@ -49,11 +91,9 @@ impl Store {
         };
         let state: PersistentState =
             serde_json::from_str(&content).map_err(|err| fail(err.to_string()))?;
-        if state.schema != STATE_SCHEMA_VERSION {
-            return Err(fail(format!(
-                "schema {} is not the supported schema {STATE_SCHEMA_VERSION}",
-                state.schema
-            )));
+        // A newer schema only adds fields (see STATE_SCHEMA_VERSION).
+        if state.schema < 1 {
+            return Err(fail(format!("schema {} is not a recab state schema", state.schema)));
         }
         Ok(state)
     }

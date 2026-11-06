@@ -37,6 +37,17 @@
         }
       ]
     },
+    "last_trial": {
+      "description": "How the last judged trial boot ended.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TrialRecord"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "next_boot": {
       "description": "The slot the next boot starts: the trial slot, else the default.",
       "anyOf": [
@@ -78,6 +89,34 @@
       "enum": [
         "A",
         "B"
+      ]
+    },
+    "TrialRecord": {
+      "description": "How the last judged trial boot ended.",
+      "type": "object",
+      "properties": {
+        "committed": {
+          "description": "The trial was healthy and committed; otherwise it was abandoned.",
+          "type": "boolean"
+        },
+        "detail": {
+          "description": "How startup ended, and the failed units if any.",
+          "type": "string"
+        },
+        "slot": {
+          "$ref": "#/$defs/Slot"
+        },
+        "unix_time": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "slot",
+        "committed",
+        "detail",
+        "unix_time"
       ]
     }
   }

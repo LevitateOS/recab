@@ -6,19 +6,10 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::state::Startup;
+
 pub(crate) struct Systemd {
     systemctl: String,
-}
-
-/// How system startup ended.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Startup {
-    /// Started with no failed units.
-    Running,
-    /// Finished in another state: `degraded`, `maintenance`, ...
-    Finished(String),
-    /// Still starting when the deadline passed.
-    TimedOut,
 }
 
 impl Systemd {
@@ -52,10 +43,14 @@ impl Systemd {
         if let Some(mut stdout) = child.stdout.take() {
             stdout.read_to_string(&mut state)?;
         }
+        // `degraded`: units failed. `maintenance`: the emergency or rescue
+        // target. Anything else (`stopping`, `offline`, `unknown`, ...) is
+        // a shutdown or an unreachable systemd: no verdict on the boot.
         Ok(match state.trim() {
             "running" => Startup::Running,
-            "" => Startup::Finished("unknown".to_string()),
-            other => Startup::Finished(other.to_string()),
+            state @ ("degraded" | "maintenance") => Startup::Failed(state.to_string()),
+            "" => Startup::Inconclusive("no answer".to_string()),
+            other => Startup::Inconclusive(other.to_string()),
         })
     }
 

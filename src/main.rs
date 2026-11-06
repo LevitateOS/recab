@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use recab::{stable_exit_code, Slot, StageRequest, Status, TrialOutcome};
+use recab::{stable_exit_code, InitRequest, Slot, StageRequest, Status, TrialOutcome};
 
 #[derive(Parser)]
 #[command(name = "recab")]
@@ -21,6 +21,28 @@ enum Command {
         /// Emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Set up the A/B boot layout of a freshly installed system (slot A).
+    Init {
+        /// The installed system's root, with its ESP at boot/ and state at var/.
+        #[arg(long)]
+        root: PathBuf,
+        /// Slot A's partition, holding the installed system.
+        #[arg(long)]
+        slot_a: PathBuf,
+        /// Slot B's partition.
+        #[arg(long)]
+        slot_b: PathBuf,
+        /// Kernel image for slot A.
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Initramfs for slot A, if it boots through one.
+        #[arg(long)]
+        initrd: Option<PathBuf>,
+        /// Extra kernel options for both slot entries (for example consoles).
+        #[arg(long, default_value = "")]
+        options: String,
     },
 
     /// Write a prebuilt system into the inactive slot (formats the slot).
@@ -92,6 +114,21 @@ fn run() -> anyhow::Result<()> {
                 initrd,
             })?;
         }
+        Command::Init {
+            root,
+            slot_a,
+            slot_b,
+            kernel,
+            initrd,
+            options,
+        } => recab::init(&InitRequest {
+            root,
+            slot_a,
+            slot_b,
+            kernel,
+            initrd,
+            options,
+        })?,
         Command::SetNext { slot } => recab::set_next(slot)?,
         Command::Commit => recab::commit()?,
         Command::Rollback => recab::rollback()?,
@@ -121,6 +158,10 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
     println!("rollback: {}", slot(st.rollback_slot, "none"));
     println!("trial_pending: {}", yes_no(st.trial_pending));
     println!("next_boot: {}", slot(st.next_boot, "none"));
+    if let Some(trial) = &st.last_trial {
+        let outcome = if trial.committed { "committed" } else { "abandoned" };
+        println!("last_trial: slot {} {outcome} ({})", trial.slot, trial.detail);
+    }
     println!("entry_prefix: {}", st.entry_prefix);
     Ok(())
 }

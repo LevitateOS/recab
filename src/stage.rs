@@ -16,15 +16,11 @@ use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::{tagged_err, unit, ErrorClass, Slot, StageRequest};
 
 /// Machine configuration a new system keeps from the running one: identity,
-/// accounts, locale and time, enabled units, network connections. Everything
-/// else under /etc comes from the new image.
+/// locale and time. Everything else under /etc comes from the new image,
+/// except what [`ACCOUNT_FILES`] and [`OVERLAID_DIRS`] merge.
 const CARRIED_FILES: &[&str] = &[
     "etc/hostname",
     "etc/machine-id",
-    "etc/passwd",
-    "etc/shadow",
-    "etc/group",
-    "etc/gshadow",
     "etc/subuid",
     "etc/subgid",
     "etc/localtime",
@@ -32,7 +28,14 @@ const CARRIED_FILES: &[&str] = &[
     "etc/vconsole.conf",
     "etc/adjtime",
 ];
-const CARRIED_DIRS: &[&str] = &["etc/systemd/system", "etc/NetworkManager/system-connections"];
+/// Account databases, merged by name: the image's entries (new system users
+/// and groups) plus the running system's, whose own entries win (passwords,
+/// shells, group members).
+const ACCOUNT_FILES: &[&str] = &["etc/passwd", "etc/group", "etc/shadow", "etc/gshadow"];
+/// Directories whose running-system contents are copied over the image's,
+/// adding what the machine enabled or configured without removing what the
+/// new image enables.
+const OVERLAID_DIRS: &[&str] = &["etc/systemd/system", "etc/NetworkManager/system-connections"];
 /// SSH host keys, so the machine keeps its SSH identity.
 const SSH_DIR: &str = "etc/ssh";
 const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
@@ -40,29 +43,48 @@ const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 /// The filesystem stage makes on a slot.
 const SLOT_FILESYSTEM: &str = "ext4";
 
+/// The partition a stage will write, checked before anything is changed.
+pub(crate) struct Target {
+    device: PathBuf,
+}
+
+/// Check everything stage needs without changing anything: the inputs, and
+/// a slot partition named by PARTUUID that is not mounted.
+pub(crate) fn check(backend: &SystemdBoot, boot: &Boot, slot: Slot, request: &StageRequest) -> Result<Target> {
+    check_inputs(request)?;
+    let device = backend.slot_device(boot, slot)?;
+    ensure_unmounted(&device)?;
+    let partuuid = output("blkid", &["-s", "PARTUUID", "-o", "value", path_str(&device)?])?;
+    if partuuid.is_empty() {
+        bail!("'{}' has no PARTUUID (stage needs a GPT partition)", device.display());
+    }
+    Ok(Target { device })
+}
+
+/// Write the slot. Its kernel goes first, so the slot cannot be booted
+/// until the kernel and entry are installed at the end.
 pub(crate) fn write_slot(
     backend: &SystemdBoot,
     boot: &Boot,
     slot: Slot,
     request: &StageRequest,
+    target: &Target,
 ) -> Result<()> {
-    check_inputs(request)?;
-    let device = backend.slot_device(boot, slot)?;
-    ensure_unmounted(&device)?;
+    let device = &target.device;
     let running_root = Path::new("/");
 
     backend.remove_slot_boot_files(boot, slot)?;
 
-    let label = output("blkid", &["-s", "LABEL", "-o", "value", path_str(&device)?])
+    let label = output("blkid", &["-s", "LABEL", "-o", "value", path_str(device)?])
         .ok()
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| format!("ROOT_{slot}"));
-    run(&format!("mkfs.{SLOT_FILESYSTEM}"), &["-F", "-q", "-L", &label, path_str(&device)?])?;
+    run(&format!("mkfs.{SLOT_FILESYSTEM}"), &["-F", "-q", "-L", &label, path_str(device)?])?;
 
     let mount_point = PathBuf::from(format!("/run/recab/stage-{}", slot.entry_suffix()));
     fs::create_dir_all(&mount_point)
         .with_context(|| format!("creating '{}'", mount_point.display()))?;
-    let mounted = Mounted::mount(&device, &mount_point)?;
+    let mounted = Mounted::mount(device, &mount_point)?;
     let recstrap = std::env::var("RECAB_RECSTRAP_BIN").unwrap_or_else(|_| "recstrap".to_string());
     run(
         &recstrap,
@@ -70,14 +92,13 @@ pub(crate) fn write_slot(
     )
     .context("extracting the rootfs image into the slot")?;
     carry_configuration(running_root, &mount_point)?;
-    if unit::installed(running_root) {
-        // The new system gets this recab's unit, not a stale copy.
-        unit::refresh(&mount_point)?;
+    if unit::enabled(running_root) {
+        // The unit as the new image's recab writes it: run that recab in the
+        // new root, so its own version of the unit is installed.
+        run("chroot", &[path_str(&mount_point)?, "/usr/bin/recab", "install-unit"])
+            .context("installing the new system's recab-trial.service")?;
     }
-    let partuuid = output("blkid", &["-s", "PARTUUID", "-o", "value", path_str(&device)?])?;
-    if partuuid.is_empty() {
-        bail!("'{}' has no PARTUUID (stage needs a GPT partition)", device.display());
-    }
+    let partuuid = output("blkid", &["-s", "PARTUUID", "-o", "value", path_str(device)?])?;
     write_fstab(
         &running_root.join("etc/fstab"),
         &mount_point.join("etc/fstab"),
@@ -130,19 +151,18 @@ fn carry_configuration(from: &Path, to: &Path) -> Result<()> {
             copy_preserving(&source, &to.join(rel))?;
         }
     }
-    for rel in CARRIED_DIRS {
+    for rel in ACCOUNT_FILES {
+        merge_accounts(&from.join(rel), &to.join(rel))?;
+    }
+    for rel in OVERLAID_DIRS {
         let source = from.join(rel);
-        if !source.is_dir() {
-            continue;
+        if source.is_dir() {
+            let dest = to.join(rel);
+            fs::create_dir_all(&dest).with_context(|| format!("creating '{}'", dest.display()))?;
+            // `source/.` copies the contents into `dest`, replacing same-named
+            // entries and keeping the others.
+            run("cp", &["-a", "--remove-destination", &format!("{}/.", path_str(&source)?), path_str(&dest)?])?;
         }
-        let dest = to.join(rel);
-        match dest.symlink_metadata() {
-            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&dest),
-            Ok(_) => fs::remove_file(&dest),
-            Err(_) => Ok(()),
-        }
-        .with_context(|| format!("replacing '{}'", dest.display()))?;
-        copy_preserving(&source, &dest)?;
     }
     if let Ok(entries) = fs::read_dir(from.join(SSH_DIR)) {
         for entry in entries.flatten() {
@@ -152,6 +172,50 @@ fn carry_configuration(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Merge a colon-separated account file by its first field: the image's
+/// lines in their order with the running system's line for the same name in
+/// their place, then the running system's other lines. Keeps the image
+/// file's owner and mode (shadow files are not world-readable).
+fn merge_accounts(running: &Path, image: &Path) -> Result<()> {
+    let Ok(running_content) = fs::read_to_string(running) else {
+        return Ok(());
+    };
+    let Ok(image_content) = fs::read_to_string(image) else {
+        return copy_preserving(running, image);
+    };
+    let name = |line: &str| line.split(':').next().unwrap_or("").to_string();
+    let running_lines: Vec<&str> = running_content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut used = std::collections::HashSet::new();
+    let mut merged: Vec<String> = Vec::new();
+    for line in image_content.lines().filter(|l| !l.trim().is_empty()) {
+        let key = name(line);
+        match running_lines.iter().find(|r| name(r) == key) {
+            Some(own) => {
+                used.insert(key);
+                merged.push(own.to_string());
+            }
+            None => merged.push(line.to_string()),
+        }
+    }
+    merged.extend(
+        running_lines
+            .iter()
+            .filter(|line| !used.contains(&name(line)))
+            .map(|line| line.to_string()),
+    );
+    write_preserving_mode(image, (merged.join("\n") + "\n").as_bytes())
+}
+
+/// Replace `path`'s content durably, keeping its owner and permissions.
+fn write_preserving_mode(path: &Path, content: &[u8]) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = fs::metadata(path).with_context(|| format!("reading '{}'", path.display()))?;
+    write_durable(path, content).with_context(|| format!("writing '{}'", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()))
+        .with_context(|| format!("restoring the owner of '{}'", path.display()))
 }
 
 /// The running fstab with the root line pointed at the new slot's partition.

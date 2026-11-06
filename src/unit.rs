@@ -36,21 +36,15 @@ fn unit_path(root: &Path) -> std::path::PathBuf {
     root.join("etc/systemd/system").join(UNIT_NAME)
 }
 
-/// The unit is installed under `root`.
-pub(crate) fn installed(root: &Path) -> bool {
-    unit_path(root).is_file()
-}
-
-/// Rewrite the unit file under `root` with this recab's version, leaving
-/// whether it is enabled alone.
-pub(crate) fn refresh(root: &Path) -> Result<()> {
-    let path = unit_path(root);
-    write_durable(&path, UNIT.as_bytes()).with_context(|| format!("writing '{}'", path.display()))
+/// The unit is enabled under `root`.
+pub(crate) fn enabled(root: &Path) -> bool {
+    root.join(WANTS_DIR).join(UNIT_NAME).symlink_metadata().is_ok()
 }
 
 /// Write the unit under `root` and enable it, as `systemctl enable` would.
 pub(crate) fn install(root: &Path) -> Result<()> {
-    refresh(root)?;
+    let path = unit_path(root);
+    write_durable(&path, UNIT.as_bytes()).with_context(|| format!("writing '{}'", path.display()))?;
     let wants = root.join(WANTS_DIR);
     fs::create_dir_all(&wants).with_context(|| format!("creating '{}'", wants.display()))?;
     let link = wants.join(UNIT_NAME);

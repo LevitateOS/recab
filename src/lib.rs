@@ -1,15 +1,17 @@
 //! recab - A/B slot management for systemd-boot systems.
 //!
+//! - set up the A/B boot layout at install time (`init`)
 //! - which slot booted, which boots next (`status`)
 //! - write a prebuilt system into the inactive slot (`stage`)
 //! - boot the other slot once (`set_next`)
 //! - keep the running slot (`commit`), or go back (`rollback`)
 //! - on each boot, commit a healthy trial or reboot out of a failed one (`trial`)
 //!
-//! [`state`] holds the slot state machine without I/O; [`systemd_boot`] reads
-//! and writes the boot selection; [`store`] keeps recab's state and audit log.
+//! `state` holds the slot state machine without I/O; `systemd_boot` reads and
+//! writes the boot selection; `store` keeps recab's state and audit log.
 
 mod error;
+mod init;
 mod stage;
 mod state;
 mod store;
@@ -29,10 +31,13 @@ pub use error::{
 pub use unit::UNIT_NAME;
 
 use error::{tagged_err, ErrorClass};
-use state::{committed, known_good, plan, rollback_target, BootChange, PersistentState, Request, Transition};
-use store::Store;
+use state::{
+    committed, judge_trial, known_good, plan, rollback_target, BootChange, Operation,
+    PersistentState, Request, Startup, Transition, TrialVerdict,
+};
+use store::{Lock, Store};
 use systemd_boot::{ApplyError, Boot, SystemdBoot};
-use trial::{Startup, Systemd};
+use trial::Systemd;
 
 /// System slot identifier (A/B).
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
@@ -77,6 +82,18 @@ impl std::fmt::Display for Slot {
     }
 }
 
+/// How the last judged trial boot ended.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrialRecord {
+    pub slot: Slot,
+    /// The trial was healthy and committed; otherwise it was abandoned.
+    pub committed: bool,
+    /// How startup ended, and the failed units if any.
+    pub detail: String,
+    pub unix_time: u64,
+}
+
 /// Current A/B view exported by `recab status --json`.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,6 +111,8 @@ pub struct Status {
     pub committed: bool,
     /// The slot `recab rollback` would select, if any.
     pub rollback_slot: Option<Slot>,
+    /// How the last judged trial boot ended.
+    pub last_trial: Option<TrialRecord>,
     pub entry_prefix: String,
 }
 
@@ -106,37 +125,67 @@ pub struct StageRequest {
     pub initrd: Option<PathBuf>,
 }
 
+/// The installed system `init` sets up.
+#[derive(Debug, Clone)]
+pub struct InitRequest {
+    /// The installed system's root, with its ESP mounted at `boot/` and its
+    /// state partition at `var/`.
+    pub root: PathBuf,
+    /// Slot A's partition (holding the installed system) and slot B's.
+    pub slot_a: PathBuf,
+    pub slot_b: PathBuf,
+    pub kernel: PathBuf,
+    pub initrd: Option<PathBuf>,
+    /// Extra kernel options for both entries (consoles, for example).
+    pub options: String,
+}
+
 /// What `trial` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrialOutcome {
-    /// The running slot was already committed.
+    /// Not a trial recab scheduled, or no verdict: nothing done.
     NotATrial,
     /// The trial booted healthy and was committed.
     Committed(Slot),
 }
 
-/// One recab run's view: backend, store, boot selection and state.
+/// One recab run's view, holding the run lock when it may change anything.
 struct System {
     backend: SystemdBoot,
     store: Store,
     boot: Boot,
     state: PersistentState,
+    _lock: Option<Lock>,
 }
 
 impl System {
-    fn load() -> Result<Self> {
+    /// Read-only view.
+    fn read() -> Result<Self> {
+        Self::open(false)
+    }
+
+    /// View for a change: holds the lock until dropped.
+    fn locked() -> Result<Self> {
+        Self::open(true)
+    }
+
+    fn open(lock: bool) -> Result<Self> {
         let backend = SystemdBoot::from_env()?;
         let store = Store::from_env();
+        // Only root changes anything; a run that is not root is refused by
+        // its root check later and has nothing to serialise.
+        // SAFETY: geteuid has no preconditions.
+        let lock = if lock && unsafe { libc::geteuid() } == 0 { Some(store.lock()?) } else { None };
         let boot = backend.read()?;
         let state = store.load()?;
-        Ok(Self { backend, store, boot, state })
+        Ok(Self { backend, store, boot, state, _lock: lock })
     }
 }
 
 /// Query current A/B state from the boot configuration and recab's state.
 /// Only reads, so it works anywhere the files are readable.
 pub fn status() -> Result<Status> {
-    let sys = System::load()?;
+    let sys = System::read()?;
     let (sel, state) = (&sys.boot.selection, &sys.state);
     Ok(Status {
         active_slot: sel.active,
@@ -147,81 +196,149 @@ pub fn status() -> Result<Status> {
         known_good_slot: known_good(state, sel),
         committed: committed(state, sel),
         rollback_slot: rollback_target(state, sel),
+        last_trial: state.last_trial.clone(),
         entry_prefix: sys.boot.prefix,
     })
+}
+
+/// Set up the A/B boot layout of a freshly installed system: both slot
+/// entries, slot A's kernel, loader.conf, recab's state, the trial service,
+/// and systemd-boot's firmware variables pointing at slot A.
+pub fn init(request: &InitRequest) -> Result<()> {
+    require_root("init")?;
+    init::run(request)
 }
 
 /// Write a prebuilt system into the inactive slot: format it, extract the
 /// rootfs image, carry the machine's configuration over, and install the
 /// slot's kernel and boot entry. The slot is not booted until `set_next`.
 pub fn stage(request: &StageRequest) -> Result<()> {
-    let sys = System::load()?;
+    let sys = System::locked()?;
     let transition = plan(Request::Stage, &sys.boot.selection, &sys.state)?
         .expect("stage always writes the inactive slot");
     require_root("stage")?;
     let slot = sys.boot.selection.active.other();
-    stage::write_slot(&sys.backend, &sys.boot, slot, request)?;
+    let target = stage::check(&sys.backend, &sys.boot, slot, request)?;
+    // Recorded before the slot is touched: from here its old system is gone,
+    // so nothing may roll back to it, even if the write fails.
     let next = stamped(&transition)?;
     sys.store.save(&next, "stage")?;
     sys.store
         .audit(transition.operation, sys.boot.selection.active, &sys.state, &next);
-    Ok(())
+    stage::write_slot(&sys.backend, &sys.boot, slot, request, &target)
 }
 
 /// Configure a one-shot trial boot of the inactive `slot`.
 pub fn set_next(slot: Slot) -> Result<()> {
-    change(Request::SetNext(slot))
+    change(System::locked()?, Request::SetNext(slot), |_| {})
 }
 
 /// Mark the running slot as known-good and make it the default.
 pub fn commit() -> Result<()> {
-    change(Request::Commit)
+    change(System::locked()?, Request::Commit, |_| {})
 }
 
 /// Configure the next boot back to the known-good slot.
 pub fn rollback() -> Result<()> {
-    change(Request::Rollback)
+    change(System::locked()?, Request::Rollback, |_| {})
 }
 
-/// Decide a trial boot once startup has finished (at most `timeout`): commit
-/// it when no unit failed, otherwise make the known-good slot the next boot
-/// and reboot into it. A committed slot is left alone.
+/// Decide a trial boot once startup has finished (at most `timeout`). Only
+/// the boot of the slot `set_next` scheduled is judged: committed when no
+/// unit failed; otherwise not committed, the known-good slot made the next
+/// boot, and the machine rebooted into it.
 pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     let systemd = Systemd::from_env();
     let startup = systemd.wait_for_startup(timeout)?;
-    let sys = System::load()?;
-    let sel = sys.boot.selection;
-    if committed(&sys.state, &sel) {
-        return Ok(TrialOutcome::NotATrial);
-    }
-    let active = sel.active;
-    let problem = match startup {
-        Startup::Running => {
-            commit()?;
-            return Ok(TrialOutcome::Committed(active));
-        }
-        Startup::Finished(state) => format!("finished starting in state '{state}'"),
+    let problem = match &startup {
+        Startup::Running => String::new(),
+        Startup::Failed(state) => format!("finished starting in state '{state}'"),
         Startup::TimedOut => format!("did not finish starting within {}s", timeout.as_secs()),
+        Startup::Inconclusive(_) => return Ok(TrialOutcome::NotATrial),
     };
-    let failed = systemd.failed_units();
-    let failed = if failed.is_empty() {
-        String::new()
-    } else {
-        format!(" (failed units: {})", failed.join(", "))
+    let failed = match &startup {
+        Startup::Running => String::new(),
+        _ => match systemd.failed_units() {
+            units if units.is_empty() => String::new(),
+            units => format!(" (failed units: {})", units.join(", ")),
+        },
     };
     let fail = |message: String| tagged_err(ErrorClass::TrialFailed, message);
-    let Some(fallback) = known_good(&sys.state, &sel).filter(|slot| *slot != active) else {
-        return Err(fail(format!(
-            "the trial boot of slot {active} {problem}{failed}; not committing it, and there is no known-good slot to return to"
-        )));
+
+    let sys = match System::locked() {
+        Ok(sys) => sys,
+        // The ESP or /var may be what broke. The firmware still knows
+        // whether this boot was a one-shot trial, and its default is the
+        // fallback.
+        Err(err) => {
+            let firmware_trial = SystemdBoot::from_env().ok().and_then(|b| b.firmware_trial());
+            if startup == Startup::Running || firmware_trial != Some(true) {
+                return Err(err);
+            }
+            require_root("trial")?;
+            systemd.reboot()?;
+            return Err(fail(format!(
+                "this one-shot trial boot {problem}{failed}, and the slots could not be read ({err:#}); rebooting into the default entry"
+            )));
+        }
     };
-    if sel.next_boot() != Some(fallback) {
-        rollback()?;
+    let sel = sys.boot.selection;
+    let active = sel.active;
+    let verdict = match judge_trial(&startup, &sel, &sys.state) {
+        // No state on /var but a one-shot boot that failed: /var itself may
+        // be what failed to mount.
+        TrialVerdict::Ignore
+            if startup != Startup::Running
+                && !sys.store.exists()
+                && sys.backend.firmware_trial() == Some(true) =>
+        {
+            TrialVerdict::Fail
+        }
+        verdict => verdict,
+    };
+    let record = |committed: bool, detail: String| -> Result<TrialRecord> {
+        Ok(TrialRecord { slot: active, committed, detail, unix_time: now()? })
+    };
+    match verdict {
+        TrialVerdict::Ignore => Ok(TrialOutcome::NotATrial),
+        TrialVerdict::Commit => {
+            let record = record(true, "startup finished with no failed units".to_string())?;
+            change(sys, Request::Commit, |next| next.last_trial = Some(record))?;
+            Ok(TrialOutcome::Committed(active))
+        }
+        TrialVerdict::Fail => {
+            require_root("trial")?;
+            let detail = format!("{problem}{failed}");
+            let mut next = sys.state.clone();
+            next.pending_trial_slot = None;
+            next.last_trial = Some(record(false, detail.clone())?);
+            next.last_operation = Some(Operation::TrialFailed(active).label());
+            next.last_transition_unix = Some(now()?);
+            if let Err(err) = sys.store.save(&next, "trial") {
+                eprintln!("recab: warning: the failed trial was not recorded: {err:#}");
+            } else {
+                sys.store.audit(Operation::TrialFailed(active), active, &sys.state, &next);
+            }
+            let Some(fallback) = known_good(&next, &sel).filter(|slot| *slot != active) else {
+                return Err(fail(format!(
+                    "the trial boot of slot {active} {detail}; not committing it, and there is no known-good slot to return to"
+                )));
+            };
+            if let Err(err) = sys.backend.ensure_bootable(&sys.boot, fallback) {
+                return Err(fail(format!(
+                    "the trial boot of slot {active} {detail}; not committing it, but not rebooting: the known-good slot {fallback} cannot boot ({err:#})"
+                )));
+            }
+            if sel.next_boot() != Some(fallback) {
+                drop(sys);
+                rollback()?;
+            }
+            systemd.reboot()?;
+            Err(fail(format!(
+                "the trial boot of slot {active} {detail}; not committing it. Rebooting into slot {fallback}."
+            )))
+        }
     }
-    systemd.reboot()?;
-    Err(fail(format!(
-        "the trial boot of slot {active} {problem}{failed}; not committing it. Rebooting into slot {fallback}."
-    )))
 }
 
 /// Install and enable `recab-trial.service` under `root` (`/` for this
@@ -241,71 +358,69 @@ fn require_root(operation: &str) -> Result<()> {
     Ok(())
 }
 
+fn now() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system clock before UNIX_EPOCH"))?
+        .as_secs())
+}
+
 /// The transition's next state, stamped with the operation and time.
 fn stamped(transition: &Transition) -> Result<PersistentState> {
     let mut next = transition.next.clone();
     next.last_operation = Some(transition.operation.label());
-    next.last_transition_unix = Some(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| anyhow::anyhow!("system clock before UNIX_EPOCH"))?
-            .as_secs(),
-    );
+    next.last_transition_unix = Some(now()?);
     Ok(next)
 }
 
-/// Run a boot-selection request. The state file is written first; if the
-/// boot change then fails before a firmware variable changed, the state is
-/// restored, otherwise the result is a reported partial update.
-fn change(request: Request) -> Result<()> {
-    let sys = System::load()?;
+/// Run a boot-selection request on a locked system. The boot selection is
+/// written first and recab's state second: after a crash between the two,
+/// the machine boots what was asked, and the state is what is stale.
+fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentState)) -> Result<()> {
     let Some(transition) = plan(request, &sys.boot.selection, &sys.state)? else {
         return Ok(());
     };
-    if let BootChange::OneShot(slot) = transition.boot {
-        sys.backend.ensure_bootable(&sys.boot, slot)?;
+    let active = sys.boot.selection.active;
+    // systemd-boot skips an entry it cannot boot: never select one.
+    match transition.boot {
+        BootChange::OneShot(slot) | BootChange::Default(slot) if slot != active => {
+            sys.backend.ensure_bootable(&sys.boot, slot)?;
+        }
+        _ => {}
     }
     let name = transition.operation.name();
     require_root(name)?;
     sys.backend.ensure_can_change()?;
 
-    let next = stamped(&transition)?;
-    sys.store.save(&next, name)?;
+    let mut next = stamped(&transition)?;
+    annotate(&mut next);
     match sys.backend.apply(&sys.boot, transition.boot) {
         Ok(()) => {}
         Err(ApplyError::Untouched(cause)) => {
-            return match sys.store.save(&sys.state, &format!("{name}-revert")) {
-                Ok(()) => Err(cause.context(format!(
-                    "{name} aborted; the boot selection and recab's state are unchanged"
-                ))),
-                Err(revert) => Err(tagged_err(
-                    ErrorClass::PartialUpdate,
-                    format!(
-                        "{name} failed and restoring recab's state also failed; the boot selection is unchanged.\n\
-primary error: {cause:#}\nrestore error: {revert:#}"
-                    ),
-                )),
-            };
+            return Err(cause.context(format!("{name} aborted; the boot selection is unchanged")));
         }
         Err(ApplyError::FirmwareChanged(cause)) => {
             return Err(tagged_err(
                 ErrorClass::PartialUpdate,
-                format!(
-                    "{name} changed systemd-boot's firmware variables and then failed; recab's state and loader.conf keep the new selection.\nerror: {cause:#}"
-                ),
+                format!("{name} changed the boot selection only in part, and recab's state was not updated: {cause:#}"),
             ));
         }
         Err(ApplyError::RestoreFailed { cause, restore }) => {
             return Err(tagged_err(
                 ErrorClass::PartialUpdate,
                 format!(
-                    "{name} failed and loader.conf could not be put back; recab's state keeps the new selection.\n\
+                    "{name} failed and loader.conf could not be put back; recab's state was not updated.\n\
 primary error: {cause:#}\nrestore error: {restore:#}"
                 ),
             ));
         }
     }
-    sys.store
-        .audit(transition.operation, sys.boot.selection.active, &sys.state, &next);
+    sys.store.save(&next, name).map_err(|err| {
+        tagged_err(
+            ErrorClass::PartialUpdate,
+            format!("{name} changed the boot selection, but recab's state was not saved: {err:#}"),
+        )
+    })?;
+    sys.store.audit(transition.operation, active, &sys.state, &next);
     Ok(())
 }

@@ -133,8 +133,19 @@ uncommitted or a trial is pending, else the slot that was known-good before the
 running slot was committed, while that slot still holds its system.
 
 **REQ-SM-013**: A `stage` operation MUST write only the inactive slot, MUST
-leave that slot unbootable until it is complete, and MUST refuse while the
-running slot is uncommitted (the inactive slot is then the only fallback).
+leave that slot unbootable until it is complete, MUST refuse while the running
+slot is uncommitted (the inactive slot is then the only fallback) or while the
+inactive slot is the next boot, and MUST stop treating the slot as a rollback
+target before it changes anything on it.
+
+**REQ-SM-014**: recab MUST NOT select (as default or one-shot) a slot whose
+entry names files missing from the ESP, and MUST NOT count such an entry as the
+default: systemd-boot skips it and boots another.
+
+**REQ-SM-015**: `recab init` MUST set up the boot layout an installed system's
+recab reads (slot entries, slot A's kernel, loader.conf, state with slot A
+known-good, the trial service) and MUST point systemd-boot's firmware variables
+at slot A, so variables left by an earlier install cannot select another slot.
 
 ### 4.3 Trial Boot Safety
 
@@ -147,16 +158,25 @@ userspace cannot run when the system does not boot. recab gives one attempt
 (a one-shot entry over a known-good default); fallback happens at the next
 reboot, so REQ-SM-022 makes failed trials reboot.
 
-**REQ-SM-021**: With `recab-trial.service` enabled, a trial boot whose startup
-ends with no failed unit MUST be committed without operator action, and one
-whose startup ends any other way, or does not end within a bounded time, MUST
-NOT be committed.
+**REQ-SM-021**: With `recab-trial.service` enabled, the trial boot `set-next`
+scheduled MUST be committed without operator action when its startup ends with
+no failed unit, and MUST NOT be committed when startup ends degraded or in
+maintenance, or does not end within a bounded time. Other boots (a committed
+slot, a slot picked from the boot menu, a trial an operator rolled back) and
+startups without a verdict (a shutdown) MUST be left alone.
 
-**REQ-SM-022**: A failed trial MUST reboot into the known-good slot: a trial
-`recab trial` judges failed (REQ-SM-021) is rebooted by it, and slot entries
-`recab stage` writes carry `panic=` so a panicking kernel reboots. A kernel or
-PID 1 that hangs without panicking is outside this requirement: it needs a
-hardware watchdog, which recab does not configure.
+**REQ-SM-022**: A failed trial MUST reboot into the known-good slot, unless that
+slot cannot boot: a trial `recab trial` judges failed (REQ-SM-021) is rebooted by
+it, also when the ESP or /var cannot be read (the firmware's selected and
+default entries tell a one-shot trial); slot entries carry `panic=` so a
+panicking kernel reboots; and a trial's entry carries `rd.emergency=reboot`
+(initramfs failures) and `systemd.crash_action=reboot` (PID 1 crashes), which
+it loses when it becomes the default. A kernel or PID 1 that hangs without
+crashing is outside this requirement: it needs a hardware watchdog, which
+recab does not configure.
+
+**REQ-SM-023**: A judged trial MUST be recorded (slot, outcome, how startup
+ended, failed units), shown by `recab status`, and audited.
 
 ---
 
@@ -171,6 +191,7 @@ hardware watchdog, which recab does not configure.
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
+- `recab init` (sets up the A/B boot layout of a freshly installed system)
 - `recab trial` (decides a trial boot; run by `recab-trial.service`)
 - `recab install-unit [--root DIR]` (installs and enables that service)
 
@@ -212,8 +233,8 @@ can call without invoking the CLI.
 
 - A `Slot` type (A/B)
 - A `Status`-like structure that represents the same information as `recab status`
-- Functions to `set_next(slot)`, `commit()`, and `rollback()`, and `stage()` and
-  `trial()`
+- Functions to `set_next(slot)`, `commit()`, and `rollback()`, and `init()`,
+  `stage()` and `trial()`
 
 **REQ-LIB-003**: The library MUST separate pure state representation from the
 backend implementation used to read/write boot metadata. (`src/state.rs` plans
@@ -258,6 +279,17 @@ semantics in a way that satisfies `REQ-SM-020` (automatic fallback).
 - determining the previously known-good slot for rollback
 - recording the last requested transition (set-next/commit/rollback)
 
+**REQ-PERSIST-003**: Runs that change anything MUST hold an exclusive lock for
+their whole duration, so their reads and writes never interleave.
+
+**REQ-PERSIST-004**: Both slots' recab read one state file. A newer schema MUST
+only add fields; recab MUST read a newer schema, keep the fields it does not
+know, and never lower the schema number.
+
+**REQ-PERSIST-005**: A boot-selection change MUST write the boot selection
+before recab's state, so a crash between the two leaves the machine booting
+what was asked.
+
 **REQ-PERSIST-002**: Persistent state writes MUST be atomic and durable: a temp
 file flushed to disk, renamed over the target, and the directory flushed. The
 same applies to `loader.conf` and to the entries and kernels `stage` writes
@@ -294,9 +326,9 @@ partially updated state.
 
 ## 10. Security
 
-**REQ-SEC-001**: `recab` MUST refuse to perform mutating operations (`stage`,
-`set-next`, `commit`, `rollback`, and `trial` when it commits) unless run with
-sufficient privileges (root).
+**REQ-SEC-001**: `recab` MUST refuse to perform mutating operations (`init`,
+`stage`, `set-next`, `commit`, `rollback`, and `trial` when it commits or
+reboots) unless run with sufficient privileges (root).
 
 **REQ-SEC-002**: `recab` MUST NOT accept arbitrary slot identifiers. Slot inputs
 MUST be validated and restricted to `A` or `B`.
@@ -326,4 +358,4 @@ Primary sources for these requirements:
 
 ### 11.3 Validation
 
-Unit tests are prohibited. Use `cargo check -p recab` or the scratch-tree lifecycle checks in `tests/lifecycle.rs` (the mutating ones as root). No maintained traceability matrix or minimum coverage gate is required during development.
+Unit tests are prohibited. Use `cargo check -p recab` or the scratch-tree lifecycle checks in `tests/lifecycle.rs` (`cargo test -p recab`, unprivileged through a user namespace). No maintained traceability matrix or minimum coverage gate is required during development.

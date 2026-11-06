@@ -1,26 +1,41 @@
 //! The slot state machine, without I/O: recab's persistent record, what the
-//! boot loader currently selects, and the transition each request makes.
+//! boot loader currently selects, the transition each request makes, and
+//! what a trial boot's outcome calls for.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{tagged_err, ErrorClass};
-use crate::Slot;
+use crate::{Slot, TrialRecord};
 
+/// The schema recab writes. Both slots' recab read the same file (it lives
+/// on the shared /var), so newer schemas only add fields: an older recab
+/// reads them, keeps the fields it does not know, and never lowers the number.
 pub(crate) const STATE_SCHEMA_VERSION: u32 = 1;
 
 /// What recab keeps in its state file.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PersistentState {
     pub schema: u32,
+    #[serde(default)]
     pub known_good_slot: Option<Slot>,
     /// The slot that was known-good before `known_good_slot`, while it still
     /// holds that system: what rollback from a committed slot returns to.
     #[serde(default)]
     pub previous_good_slot: Option<Slot>,
+    /// The slot `set-next` scheduled; only its boot is judged as a trial.
+    #[serde(default)]
     pub pending_trial_slot: Option<Slot>,
+    /// How the last judged trial ended.
+    #[serde(default)]
+    pub last_trial: Option<TrialRecord>,
+    #[serde(default)]
     pub last_operation: Option<String>,
+    #[serde(default)]
     pub last_transition_unix: Option<u64>,
+    /// Fields a newer recab wrote, kept as they are.
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for PersistentState {
@@ -30,13 +45,16 @@ impl Default for PersistentState {
             known_good_slot: None,
             previous_good_slot: None,
             pending_trial_slot: None,
+            last_trial: None,
             last_operation: None,
             last_transition_unix: None,
+            unknown: serde_json::Map::new(),
         }
     }
 }
 
-/// What the boot loader selects, as recab's decisions need it.
+/// What the boot loader selects, as recab's decisions need it. Entries whose
+/// files are missing from the ESP are never selected: systemd-boot skips them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Selection {
     /// The slot that booted.
@@ -90,6 +108,8 @@ pub(crate) enum Operation {
     SetNext(Slot),
     Commit(Slot),
     Rollback(Slot),
+    /// A trial boot that was not healthy.
+    TrialFailed(Slot),
 }
 
 impl Operation {
@@ -99,6 +119,7 @@ impl Operation {
             Operation::SetNext(_) => "set-next",
             Operation::Commit(_) => "commit",
             Operation::Rollback(_) => "rollback",
+            Operation::TrialFailed(_) => "trial-failed",
         }
     }
 
@@ -109,6 +130,7 @@ impl Operation {
             Operation::SetNext(slot) => format!("set-next-{slot}"),
             Operation::Commit(slot) => format!("commit-{slot}"),
             Operation::Rollback(slot) => format!("rollback-to-{slot}"),
+            Operation::TrialFailed(slot) => format!("trial-failed-{slot}"),
         }
     }
 }
@@ -152,9 +174,9 @@ pub(crate) fn plan(
 Run 'recab commit' to keep slot {active}, or reboot into slot {slot}."
                 )));
             }
-            if sel.oneshot == Some(slot) {
+            if sel.next_boot() == Some(slot) {
                 return Err(refuse(format!(
-                    "a trial boot of slot {slot} is pending; run 'recab rollback' to cancel it before staging slot {slot} again"
+                    "the next boot is slot {slot}; run 'recab rollback' (or 'recab commit') so it is slot {active} before staging slot {slot}"
                 )));
             }
             next.known_good_slot = Some(active);
@@ -220,4 +242,40 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
         }
     };
     Ok(Some(transition))
+}
+
+/// How system startup ended, as `recab trial` sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Startup {
+    /// Started with no failed units.
+    Running,
+    /// Started with failed units, or ended in the emergency/rescue target.
+    Failed(String),
+    /// Still starting when the deadline passed.
+    TimedOut,
+    /// Anything else (shutting down, systemd unreachable): no verdict.
+    Inconclusive(String),
+}
+
+/// What a trial boot's outcome calls for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TrialVerdict {
+    /// Not a trial recab scheduled, or no verdict: do nothing.
+    Ignore,
+    Commit,
+    /// Do not commit; return to the default.
+    Fail,
+}
+
+/// Judge a boot from how startup ended. Only the boot of the slot `set-next`
+/// scheduled is a trial; a slot picked from the boot menu, or a trial an
+/// operator already rolled back, is left alone.
+pub(crate) fn judge_trial(startup: &Startup, sel: &Selection, state: &PersistentState) -> TrialVerdict {
+    let is_trial = state.pending_trial_slot == Some(sel.active) && !committed(state, sel);
+    match startup {
+        _ if !is_trial => TrialVerdict::Ignore,
+        Startup::Running => TrialVerdict::Commit,
+        Startup::Failed(_) | Startup::TimedOut => TrialVerdict::Fail,
+        Startup::Inconclusive(_) => TrialVerdict::Ignore,
+    }
 }
