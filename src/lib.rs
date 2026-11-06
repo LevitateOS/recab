@@ -753,16 +753,9 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
             }
         };
 
-        if let Some(slot) = slot_from_cmdline(&cmdline) {
-            return Ok(Some(slot));
-        }
-
         let Some(root_selector) = root_selector_from_cmdline(&cmdline) else {
             return Ok(None);
         };
-        if !root_selector.is_slot_mapping_candidate() {
-            return Ok(None);
-        }
 
         let prefix = self.entry_prefix()?;
         let slot = slot_from_entry_roots(&self.entries_dir, &prefix, &root_selector)?;
@@ -834,21 +827,20 @@ impl BootBackend for SystemdBootBackend {
             };
         }
 
+        // The slot entries' root= selectors, written at install time, are the
+        // record of which partition is which slot; the running root= is
+        // matched against them. The loader default is what boots next, not
+        // what booted, so it is never used as the answer.
         if let Some(slot) = self.detect_slot_from_cmdline()? {
             return Ok(slot);
-        }
-
-        if let Some(default_slot) = self.default_slot()? {
-            return Ok(default_slot);
         }
 
         Err(tagged_err(
             ErrorClass::StateOrDetection,
             format!(
-                "unable to determine active slot from '{}' or loader default '{}'.\n\
+                "unable to determine active slot: '{}' has no root= that matches a slot entry.\n\
 Set RECAB_ACTIVE_SLOT=A|B to override detection in constrained environments.",
                 self.proc_cmdline_path.display(),
-                self.loader_conf_path.display()
             ),
         ))
     }
@@ -925,22 +917,11 @@ Install systemd-boot userspace tools and retry, or ensure RECAB_BOOTCTL_BIN poin
             ErrorClass::StateOrDetection,
             format!(
                 "unable to determine A/B entry prefix in '{}'. Expected '<prefix>-a.conf' and '<prefix>-b.conf'.\n\
-Set RECAB_ENTRY_PREFIX explicitly (for example: RECAB_ENTRY_PREFIX=levitate).",
+Name the entries after the os-release ID, or set RECAB_ENTRY_PREFIX.",
                 self.entries_dir.display()
             ),
         ))
     }
-}
-
-fn slot_from_cmdline(cmdline: &str) -> Option<Slot> {
-    let lower = cmdline.to_ascii_lowercase();
-    if lower.contains("system-a") {
-        return Some(Slot::A);
-    }
-    if lower.contains("system-b") {
-        return Some(Slot::B);
-    }
-    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -980,8 +961,23 @@ impl RootSelector {
         Some(Self::DevicePath(lower))
     }
 
-    fn is_slot_mapping_candidate(&self) -> bool {
-        !matches!(self, Self::DevicePath(_))
+    /// The block device this selector names on the running system, through
+    /// the kernel's /dev/disk links.
+    fn device(&self) -> Option<PathBuf> {
+        let link = match self {
+            Self::PartUuid(v) => PathBuf::from(format!("/dev/disk/by-partuuid/{v}")),
+            Self::Uuid(v) => PathBuf::from(format!("/dev/disk/by-uuid/{v}")),
+            Self::Label(v) => PathBuf::from(format!("/dev/disk/by-label/{v}")),
+            Self::DevicePath(v) => PathBuf::from(v),
+        };
+        fs::canonicalize(link).ok()
+    }
+
+    /// Same selector, or two selectors naming the same device (a cmdline
+    /// UUID= and an entry PARTUUID= for one partition).
+    fn names_same_root(&self, other: &Self) -> bool {
+        self == other
+            || matches!((self.device(), other.device()), (Some(a), Some(b)) if a == b)
     }
 }
 
@@ -1042,7 +1038,7 @@ fn slot_from_entry_roots(
         let Some(entry_root) = root_selector_from_entry_content(&content) else {
             continue;
         };
-        if entry_root != *target {
+        if !entry_root.names_same_root(target) {
             continue;
         }
 
