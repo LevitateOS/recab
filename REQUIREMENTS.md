@@ -287,10 +287,8 @@ document:
 Primary sources for these requirements:
 
 - `tools/recab/README.md` and `tools/recab/CLAUDE.md` (tool scope and intent)
-- `QUALITY.md` (repo-wide CLI/tooling quality expectations)
 - `architecture.md` (A/B update and rollback validation)
 - `docs/ab-default-plan.md` (repo-wide A/B default plan)
-- `tools/recipe/OS_UPGRADES_BRAINDUMP.md` (recipe + A/B upgrade flow)
 
 ### 11.3 Validation
 

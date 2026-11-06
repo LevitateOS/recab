@@ -103,8 +103,3 @@ sudo RECAB_E2E_SDC_ACK=ERASE_SDC cargo test --test e2e_sdc -- --ignored --nocapt
 
 - Not a full updater (it does not build filesystem trees or download packages).
 - Not a package manager (that stays in `tools/recipe`).
-
-## Likely Integrations (TBD)
-
-- `systemd-boot` boot counting / try-boot / commit semantics
-- A persistent state file under `/var` (for "slot marked good" + audit metadata)
