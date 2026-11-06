@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Status",
+  "description": "Current A/B view exported by `recab status --json`.",
+  "type": "object",
+  "properties": {
+    "active_slot": {
+      "$ref": "#/$defs/Slot"
+    },
+    "default_slot": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Slot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "entry_prefix": {
+      "type": "string"
+    },
+    "inactive_slot": {
+      "$ref": "#/$defs/Slot"
+    },
+    "known_good_slot": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Slot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "next_boot": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Slot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "trial_pending": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "active_slot",
+    "inactive_slot",
+    "trial_pending",
+    "entry_prefix"
+  ],
+  "$defs": {
+    "Slot": {
+      "description": "System slot identifier (A/B).",
+      "type": "string",
+      "enum": [
+        "A",
+        "B"
+      ]
+    }
+  }
+}

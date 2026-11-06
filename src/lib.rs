@@ -92,6 +92,7 @@ pub fn stable_exit_code(err: &anyhow::Error) -> u8 {
 }
 
 /// System slot identifier (A/B).
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
 )]
@@ -132,7 +133,8 @@ impl std::fmt::Display for Slot {
     }
 }
 
-/// Current A/B view exported by `recab status`.
+/// Current A/B view exported by `recab status --json`.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
     pub active_slot: Slot,
