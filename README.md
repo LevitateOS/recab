@@ -16,24 +16,43 @@ Status: implemented with a systemd-boot backend and persistent local state.
 
 - `recab status`
 - `recab status --json`
+- `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> [--initrd <img>]`
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
 
+An update is `stage`, `set-next`, reboot, check the system, `commit`:
+
+```sh
+recab stage --rootfs /mnt/live/filesystem.erofs --kernel /mnt/boot/vmlinuz --initrd /mnt/boot/initramfs.img
+recab set-next B      # one trial boot of the staged slot
+reboot                # into B; an uncommitted B is left on the next boot
+recab commit          # keep B
+recab rollback        # later: back to A, while A still holds its system
+```
+
 ## Behavior
 
-- `status` reports active/inactive slot, default slot, known-good slot, trial-pending state, and next boot target.
+- `status` reports active/inactive slot, default slot, known-good slot, whether the running slot is committed, the rollback target, trial-pending state, and next boot target.
   It only reads, so it also works off UEFI. The default slot is systemd-boot's `LoaderEntryDefault` EFI variable when set, else the last `default` line of `loader.conf`.
-- `set-next` uses `bootctl set-oneshot` to stage a one-shot trial boot of the inactive slot (the running slot is refused).
+  A trial is pending while systemd-boot's `LoaderEntryOneShot` names a slot entry; the firmware removes it when it boots the entry.
+- `stage` writes a prebuilt system into the inactive slot. The slot's partition is the one its entry's `root=` names (both entries are written at install time).
+  It removes the slot's kernel directory (`/boot/<prefix>-<a|b>/`), formats the partition (keeping its label), extracts the image with `recstrap`,
+  carries the running system's identity, accounts, locale/time, enabled units, network connections and SSH host keys over, points the new `fstab` root at the slot,
+  then installs the kernel (and initrd) and rewrites the entry's `linux`/`initrd` lines. It refuses while the running slot is uncommitted,
+  because the other slot is then the only fallback, and while a trial of the slot is pending.
+- `set-next` uses `bootctl set-oneshot` to stage a one-shot trial boot of the inactive slot (the running slot is refused, and so is a slot whose entry names files missing from the ESP).
   One-shot trial plus an already-stable default entry provides bounded-attempt fallback.
   Repeating it for an already staged slot only sets the one-shot entry again.
-- `commit` sets the currently active slot as known-good and default (`bootctl set-default` + `loader.conf` update).
-- `rollback` sets previously known-good slot as default.
+- `commit` sets the currently active slot as known-good and default (`bootctl set-default` + `loader.conf` update); the slot that was known-good before becomes the rollback target.
+- `rollback` from an uncommitted slot, or with a trial pending, selects the known-good slot. From a committed slot it selects the slot that was good before it, as long as that slot has not been staged over since.
 - `commit` and `rollback` clear a pending one-shot entry, so the next boot is the new default.
 - `set-next` refuses to run if the default is not aligned to the known-good fallback.
   Run `recab commit` first to repair fallback invariants.
 
 ## Persistence
+
+The A/B layout mounts its state partition at `/var`, so both slots share recab's state.
 
 - State: `/var/lib/recab/state.json`
 - Audit log (JSON lines): `/var/lib/recab/audit.log`
@@ -79,8 +98,9 @@ root (`--include-ignored`).
 - `RECAB_EFIVARS_PATH` (default `/sys/firmware/efi/efivars`)
 - `RECAB_BOOTCTL_BIN` (default `bootctl`)
 - `RECAB_ENTRY_PREFIX` (override inferred `<prefix>-a.conf` / `<prefix>-b.conf`)
+- `RECAB_RECSTRAP_BIN` (default `recstrap`, used by `stage`)
 
 ## Non-Goals
 
-- Not a full updater (it does not build filesystem trees or download packages).
+- Not a full updater: it writes a prebuilt image into a slot, but does not build filesystem trees or download anything.
 - Not a package manager (that stays in `tools/recipe`).

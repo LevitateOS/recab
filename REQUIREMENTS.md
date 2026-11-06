@@ -80,7 +80,9 @@ This specification does not cover:
 A/B slot selection and commit/rollback semantics.
 
 **REQ-DESIGN-002**: `recab` MUST NOT perform package management actions (install,
-remove, upgrade) and MUST NOT compose filesystem trees.
+remove, upgrade) and MUST NOT compose filesystem trees. It MAY write a prebuilt
+rootfs image into the inactive slot (`stage`), carrying the machine's own
+configuration over.
 
 ### 3.2 Conservative Boot Changes
 
@@ -125,7 +127,13 @@ states:
 `Stable(active)` and clear any trial-pending metadata.
 
 **REQ-SM-012**: A `rollback` operation MUST configure the next boot to use the
-previously known-good slot.
+previously known-good slot: the known-good slot when the running slot is
+uncommitted or a trial is pending, else the slot that was known-good before the
+running slot was committed, while that slot still holds its system.
+
+**REQ-SM-013**: A `stage` operation MUST write only the inactive slot, MUST
+leave that slot unbootable until it is complete, and MUST refuse while the
+running slot is uncommitted (the inactive slot is then the only fallback).
 
 ### 4.3 Trial Boot Safety
 
@@ -145,6 +153,7 @@ userspace cannot run when the system does not boot.
 **REQ-CLI-001**: The CLI MUST provide these subcommands:
 
 - `recab status`
+- `recab stage --rootfs <image> --kernel <file> [--initrd <file>]`
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
