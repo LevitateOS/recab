@@ -78,12 +78,7 @@ sudo RECAB_E2E_SDC_ACK=ERASE_SDC cargo test --test e2e_sdc -- --ignored --nocapt
 
 ## Exit Codes
 
-- `0`: success
-- `1`: generic failure
-- `13`: permission failure (root required for mutating operations)
-- `20`: backend unavailable/misconfigured (non-UEFI, missing efivars, missing `bootctl`)
-- `21`: state or slot-detection failure (missing known-good/default/prefix/entries)
-- `22`: mutation safety failure (operation failed and state-restore failed)
+`0` on success, `1` for an unclassified failure; every classified failure prints a `[RECAB_ERR_*]` tag and exits with its class's code. The classes and codes are defined once, in `ErrorClass` and the `EXIT_CODE_*` constants in [`src/lib.rs`](src/lib.rs).
 
 ## Environment Overrides
 

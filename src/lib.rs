@@ -62,46 +62,37 @@ impl ErrorClass {
     }
 }
 
+/// An error with a stable class. The class travels as a typed value in the
+/// error chain, so the exit status never depends on message wording.
+#[derive(Debug)]
+struct ClassifiedError {
+    class: ErrorClass,
+    message: String,
+}
+
+impl std::fmt::Display for ClassifiedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.class.tag(), self.message)
+    }
+}
+
+impl std::error::Error for ClassifiedError {}
+
 fn tagged_err(class: ErrorClass, message: impl Into<String>) -> anyhow::Error {
-    anyhow!("[{}] {}", class.tag(), message.into())
+    anyhow::Error::new(ClassifiedError {
+        class,
+        message: message.into(),
+    })
 }
 
-fn has_class_tag(err: &anyhow::Error, class: ErrorClass) -> bool {
-    let tag = class.tag();
-    err.chain().any(|cause| cause.to_string().contains(tag))
-}
-
-/// Stable exit-code mapping for recab CLI and callers.
+/// Stable exit-code mapping for recab CLI and callers: the outermost classified
+/// error decides, so a partial update caused by a backend failure reports the
+/// partial update.
 pub fn stable_exit_code(err: &anyhow::Error) -> u8 {
-    for class in [
-        ErrorClass::Permission,
-        ErrorClass::BackendUnavailable,
-        ErrorClass::PartialUpdate,
-        ErrorClass::StateOrDetection,
-    ] {
-        if has_class_tag(err, class) {
-            return class.code();
-        }
-    }
-
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    if msg.contains("must run as root") || msg.contains("requires root privileges") {
-        return EXIT_CODE_PERMISSION;
-    }
-    if msg.contains("systemd-boot backend requires")
-        || msg.contains("missing '/sys/firmware/efi'")
-        || msg.contains("missing efivarfs")
-    {
-        return EXIT_CODE_BACKEND_UNAVAILABLE;
-    }
-    if msg.contains("unable to determine active slot")
-        || msg.contains("unable to determine a/b entry prefix")
-        || msg.contains("known-good slot missing")
-        || msg.contains("loader default slot")
-    {
-        return EXIT_CODE_STATE_OR_DETECTION;
-    }
-    EXIT_CODE_GENERIC
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<ClassifiedError>())
+        .map(|classified| classified.class.code())
+        .unwrap_or(EXIT_CODE_GENERIC)
 }
 
 /// System slot identifier (A/B).
