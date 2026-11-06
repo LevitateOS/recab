@@ -56,32 +56,13 @@ host UEFI runtime, efivars and `bootctl` are available:
 
 - Mutating operations (`set-next`, `commit`, `rollback`) require root.
 
-## E2E on `/dev/sdc` (Destructive)
+## Tests
 
-`recab` includes ignored integration tests that exercise a full A/B lifecycle
-using real `/dev/sdc` partitions and real PARTUUIDs.
-
-- File: `tools/recab/tests/e2e_sdc.rs`
-- Scope:
-  - repartition `/dev/sdc` as GPT with 2 ext4 partitions (`system-a`, `system-b`)
-  - verify `status -> set-next -> commit -> rollback`
-  - validate audit/state updates and bootctl command sequencing
-- Safety gates:
-  - must run as root
-  - must set `RECAB_E2E_SDC_ACK=ERASE_SDC`
-  - target device must be `/dev/sdc`
-  - refuses to run if `/dev/sdc` has mounted filesystems
-- Trace output:
-  - writes a step-by-step markdown trace (commands, outputs, file snapshots)
-  - default path: `/tmp/recab-<test>-<pid>.trace.md`
-  - override path with `RECAB_E2E_TRACE_OUT=<path>`
-
-Run:
-
-```bash
-cd tools/recab
-sudo RECAB_E2E_SDC_ACK=ERASE_SDC cargo test --test e2e_sdc -- --ignored --nocapture
-```
+`tests/lifecycle.rs` runs recab against a scratch boot tree (slot entries
+naming fake devices, a stand-in `/proc/cmdline`, and a fake `bootctl` that
+writes systemd-boot's EFI variables), so no disk is touched. `status` and the
+root check run unprivileged; the lifecycle and failure-restore tests need
+root (`--include-ignored`).
 
 ## Exit Codes
 
