@@ -19,7 +19,7 @@ ts-rs = { version = "12", optional = true }
 
 [features]
 # Derive the JSON Schemas and TypeScript declarations of the JSON output
-# (`cargo xtask contracts`); the shipped tool does not need them.
+# (`cargo xtask gen`); the shipped tool does not need them.
 contracts = ["dep:schemars", "dep:ts-rs"]
 
 [dev-dependencies]
