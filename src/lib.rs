@@ -9,7 +9,6 @@
 //! Backend: systemd-boot entries + local persistent state.
 
 use anyhow::{anyhow, bail, Context, Result};
-use distro_spec::shared::is_root;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -428,7 +427,8 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
         }
     };
 
-    if !is_root() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
         return Err(tagged_err(
             ErrorClass::Permission,
             format!("{} must run as root", operation.name()),

@@ -113,7 +113,8 @@ fn status_reads_the_running_slot_without_root_or_uefi() {
 
 #[test]
 fn mutations_refuse_without_root() {
-    if distro_spec::shared::is_root() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
         eprintln!("skipped: running as root");
         return;
     }
