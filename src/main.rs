@@ -71,14 +71,14 @@ enum Command {
     Rollback,
 
     /// After startup: commit a healthy trial boot, or reboot into the
-    /// known-good slot (run by recab-trial.service).
+    /// known-good slot (run by the trial service on every boot).
     Trial {
         /// Seconds to wait for startup to finish before the trial fails.
         #[arg(long, default_value_t = 900)]
         timeout: u64,
     },
 
-    /// Install and enable recab-trial.service.
+    /// Install and enable the trial service (systemd unit or OpenRC service).
     InstallUnit {
         /// Root of the system to install into (for example an install target).
         #[arg(long, default_value = "/")]

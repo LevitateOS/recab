@@ -258,7 +258,16 @@ every transition without I/O; `src/systemd_boot.rs` reads and applies it.)
 ### 7.2 systemd-boot Backend (Initial Target)
 
 **REQ-BACKEND-010**: `recab` MUST support a `systemd-boot` backend suitable for
-UEFI systems using `systemd-boot` boot entries for slot A and slot B.
+UEFI systems using `systemd-boot` boot entries for slot A and slot B, writing
+systemd-boot's EFI variables itself, so it works where only systemd-boot's EFI
+binary is installed (no `bootctl`).
+
+**REQ-BACKEND-013**: `recab` MUST support systemd and OpenRC as init systems for
+everything that depends on them: deciding a trial (REQ-SM-021), rebooting, the
+trial service, trial kernel options, and the configuration `stage` carries.
+
+**REQ-BACKEND-014**: `stage` MUST NOT depend on GNU coreutils options, so busybox
+systems can stage.
 
 **REQ-BACKEND-011**: If the host is not booted in UEFI mode (or efivars are not
 available), the `systemd-boot` backend MUST fail with a clear error that
