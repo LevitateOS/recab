@@ -37,6 +37,7 @@ const CARRIED_DIRS: &[&str] = &["etc/systemd/system", "etc/NetworkManager/system
 const SSH_DIR: &str = "etc/ssh";
 const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 
+const SLOT_FILESYSTEM: &str = "ext4";
 const KERNEL_FILE: &str = "vmlinuz";
 const INITRD_FILE: &str = "initramfs.img";
 
@@ -73,7 +74,7 @@ pub(crate) fn write_slot(
         .ok()
         .filter(|label| !label.is_empty())
         .unwrap_or_else(|| format!("ROOT_{slot}"));
-    run("mkfs.ext4", &["-F", "-q", "-L", &label, path_str(&device)?])?;
+    run(&format!("mkfs.{SLOT_FILESYSTEM}"), &["-F", "-q", "-L", &label, path_str(&device)?])?;
 
     let mount_point = PathBuf::from(format!("/run/recab/stage-{}", slot.as_letter().to_ascii_lowercase()));
     fs::create_dir_all(&mount_point)
@@ -166,7 +167,8 @@ fn carry_configuration(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The running fstab with the root line pointed at the new slot's partition.
+/// The running fstab with the root line pointed at the new slot's partition,
+/// which stage formats as ext4.
 fn write_fstab(running: &Path, dest: &Path, partuuid: &str) -> Result<()> {
     let content = fs::read_to_string(running)
         .with_context(|| format!("reading '{}'", running.display()))?;
@@ -179,6 +181,9 @@ fn write_fstab(running: &Path, dest: &Path, partuuid: &str) -> Result<()> {
                 found_root = true;
                 let mut fields: Vec<String> = fields.iter().map(|f| f.to_string()).collect();
                 fields[0] = format!("PARTUUID={partuuid}");
+                if let Some(fstype) = fields.get_mut(2) {
+                    *fstype = SLOT_FILESYSTEM.to_string();
+                }
                 fields.join("\t")
             } else {
                 line.to_string()
