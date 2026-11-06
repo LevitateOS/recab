@@ -83,6 +83,27 @@ writes systemd-boot's EFI variables), so no disk is touched. `status` and the
 root check run unprivileged; the lifecycle and failure-restore tests need
 root (`--include-ignored`).
 
+## End-to-End Testing Still Needed
+
+The A/B flow has not run on a booted LevitateOS yet. What is verified:
+`tests/lifecycle.rs` (state machine against a scratch boot tree) and a manual
+`recab stage` onto loop-device slots on a Linux host.
+
+What still needs an e2e run, once Recipe can build the levitate live-tools ISO
+(on 2026-11-06 it fails extracting the Fedora RPMs inside Ginux):
+
+```sh
+cargo xtask build live-tools levitate
+cargo xtask test install levitate     # A/B install: per-slot kernels, both entries, STATE at /var
+cargo xtask test runtime levitate     # recab and recstrap present on the installed system
+cargo xtask test ab-update levitate   # stage B, trial boot, fallback, commit, rollback
+```
+
+`ab-update` checks what the host checks cannot: that the installed system
+boots from a slot `recab stage` wrote, that OVMF keeps and consumes the
+one-shot variable, that an uncommitted trial falls back, and that commit and
+rollback survive reboots.
+
 ## Exit Codes
 
 `0` on success, `1` for an unclassified failure; every classified failure prints a `[RECAB_ERR_*]` tag and exits with its class's code. The classes and codes are defined once, in `ErrorClass` and the `EXIT_CODE_*` constants in [`src/lib.rs`](src/lib.rs).
