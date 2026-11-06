@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 use recab::{stable_exit_code, Slot, Status};
@@ -24,7 +24,7 @@ enum Command {
     /// Stage a one-shot trial boot for a slot.
     SetNext {
         #[arg(value_enum, ignore_case = true)]
-        slot: SlotArg,
+        slot: Slot,
     },
 
     /// Commit currently booted slot as known-good and default.
@@ -32,21 +32,6 @@ enum Command {
 
     /// Configure next boot to previously known-good slot.
     Rollback,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum SlotArg {
-    A,
-    B,
-}
-
-impl From<SlotArg> for Slot {
-    fn from(value: SlotArg) -> Self {
-        match value {
-            SlotArg::A => Slot::A,
-            SlotArg::B => Slot::B,
-        }
-    }
 }
 
 fn main() -> ExitCode {
@@ -67,7 +52,7 @@ fn run() -> anyhow::Result<()> {
             print_status(&st, json)?;
         }
         Command::SetNext { slot } => {
-            recab::set_next(slot.into())?;
+            recab::set_next(slot)?;
         }
         Command::Commit => {
             recab::commit()?;

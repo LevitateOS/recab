@@ -197,15 +197,14 @@ fn require_root_and_ack(trace: &mut TraceLog) -> String {
     let device = std::env::var(DEVICE_ENV).unwrap_or_else(|_| DEVICE_DEFAULT.to_string());
     let ack = std::env::var(ACK_ENV).unwrap_or_default();
 
-    // SAFETY: geteuid has no preconditions.
-    let euid = unsafe { libc::geteuid() };
-    trace.line(format!("- euid: `{euid}`"));
+    let root = distro_spec::shared::is_root();
+    trace.line(format!("- root: `{root}`"));
     trace.line(format!("- target device: `{device}`"));
     trace.line(format!("- ack env present: `{}`", !ack.is_empty()));
     trace.lines.push(String::new());
 
     assert!(
-        euid == 0,
+        root,
         "destructive SDC e2e test requires root. Run with sudo."
     );
     assert!(
@@ -356,7 +355,10 @@ fn setup_layout(partuuid_a: &str, partuuid_b: &str) -> E2eLayout {
     let bootctl_log = root.join("bootctl.log");
     fs::write(
         &bootctl_path,
-        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"bootctl 255\"; exit 0; fi\nif [ -n \"$RECAB_TEST_BOOTCTL_LOG\" ]; then printf '%s\\n' \"$*\" >> \"$RECAB_TEST_BOOTCTL_LOG\"; fi\nexit 0\n",
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"bootctl 255\"; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            bootctl_log.display()
+        ),
     )
     .expect("bootctl script");
     #[cfg(unix)]
@@ -392,7 +394,6 @@ fn recab_cmd(layout: &E2eLayout) -> Command {
         .env("RECAB_SYS_FIRMWARE_EFI_PATH", &layout.efi_path)
         .env("RECAB_EFIVARS_PATH", &layout.efivars_path)
         .env("RECAB_BOOTCTL_BIN", &layout.bootctl_path)
-        .env("RECAB_TEST_BOOTCTL_LOG", &layout.bootctl_log)
         .env("RECAB_ENTRY_PREFIX", BOOT_PREFIX);
     cmd
 }
