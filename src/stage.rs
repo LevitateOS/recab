@@ -42,31 +42,153 @@ const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 /// The filesystem stage makes on a slot.
 const SLOT_FILESYSTEM: &str = "ext4";
 
+/// Where an EROFS image's superblock starts, and its magic number there.
+const EROFS_SUPERBLOCK_OFFSET: u64 = 1024;
+const EROFS_SUPER_MAGIC: u32 = 0xE0F5_E1E2;
+/// Block sizes (as a bit shift) an EROFS superblock can declare.
+const EROFS_BLOCK_SIZE_BITS: std::ops::RangeInclusive<u8> = 9..=16;
+
+/// The inputs a stage reads, checked before anything is changed.
+pub(crate) struct Inputs {
+    /// The rootfs image, canonical.
+    rootfs: PathBuf,
+    /// Its size: the file's length, or the image size a partition's EROFS
+    /// superblock declares.
+    rootfs_bytes: u64,
+    /// The device number, when the rootfs is a block device.
+    rootfs_rdev: Option<u64>,
+}
+
 /// The partition a stage will write, checked before anything is changed.
 pub(crate) struct Target {
     device: PathBuf,
 }
 
-/// Check everything stage needs without changing anything: the inputs, and
-/// a slot partition named by PARTUUID that is not mounted.
-pub(crate) fn check(
+fn refuse(message: String) -> anyhow::Error {
+    tagged_err(ErrorClass::StateOrDetection, message)
+}
+
+/// Check the inputs without changing anything: an EROFS rootfs image (a
+/// file or a partition), a kernel and initrd, and none of them inside the
+/// slot's kernel directory, which stage removes first.
+pub(crate) fn check_inputs(
     backend: &SystemdBoot,
     boot: &Boot,
     slot: Slot,
     request: &StageRequest,
+) -> Result<Inputs> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let rootfs = &request.rootfs;
+    // The rootfs may be an image file or a partition holding the image.
+    let meta = fs::metadata(rootfs)
+        .ok()
+        .filter(|m| m.is_file() || m.file_type().is_block_device())
+        .ok_or_else(|| {
+            refuse(format!(
+                "rootfs image '{}' is not a file or block device",
+                rootfs.display()
+            ))
+        })?;
+    let Some(declared_bytes) = erofs_image_bytes(rootfs)? else {
+        return Err(refuse(format!(
+            "rootfs '{}' is not an EROFS image (no EROFS superblock at byte {EROFS_SUPERBLOCK_OFFSET}); \
+pass the system's .erofs image, or the partition holding it",
+            rootfs.display()
+        )));
+    };
+    for (what, path) in [
+        ("kernel", Some(&request.kernel)),
+        ("initrd", request.initrd.as_ref()),
+    ] {
+        if let Some(path) = path {
+            if !path.is_file() {
+                return Err(refuse(format!("{what} '{}' is not a file", path.display())));
+            }
+        }
+    }
+    // Stage removes this directory before it installs the kernel and initrd.
+    let slot_dir = backend.slot_boot_files_dir(boot, slot);
+    if let Ok(slot_dir) = fs::canonicalize(&slot_dir) {
+        for (what, path) in [
+            ("rootfs", Some(rootfs)),
+            ("kernel", Some(&request.kernel)),
+            ("initrd", request.initrd.as_ref()),
+        ] {
+            let Some(path) = path else { continue };
+            if fs::canonicalize(path).is_ok_and(|p| p.starts_with(&slot_dir)) {
+                return Err(refuse(format!(
+                    "{what} '{}' is inside slot {slot}'s kernel directory '{}', which stage removes before installing the new kernel; \
+copy it elsewhere first (for example to /var/tmp) and pass that path",
+                    path.display(),
+                    slot_dir.display()
+                )));
+            }
+        }
+    }
+    let block_device = meta.file_type().is_block_device();
+    Ok(Inputs {
+        rootfs: fs::canonicalize(rootfs)
+            .with_context(|| format!("resolving '{}'", rootfs.display()))?,
+        rootfs_bytes: if block_device { declared_bytes } else { meta.len() },
+        rootfs_rdev: block_device.then(|| meta.rdev()),
+    })
+}
+
+/// Check the slot's partition without changing anything: named by
+/// PARTUUID, not the running root, not mounted, not the rootfs itself, and
+/// large enough for the rootfs image. The rootfs partition, if it is one,
+/// must not be mounted either.
+pub(crate) fn check_target(
+    backend: &SystemdBoot,
+    boot: &Boot,
+    slot: Slot,
+    inputs: &Inputs,
 ) -> Result<Target> {
-    check_inputs(request)?;
+    use std::os::unix::fs::MetadataExt;
     let device = backend.slot_device(boot, slot)?;
-    ensure_unmounted(&device)?;
+    if let Some(point) = mounted_at(&device)? {
+        return Err(refuse(format!(
+            "slot partition '{}' is mounted at '{point}'; unmount it before staging",
+            device.display()
+        )));
+    }
+    let device_rdev = fs::metadata(&device).ok().map(|m| m.rdev());
+    if inputs.rootfs == device || (inputs.rootfs_rdev.is_some() && inputs.rootfs_rdev == device_rdev) {
+        return Err(refuse(format!(
+            "rootfs '{}' is slot {slot}'s partition, which stage formats; pass the EROFS image file or the partition holding it",
+            inputs.rootfs.display()
+        )));
+    }
+    if inputs.rootfs_rdev.is_some() {
+        let point = mounted_at(&inputs.rootfs)?.or_else(|| {
+            let root_dev = fs::metadata("/").ok().map(|m| m.dev());
+            (root_dev == inputs.rootfs_rdev).then(|| "/".to_string())
+        });
+        if let Some(point) = point {
+            return Err(refuse(format!(
+                "rootfs partition '{}' is mounted at '{point}'; unmount it, or pass the EROFS image file",
+                inputs.rootfs.display()
+            )));
+        }
+    }
+    let slot_bytes = block_device_bytes(&device)?;
+    if inputs.rootfs_bytes > slot_bytes {
+        return Err(refuse(format!(
+            "rootfs image '{}' ({} bytes) does not fit in slot {slot}'s partition '{}' ({slot_bytes} bytes)",
+            inputs.rootfs.display(),
+            inputs.rootfs_bytes,
+            device.display()
+        )));
+    }
     let partuuid = output(
         "blkid",
         &["-s", "PARTUUID", "-o", "value", path_str(&device)?],
     )?;
     if partuuid.is_empty() {
-        bail!(
+        return Err(refuse(format!(
             "'{}' has no PARTUUID (stage needs a GPT partition)",
             device.display()
-        );
+        )));
     }
     Ok(Target { device })
 }
@@ -136,48 +258,69 @@ pub(crate) fn write_slot(
     )
 }
 
-fn check_inputs(request: &StageRequest) -> Result<()> {
-    use std::os::unix::fs::FileTypeExt;
-    // The rootfs may be an image file or a partition holding the image.
-    let rootfs_ok =
-        fs::metadata(&request.rootfs).is_ok_and(|m| m.is_file() || m.file_type().is_block_device());
-    if !rootfs_ok {
-        bail!(
-            "rootfs image '{}' is not a file or block device",
-            request.rootfs.display()
-        );
+/// The image size an EROFS superblock at the start of `path` declares
+/// (block count times block size), or `None` when there is none.
+fn erofs_image_bytes(path: &Path) -> Result<Option<u64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let context = || format!("reading rootfs '{}'", path.display());
+    let mut file = fs::File::open(path).with_context(context)?;
+    file.seek(SeekFrom::Start(EROFS_SUPERBLOCK_OFFSET)).with_context(context)?;
+    // magic (u32), checksum (u32), feature_compat (u32), blkszbits (u8),
+    // sb_extslots (u8), root nid (u16), inos (u64), build time (u64, u32),
+    // blocks (u32): all little-endian.
+    let mut superblock = [0u8; 40];
+    match file.read_exact(&mut superblock) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err).with_context(context),
     }
-    for (what, path) in [
-        ("kernel", Some(&request.kernel)),
-        ("initrd", request.initrd.as_ref()),
-    ] {
-        if let Some(path) = path {
-            if !path.is_file() {
-                bail!("{what} '{}' is not a file", path.display());
-            }
-        }
+    let u32_at = |at: usize| u32::from_le_bytes(superblock[at..at + 4].try_into().unwrap());
+    let block_bits = superblock[12];
+    if u32_at(0) != EROFS_SUPER_MAGIC || !EROFS_BLOCK_SIZE_BITS.contains(&block_bits) {
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(u64::from(u32_at(36)) << block_bits))
 }
 
-fn ensure_unmounted(device: &Path) -> Result<()> {
-    let mounts = fs::read_to_string("/proc/self/mounts").context("reading /proc/self/mounts")?;
-    let mounted = mounts
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .any(|source| {
-            source.starts_with('/') && fs::canonicalize(source).is_ok_and(|p| p == device)
-        });
-    if mounted {
-        return Err(tagged_err(
-            ErrorClass::StateOrDetection,
-            format!(
-                "slot partition '{}' is mounted; unmount it before staging",
-                device.display()
-            ),
-        ));
+/// A block device's size: from sysfs, else by seeking to its end.
+fn block_device_bytes(device: &Path) -> Result<u64> {
+    use std::io::{Seek, SeekFrom};
+    let sectors = device
+        .file_name()
+        .and_then(|name| fs::read_to_string(Path::new("/sys/class/block").join(name).join("size")).ok())
+        .and_then(|size| size.trim().parse::<u64>().ok());
+    if let Some(sectors) = sectors {
+        return Ok(sectors * 512);
     }
-    Ok(())
+    let context = || format!("reading the size of '{}'", device.display());
+    fs::File::open(device)
+        .with_context(context)?
+        .seek(SeekFrom::End(0))
+        .with_context(context)
+}
+
+/// Where the block device `device` (canonical) is mounted, if anywhere.
+fn mounted_at(device: &Path) -> Result<Option<String>> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let rdev = fs::metadata(device)
+        .ok()
+        .filter(|m| m.file_type().is_block_device())
+        .map(|m| m.rdev());
+    let mounts = fs::read_to_string("/proc/self/mounts").context("reading /proc/self/mounts")?;
+    Ok(mounts.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (source, point) = (fields.next()?, fields.next()?);
+        if !source.starts_with('/') {
+            return None;
+        }
+        let same = fs::canonicalize(source).is_ok_and(|p| p == device)
+            || rdev.is_some_and(|rdev| {
+                fs::metadata(source)
+                    .is_ok_and(|m| m.file_type().is_block_device() && m.rdev() == rdev)
+            });
+        // /proc/self/mounts escapes spaces as \040.
+        same.then(|| point.replace("\\040", " "))
+    }))
 }
 
 /// Copy the machine configuration from the running root into the new one.

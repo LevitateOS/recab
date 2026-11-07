@@ -55,7 +55,13 @@ pub(crate) struct SystemdBoot {
 /// The boot configuration as one recab run sees it.
 pub(crate) struct Boot {
     pub prefix: String,
+    /// The effective selection: entries systemd-boot would skip are dropped.
     pub selection: Selection,
+    /// The `LoaderEntryDefault` and `LoaderEntryOneShot` variables as set,
+    /// including a value `selection` dropped because its entry cannot boot
+    /// now (it can once that slot is staged).
+    pub raw_default: Option<String>,
+    pub raw_oneshot: Option<String>,
 }
 
 /// Why applying a boot change failed, and what it left behind.
@@ -124,10 +130,13 @@ impl SystemdBoot {
             .or_else(|| bootable_slot(conf_default.as_deref()));
         // systemd-boot removes the variable when it boots the entry, so it is
         // the record of whether a trial is still to come.
-        let oneshot = bootable_slot(self.loader_efivar("LoaderEntryOneShot").as_deref());
+        let efivar_oneshot = self.loader_efivar("LoaderEntryOneShot");
+        let oneshot = bootable_slot(efivar_oneshot.as_deref());
         Ok(Boot {
             prefix,
             selection: Selection { active, default, oneshot },
+            raw_default: efivar_default,
+            raw_oneshot: efivar_oneshot,
         })
     }
 
@@ -142,6 +151,47 @@ impl SystemdBoot {
         })?;
         let (def_prefix, default) = parse_entry_name(&default)?;
         (sel_prefix == def_prefix).then_some(selected != default)
+    }
+
+    /// Point firmware variables that disagree with the effective selection
+    /// back at it, before `slot` is made bootable (`stage`) or scheduled
+    /// (`set-next`): a variable naming an entry systemd-boot skips today
+    /// would take effect once that entry can boot. A `LoaderEntryDefault`
+    /// naming any entry but `keep`'s (the effective default, the known-good
+    /// slot) is set to `keep`'s entry; a `LoaderEntryOneShot` naming `slot`'s
+    /// entry while no one-shot is pending is removed. systemd-boot boots what
+    /// it booted before; only the stale values are gone.
+    pub fn reset_stale_selection(&self, boot: &Boot, keep: Slot, slot: Slot) -> Result<()> {
+        let names = |raw: &Option<String>, slot: Slot| {
+            raw.as_deref()
+                .and_then(parse_entry_name)
+                .is_some_and(|(prefix, named)| prefix == boot.prefix && named == slot)
+        };
+        let refuse = |variable: &str, value: &str, fix: String, err: anyhow::Error| {
+            tagged_err(
+                ErrorClass::StateOrDetection,
+                format!(
+                    "systemd-boot's {variable} names '{value}', a stale value that would boot slot {slot} or another entry instead of slot {keep}, and {fix} failed: {err:#}.\n\
+Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) and retry.",
+                    self.efivars.display()
+                ),
+            )
+        };
+        if let Some(value) = &boot.raw_default {
+            if !names(&boot.raw_default, keep) {
+                let entry = entry_name(&boot.prefix, keep);
+                self.set_loader_efivar("LoaderEntryDefault", Some(&entry)).map_err(|err| {
+                    refuse("LoaderEntryDefault", value, format!("pointing it at slot {keep}'s '{entry}'"), err)
+                })?;
+            }
+        }
+        if let Some(value) = &boot.raw_oneshot {
+            if boot.selection.oneshot.is_none() && names(&boot.raw_oneshot, slot) {
+                self.set_loader_efivar("LoaderEntryOneShot", None)
+                    .map_err(|err| refuse("LoaderEntryOneShot", value, "removing it".to_string(), err))?;
+            }
+        }
+        Ok(())
     }
 
     /// Changing the boot selection needs a UEFI system with efivarfs, where
@@ -286,10 +336,16 @@ Write a system into slot {slot} with 'recab stage' first."
         Ok(device)
     }
 
+    /// The slot's kernel directory on the ESP, which
+    /// [`remove_slot_boot_files`](Self::remove_slot_boot_files) removes.
+    pub fn slot_boot_files_dir(&self, boot: &Boot, slot: Slot) -> PathBuf {
+        self.boot_root.join(slot_boot_dir(&boot.prefix, slot))
+    }
+
     /// Remove the slot's kernel directory, so its entry cannot boot until
     /// [`install_slot_boot_files`](Self::install_slot_boot_files) runs.
     pub fn remove_slot_boot_files(&self, boot: &Boot, slot: Slot) -> Result<()> {
-        let dir = self.boot_root.join(slot_boot_dir(&boot.prefix, slot));
+        let dir = self.slot_boot_files_dir(boot, slot);
         if dir.exists() {
             fs::remove_dir_all(&dir)
                 .with_context(|| format!("removing slot {slot}'s kernel '{}'", dir.display()))?;

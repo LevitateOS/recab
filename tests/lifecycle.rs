@@ -186,6 +186,33 @@ esac
         fs::read_to_string(self.path(rel)).unwrap_or_default()
     }
 
+    /// Point slot `slot`'s entry at a kernel in its own directory on the
+    /// ESP, `/lev-<slot>/vmlinuz`, which exists when `with_kernel`.
+    fn slot_kernel(&self, slot: &str, with_kernel: bool) {
+        fs::write(
+            self.path(&format!("boot/loader/entries/lev-{slot}.conf")),
+            format!("title {slot}\nlinux /lev-{slot}/vmlinuz\noptions root=/dev/fake-{slot} rw\n"),
+        )
+        .unwrap();
+        if with_kernel {
+            fs::create_dir_all(self.path(&format!("boot/lev-{slot}"))).unwrap();
+            fs::write(self.path(&format!("boot/lev-{slot}/vmlinuz")), "old kernel").unwrap();
+        }
+    }
+
+    /// A file that starts like an EROFS image (superblock magic at byte
+    /// 1024, 4 KiB blocks, one block), and a kernel to stage with it.
+    fn stage_inputs(&self) -> (String, String) {
+        let mut image = vec![0u8; 4096];
+        image[1024..1028].copy_from_slice(&0xE0F5_E1E2u32.to_le_bytes());
+        image[1024 + 12] = 12;
+        image[1024 + 36..1024 + 40].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(self.path("image.erofs"), image).unwrap();
+        fs::write(self.path("new-vmlinuz"), "new kernel").unwrap();
+        let path = |rel: &str| self.path(rel).to_str().unwrap().to_string();
+        (path("image.erofs"), path("new-vmlinuz"))
+    }
+
     /// A committed slot A with slot B scheduled and booted as a trial.
     fn trial_of_b() -> Self {
         let tree = Self::new();
@@ -386,6 +413,100 @@ fn stage_refuses_while_its_slot_is_the_fallback_or_next_boot() {
     tree.ok(&["commit"]);
     tree.ok(&["set-next", "B"]);
     tree.fails(&args, 21, "next boot is slot B");
+}
+
+/// stage checks its inputs before it removes or formats anything: a rootfs
+/// that is not an EROFS image, or a kernel stage would delete before
+/// copying it, is refused and slot B keeps its kernel.
+#[test]
+fn stage_refuses_bad_inputs_before_touching_the_slot() {
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+    tree.slot_kernel("b", true);
+    let (image, kernel) = tree.stage_inputs();
+    let state = tree.read("state/state.json");
+
+    tree.fails(
+        &["stage", "--rootfs", &kernel, "--kernel", &kernel],
+        21,
+        "not an EROFS image",
+    );
+    let slot_kernel = tree.path("boot/lev-b/vmlinuz");
+    let slot_kernel = slot_kernel.to_str().unwrap();
+    tree.fails(
+        &["stage", "--rootfs", &image, "--kernel", slot_kernel],
+        21,
+        "inside slot B's kernel directory",
+    );
+    tree.fails(
+        &["stage", "--rootfs", &image, "--kernel", &kernel, "--initrd", slot_kernel],
+        21,
+        "copy it elsewhere first",
+    );
+    tree.fails(
+        &["stage", "--rootfs", &image, "--kernel", "/nonexistent"],
+        21,
+        "is not a file",
+    );
+
+    assert_eq!(tree.read("boot/lev-b/vmlinuz"), "old kernel");
+    assert_eq!(tree.read("state/state.json"), state, "nothing recorded");
+}
+
+/// A firmware default left by an earlier install names slot B, which has
+/// no kernel, so systemd-boot skips it. Once stage writes B's kernel it
+/// would boot B by default, untried: stage points it at slot A first, and
+/// removes a stale one-shot of B. (The scratch tree has no PARTUUID slot
+/// partition, so the stage stops at its partition check afterwards.)
+#[test]
+fn stage_resets_a_stale_firmware_selection_of_its_slot() {
+    let tree = Tree::new();
+    tree.slot_kernel("b", false);
+    fs::write(tree.path("boot/loader/loader.conf"), "default lev-a.conf\n").unwrap();
+    tree.set_efivar("LoaderEntryDefault", Some("lev-b.conf"));
+    tree.set_efivar("LoaderEntryOneShot", Some("lev-b.conf"));
+    let status = tree.status();
+    assert_eq!(status["default_slot"], "A");
+    assert_eq!(status["trial_pending"], false);
+    let (image, kernel) = tree.stage_inputs();
+    let args = ["stage", "--rootfs", image.as_str(), "--kernel", kernel.as_str()];
+
+    // Without efivarfs the variables cannot be checked: refused.
+    let out = tree
+        .command(true)
+        .env("RECAB_SYS_FIRMWARE_EFI_PATH", tree.path("no-efi"))
+        .args(args)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(20), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(tree.efivar("LoaderEntryDefault").as_deref(), Some("lev-b.conf"));
+
+    tree.fails(&args, 21, "root=PARTUUID=");
+    assert_eq!(
+        tree.efivar("LoaderEntryDefault").as_deref(),
+        Some("lev-a.conf")
+    );
+    assert!(!tree.has_efivar("LoaderEntryOneShot"));
+    assert!(!tree.path("state/state.json").exists(), "nothing recorded");
+}
+
+/// set-next makes the firmware default the known-good slot it checked, not
+/// a stale value naming another entry.
+#[test]
+fn set_next_resets_a_stale_firmware_default() {
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+    tree.set_efivar("LoaderEntryDefault", Some("old-install.conf"));
+    assert_eq!(tree.status()["default_slot"], "A");
+    tree.ok(&["set-next", "B"]);
+    assert_eq!(
+        tree.efivar("LoaderEntryDefault").as_deref(),
+        Some("lev-a.conf")
+    );
+    assert_eq!(
+        tree.efivar("LoaderEntryOneShot").as_deref(),
+        Some("lev-b.conf")
+    );
 }
 
 #[test]
@@ -593,6 +714,30 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
     assert_eq!(
         tree.efivar("LoaderEntryDefault").as_deref(),
         Some("lev-a.conf")
+    );
+
+    // Without efivars the variables cannot be reset: init says so.
+    let out = tree
+        .command(true)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                tree.path("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("RECAB_SYS_FIRMWARE_EFI_PATH", tree.path("no-efi"))
+        .args(["init", "--root", target.to_str().unwrap()])
+        .args(["--slot-a", "/dev/part-a", "--slot-b", "/dev/part-b"])
+        .args(["--kernel", tree.path("kernel").to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning") && stderr.contains("could not be reset"),
+        "{stderr}"
     );
 }
 

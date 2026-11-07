@@ -103,6 +103,12 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
             .set_loader_efivar("LoaderEntryDefault", Some(&default_entry))
             .and_then(|()| backend.set_loader_efivar("LoaderEntryOneShot", None))
             .context("pointing systemd-boot's firmware variables at slot A")?;
+    } else {
+        eprintln!(
+            "recab: warning: EFI variables are not available here (no efivarfs), so systemd-boot's \
+LoaderEntryDefault and LoaderEntryOneShot left by an earlier install could not be reset to slot A; \
+until they are, they may select another entry. 'recab stage' resets them before it writes slot B."
+        );
     }
     Ok(())
 }

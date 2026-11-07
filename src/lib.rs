@@ -215,9 +215,18 @@ pub fn stage(request: &StageRequest) -> Result<()> {
     let transition = plan(Request::Stage, &sys.boot.selection, &sys.state)?
         .expect("stage always writes the inactive slot");
     require_root("stage")?;
-    let slot = sys.boot.selection.active.other();
+    let active = sys.boot.selection.active;
+    let slot = active.other();
     let init = InitSystem::running()?;
-    let target = stage::check(&sys.backend, &sys.boot, slot, request)?;
+    // A firmware variable systemd-boot skips today, because it names this
+    // slot without a kernel, would take effect once the slot is written:
+    // stage must be able to read and reset them.
+    sys.backend.ensure_can_change()?;
+    let inputs = stage::check_inputs(&sys.backend, &sys.boot, slot, request)?;
+    // The plan made sure the running slot is the known-good one and the
+    // default (if any); this changes nothing systemd-boot boots now.
+    sys.backend.reset_stale_selection(&sys.boot, active, slot)?;
+    let target = stage::check_target(&sys.backend, &sys.boot, slot, &inputs)?;
     // Recorded before the slot is touched: from here its old system is gone,
     // so nothing may roll back to it, even if the write fails.
     let next = stamped(&transition)?;
@@ -388,6 +397,11 @@ fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentSt
     let name = transition.operation.name();
     require_root(name)?;
     sys.backend.ensure_can_change()?;
+    // A trial falls back to the default the firmware variable names: make it
+    // the known-good default `plan` checked, not a stale value it skipped.
+    if let (BootChange::OneShot(slot), Some(default)) = (transition.boot, sys.boot.selection.default) {
+        sys.backend.reset_stale_selection(&sys.boot, default, slot)?;
+    }
 
     let mut next = stamped(&transition)?;
     annotate(&mut next);

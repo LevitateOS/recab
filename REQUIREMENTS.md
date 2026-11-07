@@ -135,17 +135,26 @@ running slot was committed, while that slot still holds its system.
 **REQ-SM-013**: A `stage` operation MUST write only the inactive slot, MUST
 leave that slot unbootable until it is complete, MUST refuse while the running
 slot is uncommitted (the inactive slot is then the only fallback) or while the
-inactive slot is the next boot, and MUST stop treating the slot as a rollback
-target before it changes anything on it.
+inactive slot is the next boot or the default, and MUST stop treating the slot
+as a rollback target before it changes anything on it. Before it removes or
+formats anything it MUST refuse inputs that would destroy the slot or
+themselves: a rootfs that is not an EROFS image, is the slot's partition or a
+mounted partition, or is larger than the slot's partition, and a rootfs, kernel
+or initrd inside the slot's kernel directory.
 
 **REQ-SM-014**: recab MUST NOT select (as default or one-shot) a slot whose
 entry names files missing from the ESP, and MUST NOT count such an entry as the
-default: systemd-boot skips it and boots another.
+default: systemd-boot skips it and boots another. Because such a firmware
+variable takes effect once the entry can boot, `stage` (and `set-next`) MUST
+first point a `LoaderEntryDefault` naming another entry than the known-good
+default at it, and `stage` MUST remove a `LoaderEntryOneShot` naming its slot
+while no trial is pending, refusing when it cannot.
 
 **REQ-SM-015**: `recab init` MUST set up the boot layout an installed system's
 recab reads (slot entries, slot A's kernel, loader.conf, state with slot A
 known-good, the trial service) and MUST point systemd-boot's firmware variables
-at slot A, so variables left by an earlier install cannot select another slot.
+at slot A, so variables left by an earlier install cannot select another slot;
+where efivars are not available it MUST warn that they were not reset.
 
 ### 4.3 Trial Boot Safety
 

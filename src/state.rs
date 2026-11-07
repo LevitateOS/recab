@@ -179,6 +179,13 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {slot}."
                     "the next boot is slot {slot}; run 'recab rollback' (or 'recab commit') so it is slot {active} before staging slot {slot}"
                 )));
             }
+            // After a one-shot boot of the running slot, the freshly written
+            // slot would boot as the default, untried.
+            if sel.default == Some(slot) {
+                return Err(refuse(format!(
+                    "the default is slot {slot}; run 'recab commit' so it is slot {active} before staging slot {slot}"
+                )));
+            }
             next.known_good_slot = Some(active);
             if next.pending_trial_slot == Some(slot) {
                 next.pending_trial_slot = None;

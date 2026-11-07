@@ -37,7 +37,8 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   `/boot/<id>-a/`, `loader.conf` defaulting to slot A, recab's state with slot A
   known-good, and the trial service enabled. It also points systemd-boot's
   firmware variables at slot A, so a default left by an earlier install cannot
-  win. The prefix and titles come from the target's os-release (`ID`, `NAME`);
+  win; where efivars are not available it warns on stderr that they could not
+  be reset (`stage` resets them before it writes slot B). The prefix and titles come from the target's os-release (`ID`, `NAME`);
   the init system from what the target has installed. It creates `loader/` when
   the installer only copied systemd-boot's EFI binary (AcornOS has no `bootctl`).
 - `status` reports the active and inactive slot, the default, the known-good
@@ -47,12 +48,28 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   variable, else `loader.conf`'s `default`, skipping an entry whose files are
   missing from the ESP (systemd-boot skips it too). A trial is pending while
   `LoaderEntryOneShot` names a bootable slot entry.
-- `stage` writes a prebuilt system into the inactive slot. It first checks,
-  without changing anything, that the slot's entry names its partition by
-  `root=PARTUUID=`, that the partition has a PARTUUID and is not mounted, and
-  that the inputs exist. It records the slot as no longer a rollback target,
-  then removes the slot's kernel directory, formats the partition (keeping its
-  label), extracts the image with `recstrap`, and carries the running system's
+- `stage` writes a prebuilt system into the inactive slot. Before it changes
+  anything on the slot it checks (refusing with exit 21):
+  - the rootfs is a file or block device starting with an EROFS superblock
+    (magic `0xE0F5E1E2` at byte 1024), and the kernel and initrd are files;
+  - none of the rootfs, kernel and initrd is inside the slot's kernel directory
+    (`/boot/<id>-a|b/`), which stage removes first: copy them elsewhere;
+  - the slot's entry names its partition by `root=PARTUUID=`, the partition
+    has a PARTUUID, is not the running root, and is not mounted;
+  - the rootfs is not the slot's partition, a rootfs partition is not mounted,
+    and the image (a file's length, or the size a partition's EROFS superblock
+    declares) is no larger than the slot's partition. The extracted system is
+    larger than the image, so this only catches gross mistakes.
+
+  It needs efivarfs (exit 20 without): a `LoaderEntryDefault` naming another
+  entry than the running slot's, or a `LoaderEntryOneShot` naming the slot
+  while no trial is pending, is skipped by systemd-boot while the slot has no
+  kernel, but would boot the freshly written slot (as the default, untried)
+  once it has one. Stage points the default at the running slot's entry and
+  removes such a one-shot, which changes nothing systemd-boot boots now, and
+  refuses if it cannot. It then records the slot as no longer a rollback
+  target, removes the slot's kernel directory, formats the partition (keeping
+  its label), extracts the image with `recstrap`, and carries the running system's
   configuration over:
   - hostname, machine-id, locale, time, subuid/subgid and SSH host keys are copied;
   - `passwd`, `group`, `shadow` and `gshadow` are merged by name: the image's
@@ -67,11 +84,13 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   Last it installs the kernel (and initrd) and rewrites the entry's
   `linux`/`initrd` lines, with `panic=10` and the trial options (below). It
   refuses while the running slot is uncommitted (the other slot is then the
-  only fallback) and while the slot is the next boot.
+  only fallback) and while the slot is the next boot or the default.
 - `set-next` sets a one-shot boot of the inactive slot (`LoaderEntryOneShot`)
-  and adds the trial options to its entry. It refuses the running slot, a slot
-  whose entry names files missing from the ESP, and a default that is not the
-  known-good slot (`recab commit` repairs that). Repeating it while the trial
+  and adds the trial options to its entry. A `LoaderEntryDefault` naming
+  another entry than the known-good default (one systemd-boot skips) is first
+  pointed at it, so a failed trial falls back there. It refuses the running
+  slot, a slot whose entry names files missing from the ESP, and a default
+  that is not the known-good slot (`recab commit` repairs that). Repeating it while the trial
   is pending changes nothing.
 - `commit` makes the running slot known-good and the default; the slot that was
   known-good before becomes the rollback target. Committing a committed slot
@@ -154,7 +173,8 @@ guaranteed atomic.) A failed audit-log append is reported as a warning.
 
 ## Backend Preconditions
 
-Changing the boot selection needs UEFI with efivarfs, and fails fast without:
+Changing the boot selection, and `stage`, need UEFI with efivarfs, and fail
+fast without:
 
 - `/sys/firmware/efi`
 - `/sys/firmware/efi/efivars`
