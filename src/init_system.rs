@@ -313,16 +313,43 @@ fn dir_is_empty(dir: &Path) -> bool {
     fs::read_dir(dir).map_or(true, |mut entries| entries.next().is_none())
 }
 
-/// Services OpenRC marked failed, and daemons `rc-status` reports crashed.
-fn openrc_failed(dir: &Path) -> Vec<String> {
-    let mut failed: Vec<String> = fs::read_dir(dir.join("failed"))
+/// The service names in `dir` (a runlevel or an OpenRC state directory).
+fn service_names(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir)
         .map(|entries| {
             entries
                 .flatten()
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// The runlevels a boot starts, under `/etc/runlevels` (or `RECAB_RUNLEVELS_DIR`).
+const BOOT_RUNLEVELS: [&str; 3] = ["sysinit", "boot", "default"];
+
+fn runlevels_dir() -> PathBuf {
+    PathBuf::from(std::env::var("RECAB_RUNLEVELS_DIR").unwrap_or_else(|_| "/etc/runlevels".to_string()))
+}
+
+/// Services that failed to start: each service of the boot runlevels that is neither
+/// started nor inactive, those OpenRC still marks failed, and daemons `rc-status`
+/// reports crashed. OpenRC empties `failed/` when the runlevel's `openrc` exits, which
+/// is when startup counts as finished, so the runlevels are what tells.
+fn openrc_failed(dir: &Path) -> Vec<String> {
+    let up: Vec<String> = ["started", "inactive"]
+        .iter()
+        .flat_map(|state| service_names(&dir.join(state)))
+        .collect();
+    let mut failed: Vec<String> = service_names(&dir.join("failed"));
+    let levels = runlevels_dir();
+    for level in BOOT_RUNLEVELS {
+        for name in service_names(&levels.join(level)) {
+            if !up.contains(&name) && !failed.contains(&name) {
+                failed.push(name);
+            }
+        }
+    }
     let rc_status =
         std::env::var("RECAB_RC_STATUS_BIN").unwrap_or_else(|_| "rc-status".to_string());
     if let Ok(out) = Command::new(rc_status)

@@ -277,6 +277,7 @@ They are defined in [`src/error.rs`](src/error.rs).
 - `RECAB_SYSTEMCTL_BIN` (default `systemctl`, used by `trial` on systemd)
 - `RECAB_OPENRC_DIR` (default `/run/openrc`, used by `trial` on OpenRC)
 - `RECAB_RC_STATUS_BIN` (default `rc-status`, used by `trial` on OpenRC)
+- `RECAB_RUNLEVELS_DIR` (default `/etc/runlevels`, used by `trial` on OpenRC: every service of the sysinit, boot and default runlevels must be started or inactive)
 - `RECAB_REBOOT_BIN` (default: `systemctl reboot`, or OpenRC's `openrc-shutdown -r now` / `reboot`)
 - `RECAB_RECSTRAP_BIN` (default `recstrap`, used by `stage`)
 - `RECAB_ENTRY_PREFIX` (override inferred `<prefix>-a.conf` / `<prefix>-b.conf`)

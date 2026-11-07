@@ -134,6 +134,7 @@ esac
             .env("RECAB_INIT_SYSTEM", "systemd")
             .env("RECAB_SYSTEMCTL_BIN", self.path("systemctl"))
             .env("RECAB_OPENRC_DIR", self.path("openrc"))
+            .env("RECAB_RUNLEVELS_DIR", self.path("runlevels"))
             .env("RECAB_RC_STATUS_BIN", self.path("rc-status"));
         cmd
     }
@@ -800,6 +801,19 @@ fn openrc_trials_commit_when_healthy_and_reboot_when_a_service_failed() {
         "{stderr}"
     );
     assert_eq!(tree.read("reboot.log"), "reboot\n");
+
+    // OpenRC empties failed/ when the runlevel's openrc exits, so a service of the
+    // runlevels that is not started is the failure (a real AcornOS trial): failed.
+    let tree = Tree::trial_of_b();
+    fs::create_dir_all(tree.path("runlevels/default")).unwrap();
+    fs::create_dir_all(tree.path("openrc/started")).unwrap();
+    fs::write(tree.path("runlevels/default/dhcpcd"), "").unwrap();
+    fs::write(tree.path("openrc/started/dhcpcd"), "").unwrap();
+    fs::write(tree.path("runlevels/default/ab-update-fail"), "").unwrap();
+    let out = openrc(&tree, &["trial", "--timeout", "5"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(23), "{stderr}");
+    assert!(stderr.contains("ab-update-fail") && !stderr.contains("dhcpcd"), "{stderr}");
 
     // Still starting when the deadline passes: failed.
     let tree = Tree::trial_of_b();
