@@ -23,7 +23,7 @@ installers and scenario harnesses. Requirements: [REQUIREMENTS.md](REQUIREMENTS.
 An update:
 
 ```sh
-recab stage --rootfs /mnt/live/filesystem.erofs --kernel /mnt/boot/vmlinuz --initrd /mnt/boot/initramfs.img
+recab stage --rootfs /mnt/live/filesystem.erofs --kernel /mnt/boot/vmlinuz --initrd /mnt/boot/initramfs-installed.img
 recab set-next B      # one trial boot of the staged slot
 reboot                # into B: committed if it comes up healthy, else back to A
 recab rollback        # later, if wanted: back to A, while A still holds its system
@@ -242,10 +242,10 @@ a healthy one, that the machine keeps its identity, and that commit and
 rollback survive reboots.
 
 Also open:
-- The installer copies the live ISO's initramfs (`boot/initramfs.img`, busybox,
-  searches for the ISO) to the installed system, not `initramfs-installed.img`
-  (systemd, mounts `root=`). Installed boots need the latter, and only it
-  honours `rd.emergency=reboot`.
+- The release now puts the installed system's initramfs on the ISO
+  (`boot/initramfs-installed.img`: systemd, mounts `root=`, honours
+  `rd.emergency=reboot`) and recsetup installs it instead of the live one; no
+  e2e has booted it yet.
 - No e2e covers an initramfs or PID 1 failure in a trial.
 
 ## Exit Codes
