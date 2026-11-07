@@ -55,7 +55,10 @@ esac
         );
         executable(
             &root.join("reboot"),
-            &format!("#!/bin/sh\necho reboot >> '{}/reboot.log'\n", root.display()),
+            &format!(
+                "#!/bin/sh\necho reboot >> '{}/reboot.log'\n",
+                root.display()
+            ),
         );
         executable(&root.join("rc-status"), "#!/bin/sh\n");
         fs::create_dir_all(root.join("openrc/starting")).unwrap();
@@ -74,7 +77,11 @@ esac
     /// Simulate a boot into `slot`: the running root changes, systemd-boot
     /// records the entry it booted and consumes the one-shot entry.
     fn boot_into(&self, slot: &str) {
-        fs::write(self.path("cmdline"), format!("quiet root=/dev/fake-{slot} ro\n")).unwrap();
+        fs::write(
+            self.path("cmdline"),
+            format!("quiet root=/dev/fake-{slot} ro\n"),
+        )
+        .unwrap();
         self.set_efivar("LoaderEntrySelected", Some(&format!("lev-{slot}.conf")));
         self.set_efivar("LoaderEntryOneShot", None);
     }
@@ -150,7 +157,10 @@ esac
         let out = self.recab(args);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(code), "recab {args:?}: {stderr}");
-        assert!(stderr.contains(needle), "recab {args:?}: expected '{needle}' in: {stderr}");
+        assert!(
+            stderr.contains(needle),
+            "recab {args:?}: expected '{needle}' in: {stderr}"
+        );
     }
 
     fn status(&self) -> serde_json::Value {
@@ -160,7 +170,11 @@ esac
 
     fn efivar(&self, name: &str) -> Option<String> {
         let bytes = fs::read(self.path(&format!("efi/efivars/{name}-{GUID}"))).ok()?;
-        let units: Vec<u16> = bytes[4..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|u| *u != 0).collect();
+        let units: Vec<u16> = bytes[4..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|u| *u != 0)
+            .collect();
         String::from_utf16(&units).ok()
     }
 
@@ -187,8 +201,16 @@ esac
 fn status_reads_the_running_slot_without_root_or_uefi() {
     let tree = Tree::new();
     fs::remove_dir_all(tree.path("efi")).unwrap();
-    let out = tree.command(false).args(["status", "--json"]).output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = tree
+        .command(false)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(status["active_slot"], "A");
     assert_eq!(status["entry_prefix"], "lev");
@@ -203,7 +225,12 @@ fn mutations_refuse_without_root() {
         return;
     }
     let out = Tree::new().command(false).arg("commit").output().unwrap();
-    assert_eq!(out.status.code(), Some(13), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(13),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -216,10 +243,15 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
     tree.ok(&["set-next", "B"]);
     assert!(tree.has_efivar("LoaderEntryOneShot"));
     assert_eq!(tree.status()["next_boot"], "B");
-    assert!(tree.read("boot/loader/entries/lev-b.conf").contains("rd.emergency=reboot"));
+    assert!(tree
+        .read("boot/loader/entries/lev-b.conf")
+        .contains("rd.emergency=reboot"));
 
     tree.ok(&["rollback"]);
-    assert!(!tree.has_efivar("LoaderEntryOneShot"), "rollback clears the pending trial");
+    assert!(
+        !tree.has_efivar("LoaderEntryOneShot"),
+        "rollback clears the pending trial"
+    );
     assert_eq!(tree.status()["trial_pending"], false);
 
     tree.ok(&["set-next", "B"]);
@@ -227,7 +259,10 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
     let status = tree.status();
     assert_eq!(status["active_slot"], "B");
     assert_eq!(status["default_slot"], "A");
-    assert_eq!(status["trial_pending"], false, "the boot took the one-shot entry");
+    assert_eq!(
+        status["trial_pending"], false,
+        "the boot took the one-shot entry"
+    );
     assert_eq!(status["committed"], false);
     assert_eq!(status["next_boot"], "A", "an uncommitted trial falls back");
     tree.ok(&["commit"]);
@@ -235,9 +270,14 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
     assert_eq!(status["default_slot"], "B");
     assert_eq!(status["committed"], true);
     assert_eq!(status["rollback_slot"], "A");
-    assert!(tree.read("boot/loader/loader.conf").starts_with("default lev-b.conf\n"));
+    assert!(tree
+        .read("boot/loader/loader.conf")
+        .starts_with("default lev-b.conf\n"));
     let entry = tree.read("boot/loader/entries/lev-b.conf");
-    assert!(!entry.contains("rd.emergency=reboot"), "a default loses the trial options: {entry}");
+    assert!(
+        !entry.contains("rd.emergency=reboot"),
+        "a default loses the trial options: {entry}"
+    );
 
     // Rollback from a committed slot returns to the slot that was good before.
     tree.ok(&["rollback"]);
@@ -255,9 +295,17 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
     let ops: Vec<String> = tree
         .read("state/audit.log")
         .lines()
-        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["operation"].as_str().unwrap().to_string())
+        .map(|l| {
+            serde_json::from_str::<serde_json::Value>(l).unwrap()["operation"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
-    assert_eq!(ops, ["commit", "set-next", "rollback", "set-next", "commit", "rollback"]);
+    assert_eq!(
+        ops,
+        ["commit", "set-next", "rollback", "set-next", "commit", "rollback"]
+    );
 }
 
 #[test]
@@ -281,8 +329,16 @@ fn a_failed_firmware_write_leaves_the_state_alone() {
     let state = tree.read("state/state.json");
     tree.block_efivar("LoaderEntryDefault", true);
     tree.fails(&["rollback"], 22, "one-shot boot was cleared");
-    assert_eq!(tree.read("boot/loader/loader.conf"), loader, "loader.conf is put back");
-    assert_eq!(tree.read("state/state.json"), state, "the state is written last");
+    assert_eq!(
+        tree.read("boot/loader/loader.conf"),
+        loader,
+        "loader.conf is put back"
+    );
+    assert_eq!(
+        tree.read("state/state.json"),
+        state,
+        "the state is written last"
+    );
     assert!(!tree.has_efivar("LoaderEntryOneShot"));
 }
 
@@ -319,7 +375,13 @@ fn a_default_naming_an_unbootable_slot_is_ignored() {
 #[test]
 fn stage_refuses_while_its_slot_is_the_fallback_or_next_boot() {
     let tree = Tree::new();
-    let args = ["stage", "--rootfs", "/nonexistent", "--kernel", "/nonexistent"];
+    let args = [
+        "stage",
+        "--rootfs",
+        "/nonexistent",
+        "--kernel",
+        "/nonexistent",
+    ];
     tree.fails(&args, 21, "running uncommitted");
     tree.ok(&["commit"]);
     tree.ok(&["set-next", "B"]);
@@ -342,14 +404,21 @@ fn trial_commits_a_healthy_trial() {
 fn trial_reboots_out_of_a_degraded_trial() {
     let tree = Tree::trial_of_b();
     fs::write(tree.path("system-state"), "degraded\n").unwrap();
-    fs::write(tree.path("failed-units"), "broken.service loaded failed failed Broken\n").unwrap();
+    fs::write(
+        tree.path("failed-units"),
+        "broken.service loaded failed failed Broken\n",
+    )
+    .unwrap();
     tree.fails(&["trial", "--timeout", "5"], 23, "Rebooting into slot A");
     assert_eq!(tree.read("reboot.log"), "reboot\n");
     let status = tree.status();
     assert_eq!(status["committed"], false);
     assert_eq!(status["next_boot"], "A");
     assert_eq!(status["last_trial"]["committed"], false);
-    assert!(status["last_trial"]["detail"].as_str().unwrap().contains("broken.service"));
+    assert!(status["last_trial"]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("broken.service"));
 }
 
 #[test]
@@ -371,7 +440,11 @@ fn trial_that_never_finishes_starting_fails() {
 #[test]
 fn trial_judges_only_the_trial_set_next_scheduled() {
     let committed = Tree::new();
-    fs::write(committed.path("boot/loader/loader.conf"), "default lev-a.conf\n").unwrap();
+    fs::write(
+        committed.path("boot/loader/loader.conf"),
+        "default lev-a.conf\n",
+    )
+    .unwrap();
     fs::write(committed.path("system-state"), "degraded\n").unwrap();
     committed.ok(&["trial", "--timeout", "5"]);
 
@@ -379,7 +452,11 @@ fn trial_judges_only_the_trial_set_next_scheduled() {
     picked.ok(&["commit"]);
     picked.boot_into("b");
     picked.ok(&["trial", "--timeout", "5"]);
-    assert_eq!(picked.status()["committed"], false, "a menu pick is not committed");
+    assert_eq!(
+        picked.status()["committed"],
+        false,
+        "a menu pick is not committed"
+    );
 
     let rolled_back = Tree::trial_of_b();
     rolled_back.ok(&["rollback"]);
@@ -411,11 +488,21 @@ fn trial_without_the_esp_still_reboots_a_failed_trial() {
 #[test]
 fn install_unit_writes_and_enables_the_trial_service() {
     let tree = Tree::new();
-    tree.ok(&["install-unit", "--root", tree.path("target").to_str().unwrap()]);
-    let unit = tree.read("target/etc/systemd/system/recab-trial.service");
+    tree.ok(&[
+        "install-unit",
+        "--root",
+        tree.path("target").to_str().unwrap(),
+    ]);
+    let unit = tree.read("target/usr/lib/systemd/system/recab-trial.service");
     assert!(unit.contains("ExecStart=/usr/bin/recab trial"), "{unit}");
-    let link = fs::read_link(tree.path("target/etc/systemd/system/sysinit.target.wants/recab-trial.service")).unwrap();
-    assert_eq!(link, Path::new("/etc/systemd/system/recab-trial.service"));
+    let link = fs::read_link(
+        tree.path("target/etc/systemd/system/sysinit.target.wants/recab-trial.service"),
+    )
+    .unwrap();
+    assert_eq!(
+        link,
+        Path::new("/usr/lib/systemd/system/recab-trial.service")
+    );
 }
 
 #[test]
@@ -426,6 +513,12 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
     fs::write(target.join("boot/EFI/systemd/systemd-bootx64.efi"), "efi").unwrap();
     fs::create_dir_all(target.join("etc")).unwrap();
     fs::write(target.join("etc/os-release"), "NAME=\"Lev OS\"\nID=lev\n").unwrap();
+    fs::create_dir_all(target.join("usr/lib/systemd/system")).unwrap();
+    fs::write(
+        target.join("usr/lib/systemd/system/recab-trial.service"),
+        include_str!("../src/services/recab-trial.service"),
+    )
+    .unwrap();
     fs::write(tree.path("kernel"), "new kernel").unwrap();
     fs::write(tree.path("initrd"), "new initrd").unwrap();
     fs::create_dir_all(tree.path("bin")).unwrap();
@@ -437,26 +530,70 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
 
     let out = tree
         .command(true)
-        .env("PATH", format!("{}:{}", tree.path("bin").display(), std::env::var("PATH").unwrap()))
-        .args(["init", "--root", target.to_str().unwrap(), "--slot-a", "/dev/part-a", "--slot-b", "/dev/part-b"])
-        .args(["--kernel", tree.path("kernel").to_str().unwrap(), "--initrd", tree.path("initrd").to_str().unwrap()])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                tree.path("bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .args([
+            "init",
+            "--root",
+            target.to_str().unwrap(),
+            "--slot-a",
+            "/dev/part-a",
+            "--slot-b",
+            "/dev/part-b",
+        ])
+        .args([
+            "--kernel",
+            tree.path("kernel").to_str().unwrap(),
+            "--initrd",
+            tree.path("initrd").to_str().unwrap(),
+        ])
         .args(["--options", "console=ttyS0"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let a = tree.read("target/boot/loader/entries/lev-a.conf");
-    assert!(a.contains("title Lev OS (Slot A)\nlinux /lev-a/vmlinuz\ninitrd /lev-a/initramfs.img\n"), "{a}");
-    assert!(a.contains("root=PARTUUID=aaaa-1 ro rootwait panic=10 console=ttyS0"), "{a}");
-    assert!(tree.read("target/boot/loader/entries/lev-b.conf").contains("root=PARTUUID=bbbb-2"));
+    assert!(
+        a.contains("title Lev OS (Slot A)\nlinux /lev-a/vmlinuz\ninitrd /lev-a/initramfs.img\n"),
+        "{a}"
+    );
+    assert!(
+        a.contains("root=PARTUUID=aaaa-1 ro rootwait panic=10 console=ttyS0"),
+        "{a}"
+    );
+    assert!(tree
+        .read("target/boot/loader/entries/lev-b.conf")
+        .contains("root=PARTUUID=bbbb-2"));
     assert_eq!(tree.read("target/boot/lev-a/vmlinuz"), "new kernel");
-    assert!(!tree.path("target/boot/lev-b").exists(), "slot B has no kernel until stage");
-    assert!(tree.read("target/boot/loader/loader.conf").starts_with("default lev-a.conf\n"));
-    let state: serde_json::Value = serde_json::from_str(&tree.read("target/var/lib/recab/state.json")).unwrap();
+    assert!(
+        !tree.path("target/boot/lev-b").exists(),
+        "slot B has no kernel until stage"
+    );
+    assert!(tree
+        .read("target/boot/loader/loader.conf")
+        .starts_with("default lev-a.conf\n"));
+    let state: serde_json::Value =
+        serde_json::from_str(&tree.read("target/var/lib/recab/state.json")).unwrap();
     assert_eq!(state["known_good_slot"], "A");
-    assert!(tree.path("target/etc/systemd/system/sysinit.target.wants/recab-trial.service").symlink_metadata().is_ok());
+    assert!(tree
+        .path("target/etc/systemd/system/sysinit.target.wants/recab-trial.service")
+        .symlink_metadata()
+        .is_ok());
     // The stale firmware default from an earlier install now names slot A.
-    assert_eq!(tree.efivar("LoaderEntryDefault").as_deref(), Some("lev-a.conf"));
+    assert_eq!(
+        tree.efivar("LoaderEntryDefault").as_deref(),
+        Some("lev-a.conf")
+    );
 }
 
 /// Fields a newer recab wrote survive an older recab's write.
@@ -494,10 +631,17 @@ fn openrc_trials_commit_when_healthy_and_reboot_when_a_service_failed() {
     tree.ok(&["commit"]);
     assert!(openrc(&tree, &["set-next", "B"]).status.success());
     let entry = tree.read("boot/loader/entries/lev-b.conf");
-    assert!(!entry.contains("rd.emergency=reboot"), "OpenRC trials need no initramfs options: {entry}");
+    assert!(
+        !entry.contains("rd.emergency=reboot"),
+        "OpenRC trials need no initramfs options: {entry}"
+    );
     tree.boot_into("b");
     let out = openrc(&tree, &["trial", "--timeout", "5"]);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(tree.status()["committed"], true);
 
     tree.ok(&["set-next", "A"]);
@@ -506,14 +650,22 @@ fn openrc_trials_commit_when_healthy_and_reboot_when_a_service_failed() {
     let out = openrc(&tree, &["trial", "--timeout", "5"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(23), "{stderr}");
-    assert!(stderr.contains("sshd") && stderr.contains("Rebooting into slot B"), "{stderr}");
+    assert!(
+        stderr.contains("sshd") && stderr.contains("Rebooting into slot B"),
+        "{stderr}"
+    );
     assert_eq!(tree.read("reboot.log"), "reboot\n");
 
     // Still starting when the deadline passes: failed.
     let tree = Tree::trial_of_b();
     fs::write(tree.path("openrc/starting/networking"), "").unwrap();
     let out = openrc(&tree, &["trial", "--timeout", "1"]);
-    assert_eq!(out.status.code(), Some(23), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -528,9 +680,16 @@ fn install_unit_writes_and_enables_the_openrc_service() {
         .args(["install-unit", "--root", target.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let service = tree.read("target/etc/init.d/recab-trial");
-    assert!(service.starts_with("#!/sbin/openrc-run") && service.contains("/usr/bin/recab trial"), "{service}");
+    assert!(
+        service.starts_with("#!/sbin/openrc-run") && service.contains("/usr/bin/recab trial"),
+        "{service}"
+    );
     let link = fs::read_link(tree.path("target/etc/runlevels/boot/recab-trial")).unwrap();
     assert_eq!(link, Path::new("/etc/init.d/recab-trial"));
 }

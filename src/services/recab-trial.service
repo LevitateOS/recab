@@ -1,0 +1,14 @@
+# Installed by `recab install-unit`.
+[Unit]
+Description=Commit a healthy A/B trial boot, or reboot into the known-good slot
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+IgnoreOnIsolate=yes
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/recab trial
+
+[Install]
+WantedBy=sysinit.target

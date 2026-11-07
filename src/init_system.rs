@@ -34,42 +34,8 @@ pub(crate) struct Carried {
     pub dirs: &'static [&'static str],
 }
 
-
-const SYSTEMD_UNIT: &str = "\
-# Installed by `recab install-unit`.
-[Unit]
-Description=Commit a healthy A/B trial boot, or reboot into the known-good slot
-DefaultDependencies=no
-Conflicts=shutdown.target
-Before=shutdown.target
-IgnoreOnIsolate=yes
-
-[Service]
-Type=exec
-ExecStart=/usr/bin/recab trial
-
-[Install]
-WantedBy=sysinit.target
-";
-
-/// Started early in the boot runlevel. `recab trial` waits for the default
-/// runlevel to be reached, so it runs in the background and the service
-/// counts as started at once; its one line of output goes to the kernel log.
-const OPENRC_SERVICE: &str = "\
-#!/sbin/openrc-run
-# Installed by `recab install-unit`.
-description=\"Commit a healthy A/B trial boot, or reboot into the known-good slot\"
-
-depend() {
-\tafter sysfs
-}
-
-start() {
-\tebegin \"Starting A/B trial supervision\"
-\t/usr/bin/recab trial </dev/null >/dev/kmsg 2>&1 &
-\teend 0
-}
-";
+const SYSTEMD_UNIT: &str = include_str!("services/recab-trial.service");
+const OPENRC_SERVICE: &str = include_str!("services/recab-trial.openrc");
 
 impl InitSystem {
     /// The init system running now (`RECAB_INIT_SYSTEM` overrides).
@@ -130,7 +96,7 @@ impl InitSystem {
     /// The trial service's file, relative to the root.
     fn trial_service_path(self) -> &'static str {
         match self {
-            Self::Systemd => "etc/systemd/system/recab-trial.service",
+            Self::Systemd => "usr/lib/systemd/system/recab-trial.service",
             Self::OpenRc => "etc/init.d/recab-trial",
         }
     }
@@ -153,7 +119,10 @@ impl InitSystem {
         match self {
             Self::Systemd => Carried {
                 files: &[],
-                dirs: &["etc/systemd/system", "etc/NetworkManager/system-connections"],
+                dirs: &[
+                    "etc/systemd/system",
+                    "etc/NetworkManager/system-connections",
+                ],
             },
             Self::OpenRc => Carried {
                 files: &["etc/network/interfaces", "etc/inittab", "etc/doas.conf"],
@@ -164,7 +133,9 @@ impl InitSystem {
 
     /// The trial service is enabled under `root`.
     pub(crate) fn trial_service_enabled(self, root: &Path) -> bool {
-        root.join(self.trial_service_link()).symlink_metadata().is_ok()
+        root.join(self.trial_service_link())
+            .symlink_metadata()
+            .is_ok()
     }
 
     /// Write the trial service under `root` and enable it, as
@@ -175,11 +146,25 @@ impl InitSystem {
             Self::OpenRc => (OPENRC_SERVICE, 0o755),
         };
         let path = root.join(self.trial_service_path());
-        write_durable(&path, content.as_bytes()).with_context(|| format!("writing '{}'", path.display()))?;
+        write_durable(&path, content.as_bytes())
+            .with_context(|| format!("writing '{}'", path.display()))?;
         fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        self.enable_trial_service(root)
+    }
+
+    /// Enable the service packaged by Recipe; never replace package contents.
+    pub(crate) fn enable_trial_service(self, root: &Path) -> Result<()> {
+        let path = root.join(self.trial_service_path());
+        if !path.is_file() {
+            bail!(
+                "{} is missing; deploy a complete recab package produced by Recipe",
+                path.display()
+            );
+        }
         let link = root.join(self.trial_service_link());
         if let Some(parent) = link.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating '{}'", parent.display()))?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating '{}'", parent.display()))?;
         }
         if link.symlink_metadata().is_ok() {
             fs::remove_file(&link).with_context(|| format!("replacing '{}'", link.display()))?;
@@ -266,7 +251,13 @@ fn systemd_startup(timeout: Duration) -> Result<(Startup, Vec<String>)> {
 
 fn systemd_failed_units(systemctl: &str) -> Vec<String> {
     Command::new(systemctl)
-        .args(["list-units", "--failed", "--no-legend", "--plain", "--no-pager"])
+        .args([
+            "list-units",
+            "--failed",
+            "--no-legend",
+            "--plain",
+            "--no-pager",
+        ])
         .output()
         .map(|out| {
             String::from_utf8_lossy(&out.stdout)
@@ -294,8 +285,15 @@ fn openrc_startup(timeout: Duration) -> Result<(Startup, Vec<String>)> {
         let level = fs::read_to_string(dir.join("softlevel")).unwrap_or_default();
         match level.trim() {
             "default" if dir_is_empty(&dir.join("starting")) && !openrc_running() => break,
-            "single" => return Ok((Startup::Failed("single-user runlevel".to_string()), openrc_failed(&dir))),
-            "shutdown" | "reboot" => return Ok((Startup::Inconclusive(level.trim().to_string()), Vec::new())),
+            "single" => {
+                return Ok((
+                    Startup::Failed("single-user runlevel".to_string()),
+                    openrc_failed(&dir),
+                ))
+            }
+            "shutdown" | "reboot" => {
+                return Ok((Startup::Inconclusive(level.trim().to_string()), Vec::new()))
+            }
             _ => {}
         }
         if Instant::now() >= deadline {
@@ -325,8 +323,13 @@ fn openrc_failed(dir: &Path) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default();
-    let rc_status = std::env::var("RECAB_RC_STATUS_BIN").unwrap_or_else(|_| "rc-status".to_string());
-    if let Ok(out) = Command::new(rc_status).arg("--crashed").stderr(Stdio::null()).output() {
+    let rc_status =
+        std::env::var("RECAB_RC_STATUS_BIN").unwrap_or_else(|_| "rc-status".to_string());
+    if let Ok(out) = Command::new(rc_status)
+        .arg("--crashed")
+        .stderr(Stdio::null())
+        .output()
+    {
         for name in String::from_utf8_lossy(&out.stdout).split_whitespace() {
             if !failed.iter().any(|f| f == name) {
                 failed.push(format!("{name} (crashed)"));
@@ -343,7 +346,12 @@ fn openrc_running() -> bool {
         return false;
     };
     entries.flatten().any(|entry| {
-        entry.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit())
-            && fs::read_to_string(entry.path().join("comm")).is_ok_and(|comm| comm.trim() == "openrc")
+        entry
+            .file_name()
+            .to_string_lossy()
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            && fs::read_to_string(entry.path().join("comm"))
+                .is_ok_and(|comm| comm.trim() == "openrc")
     })
 }

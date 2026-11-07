@@ -21,9 +21,14 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
     let boot_root = root.join("boot");
     // `bootctl install` creates loader/; installers that copy systemd-boot's
     // EFI binary themselves do not.
-    let systemd_boot = ["EFI/systemd/systemd-bootx64.efi", "EFI/BOOT/BOOTX64.EFI", "EFI/systemd/systemd-bootaa64.efi", "EFI/BOOT/BOOTAA64.EFI"]
-        .iter()
-        .any(|rel| boot_root.join(rel).is_file());
+    let systemd_boot = [
+        "EFI/systemd/systemd-bootx64.efi",
+        "EFI/BOOT/BOOTX64.EFI",
+        "EFI/systemd/systemd-bootaa64.efi",
+        "EFI/BOOT/BOOTAA64.EFI",
+    ]
+    .iter()
+    .any(|rel| boot_root.join(rel).is_file());
     if !systemd_boot {
         bail!(
             "'{}' has no systemd-boot EFI binary; install systemd-boot on the target's ESP first",
@@ -53,7 +58,10 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
     let entries = boot_root.join("loader/entries");
     fs::create_dir_all(&entries).with_context(|| format!("creating '{}'", entries.display()))?;
     for (slot, partuuid) in &partuuids {
-        let mut entry = format!("title {name} (Slot {slot})\nlinux /{}/vmlinuz\n", dir(*slot));
+        let mut entry = format!(
+            "title {name} (Slot {slot})\nlinux /{}/vmlinuz\n",
+            dir(*slot)
+        );
         if request.initrd.is_some() {
             entry.push_str(&format!("initrd /{}/initramfs.img\n", dir(*slot)));
         }
@@ -62,16 +70,22 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
         } else {
             format!(" {}", request.options.trim())
         };
-        entry.push_str(&format!("options root=PARTUUID={partuuid} ro rootwait {PANIC_OPTION}{extra}\n"));
+        entry.push_str(&format!(
+            "options root=PARTUUID={partuuid} ro rootwait {PANIC_OPTION}{extra}\n"
+        ));
         let path = entries.join(format!("{id}-{}.conf", slot.entry_suffix()));
-        write_durable(&path, entry.as_bytes()).with_context(|| format!("writing '{}'", path.display()))?;
+        write_durable(&path, entry.as_bytes())
+            .with_context(|| format!("writing '{}'", path.display()))?;
     }
 
     let default_entry = format!("{id}-a.conf");
     let loader_conf = boot_root.join("loader/loader.conf");
     let before = read_optional(&loader_conf)?;
-    write_durable(&loader_conf, loader_with_default(before.as_deref(), &default_entry).as_bytes())
-        .with_context(|| format!("writing '{}'", loader_conf.display()))?;
+    write_durable(
+        &loader_conf,
+        loader_with_default(before.as_deref(), &default_entry).as_bytes(),
+    )
+    .with_context(|| format!("writing '{}'", loader_conf.display()))?;
 
     let state = PersistentState {
         known_good_slot: Some(Slot::A),
@@ -79,7 +93,7 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
         ..PersistentState::default()
     };
     Store::under(root).save(&state, "init")?;
-    init.install_trial_service(root)?;
+    init.enable_trial_service(root)?;
 
     // A previous install may have left systemd-boot variables naming the
     // other slot; they win over loader.conf. Point them at slot A.
@@ -117,11 +131,16 @@ fn partuuid(device: &Path) -> Result<String> {
         .arg(device)
         .output()
         .context("running 'blkid'")?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+    let value = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .to_ascii_lowercase();
     if !out.status.success() || value.is_empty() {
         return Err(tagged_err(
             ErrorClass::StateOrDetection,
-            format!("'{}' has no PARTUUID; A/B slots must be GPT partitions", device.display()),
+            format!(
+                "'{}' has no PARTUUID; A/B slots must be GPT partitions",
+                device.display()
+            ),
         ));
     }
     Ok(value)

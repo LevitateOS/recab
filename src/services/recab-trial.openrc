@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# Installed by `recab install-unit`.
+description="Commit a healthy A/B trial boot, or reboot into the known-good slot"
+
+depend() {
+	after sysfs
+}
+
+start() {
+	ebegin "Starting A/B trial supervision"
+	/usr/bin/recab trial </dev/null >/dev/kmsg 2>&1 &
+	eend 0
+}

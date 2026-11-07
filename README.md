@@ -101,7 +101,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
 - `install-unit` writes the trial service for the init system under `<root>`
   and enables it: `recab-trial.service` in `sysinit.target`, or
   `/etc/init.d/recab-trial` in the boot runlevel (it runs `recab trial` in the
-  background, logging to the kernel log). `init` runs it.
+  background, logging to the kernel log). Recipe packages this service in the system image; `init` and `stage` only enable it. `install-unit` remains an explicit repair command.
 
 ### Trial options
 
