@@ -225,27 +225,23 @@ sets, and a fake OpenRC state directory. No disk is touched. Runs that need root
 (`unshare --user --map-root-user`), so `cargo test -p recab` runs everything
 unprivileged.
 
-## End-to-End Testing Still Needed
+## End-to-End Validation
 
-The A/B flow has not run on a booted LevitateOS yet. What is verified:
-`tests/lifecycle.rs`, and a manual `recab stage` onto loop-device slots on a
-Linux host (including the account and unit merge).
-
-What still needs an e2e run, for each distro, once Recipe can build its
-live-tools ISO (on 2026-11-06 levitate's fails extracting the Fedora RPMs inside
-Ginux; acorn's has not been tried):
+On 2026-11-08, the existing `ab-update` scenario passed across seven boots on
+both LevitateOS (systemd) and AcornOS (OpenRC), using fresh A/B installations
+and live-tools images under the libvirt user session with OVMF. All eight
+scenarios in `test all` passed on each distro.
 
 ```sh
-cargo xtask build live-tools levitate   # or acorn
-cargo xtask test install levitate       # recab init: entries, slot A kernel, state, trial service enabled
-cargo xtask test runtime levitate       # recab and recstrap present on the installed system
-cargo xtask test ab-update levitate     # stage B; degraded trial reboots back; healthy trial commits itself;
-                                        # second-generation stage of A from B; rollback
+cargo xtask test all levitate
+cargo xtask test all acorn
+cargo xtask test ab-update levitate
+cargo xtask test ab-update acorn
 ```
 
-Not yet seen on real hardware or OVMF: recab's own writes to efivarfs (the
-lifecycle tests write a plain directory), and OpenRC's state directory and
-`rc-status --crashed` output on a real AcornOS boot.
+These commands consume existing release images. A passing result for the same
+inputs is reused unless `--force` is supplied. Run records and their input
+references are in `.artifacts/out/<distro>/scenarios/<scenario>/<run>/run-manifest.json`.
 
 `ab-update` checks what the host checks cannot: that the installed system boots
 from a slot `recab stage` wrote, that OVMF keeps and consumes the one-shot
@@ -253,12 +249,9 @@ variable, that `recab-trial.service` reboots out of a degraded trial and commits
 a healthy one, that the machine keeps its identity, and that commit and
 rollback survive reboots.
 
-Also open:
-- The release now puts the installed system's initramfs on the ISO
-  (`boot/initramfs-installed.img`: systemd, mounts `root=`, honours
-  `rd.emergency=reboot`) and recsetup installs it instead of the live one; no
-  e2e has booted it yet.
-- No e2e covers an initramfs or PID 1 failure in a trial.
+The runs exercise the installed initramfs, real efivarfs writes through OVMF,
+and each distro's actual service-health reporting. Physical hardware and
+injected initramfs or PID 1 failures remain untested by this scenario.
 
 ## Exit Codes
 
