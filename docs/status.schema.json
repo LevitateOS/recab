@@ -92,7 +92,7 @@
   ],
   "$defs": {
     "Slot": {
-      "description": "System slot identifier (A/B).",
+      "description": "System slot identifier (A/B). Its one spelling (`A`, `B`) is used by the\nCLI, the JSON and the state file.",
       "type": "string",
       "enum": [
         "A",
@@ -146,7 +146,7 @@
       ]
     },
     "TrialRecord": {
-      "description": "How the last judged trial boot ended.",
+      "description": "How the last judged trial boot ended (kept in the state file, and shown\nas is by `status`).",
       "type": "object",
       "properties": {
         "committed": {

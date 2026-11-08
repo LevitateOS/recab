@@ -101,12 +101,11 @@ Leaf types (`Slot`, `TrialRecord`, `Startup`) live in the pure state module and 
 
 - **Done when:** `state.rs` imports nothing from `lib.rs`; `deps.py` shows no module importing a crate-root item; every `pub` item has an outside user or is `pub(crate)`; no pass-through wrapper is left in `store.rs`; `main.rs` derives text output from the same structs as JSON.
 - **Depends on:** nothing
-- **Problems (28):**
+- **Problems (24):**
   - P002 [hidden] `src/main.rs:153-157` ends in `unreachable!`, true only because of the clap attributes at `main.rs:68-75`; change an attribute and it panics at runtime.
   - P003 [hidden] `src/main.rs:45,48,51` spell `required_if_eq("mode", "ab"|"mutable")` as literals that must match `recpart::types::InstallMode`'s names (`tools/recpart/src/types.rs:17-23`).
   - P004 [hidden] `src/main.rs:161-165` re-checks the mode/slot combinations clap already enforces (`main.rs:45-52`), with an unclassified `bail!` (exit 1): two copies of one rule.
   - P007 [hidden] `src/main.rs:194-216` `print_status` lists `Status` fields (`lib.rs:133-152`) one by one and silently omits `slots`; text and JSON already differ.
-  - P008 [hidden] `src/main.rs:177-188` renders `Health` as text one way and `src/lib.rs:352-361` renders the same startup/failed data as a trial message another way.
   - P009 [hidden] `src/lib.rs:57-95` spells a slot three ways (`#[value(name = "A")]`, `serde(rename_all = "UPPERCASE")`, `as_letter()`); `src/contract.rs:18` exports the clap spelling as `SLOTS`, the JSON uses serde's.
   - P042 [needless] `src/state.rs:9`, `src/store.rs:16`, `src/systemd_boot.rs:20` import `Slot`/`TrialRecord` from the crate root, and `store.rs:119` calls `crate::now()`: the I/O-free state machine and the store depend on `lib.rs`, the most volatile file, which imports them back (`lib.rs:48-51`).
   - P043 [needless] `src/lib.rs:98-108` `TrialRecord` is a field of `PersistentState` (`state.rs:31`) but lives in `lib.rs` beside the CLI output types.
@@ -115,7 +114,6 @@ Leaf types (`Slot`, `TrialRecord`, `Startup`) live in the pure state module and 
   - P046 [needless] `src/main.rs:9` parses `recpart::types::InstallMode`, then converts it (`:161-165`) into recab's own `InitLayout` (`lib.rs:173-180`): two types for one choice, and the CLI depends on the partitioner's type.
   - P049 [needless] `src/store.rs:148-163` make the state store the home of generic file helpers, so `systemd_boot.rs:18`, `init.rs:19`, `stage.rs:19` import "the store" for plain file I/O.
   - P053 [needless] `src/lib.rs:15` `pub mod carried`, and `lib.rs:43-44` `crash_option`, `RECAB_BIN`, are public only for `tests/lifecycle.rs:279,626,633,859,864`.
-  - P055 [needless] `Cargo.toml:15` depends on all of `recpart` for two mount constants (`config.rs:13`), `InstallMode` (`main.rs:9`) and `Role` (`stage.rs:24`).
   - P056 [needless] `src/init_system.rs:88-101` `InitSystemName` copies `distro_profile::InitSystem` (re-exported `lib.rs:42`) only to attach contract derives; it must track every init added upstream.
   - P058 [surplus] `src/lib.rs:76-81` `Slot::as_letter` is public; its only user is `Display` (`:94`).
   - P059 [surplus] `src/lib.rs:34` re-exports `layout_entry_name`, `INITRD_FILE`, `KERNEL_FILE`, `LOADER_CONF` with no caller outside the crate.
@@ -125,10 +123,8 @@ Leaf types (`Slot`, `TrialRecord`, `Startup`) live in the pure state module and 
   - P066 [surplus] `src/contract.rs:19` `ERROR_SCHEMA_VERSION` exported with an empty description.
   - P105 [hidden] `STATE_SCHEMA_VERSION` (`src/state.rs:14`) is restated as the literal `state.schema < 1` (`src/store.rs:88`).
   - P122 [surplus] `SYSTEMD_BOOT_SOURCE_DIR` is `pub` (`src/systemd_boot.rs:35`) and `PANIC_OPTION` `pub(crate)` (`:43`), both used only in `systemd_boot.rs`.
-  - P249 [hidden] User-facing messages in the state machine and backend name CLI commands (`src/state.rs:170,175,182,208,220` 'recab commit'/'rollback'/'set-next'; `src/systemd_boot.rs:294` 'recab stage'): renaming a command means editing both.
   - P259 [hidden] `src/stage.rs:19` writes through the store wrapper `write_durable`, while `:394,518,521,534` call `target_root::read_optional`/`write_durable` directly: wrapper and wrapped both in use.
   - P281 [hidden] `AuditEvent` (`src/store.rs:28-37`) embeds the whole `before`/`after` `PersistentState`, so every state-schema change changes the audit record, though `store.rs:13-15` says the audit schema is "versioned apart".
-  - P282 [needless] `PersistentState.last_trial` is `TrialRecord` (`src/state.rs:9,31`), the public status contract type exported to TypeScript (`lib.rs:101`): the persisted state and the status JSON change together.
   - P334 [needless] `Startup` (`src/state.rs:263-273`) is defined in init vocabulary (systemd maintenance, OpenRC single-user) inside the pure state machine; `init_system.rs` imports it.
 
 ### F08 One error model
@@ -266,7 +262,8 @@ One adapter per init: the startup verdict (`Health` carries it, and `trial` uses
 
 - **Done when:** Each init's facts (verdict, failed list, reboot, crash option, service file and link, logging) live in one adapter; `trial` uses `health`; only `REC_INIT` is required of the profile; `install-tools.rhai` has no `if ctx.name == "recab"`.
 - **Depends on:** F01
-- **Problems (33):**
+- **Problems (34):**
+  - P008 [hidden] `src/main.rs:177-188` renders `Health` as text one way and `src/lib.rs:352-361` renders the same startup/failed data as a trial message another way.
   - P017 [hidden] `src/lib.rs:342-350` (trial) and `:434-436` (health) repeat `Config::running` → `running_profile().init` → `wait_finished`.
   - P052 [needless] `src/lib.rs:442`, `src/main.rs:119-126` the init-system argument is named `package` (`--package <init>`) after Recipe's use (`install-tools.rhai:111`), not after what it is.
   - P197 [hidden] `trial` and `health` share the wait (`src/lib.rs:342-350`, `:433-437`) but `trial` does not call `health`, which README.md:22 and `main.rs:105` call "the verdict a trial judges by"; the verdict `trial` uses (`Startup`) is `#[serde(skip)]` (`init_system.rs:80-83`), and `health --json` consumers judge by `finished` + `failed` (`testing/ginux-boot/ginux-boot.sh:159-176`), a different rule (`degraded` is `finished: true`, `init_system.rs:150`).
@@ -551,7 +548,12 @@ Lifecycle fixtures are made by `recab init` itself (the layout recab writes) wit
   - **Why:** The builder's two tool lists duplicate the builder's own fact, outside recab; recorded for the builder owner.
 - P322 [special] `testing/ginux-boot/levitate/expect:11-34` and `acorn/expect:8` accept known failing units as passes, and say (`:6-7`) they have not been re-recorded since recab's verdict.
   - **Why:** ginux-boot's known-gap lists are that harness's own record; re-recording them is its maintenance, not recab's structure.
+- P055 [needless] `Cargo.toml:15` depends on all of `recpart` for two mount constants (`config.rs:13`), `InstallMode` (`main.rs:9`) and `Role` (`stage.rs:24`).
+  - **Why:** recpart owns the mount points, install modes and slot roles; depending on it is depending on the owner of those facts, and splitting a policy crate out of recpart is not worth it.
+- P249 [hidden] User-facing messages in the state machine and backend name CLI commands (`src/state.rs:170,175,182,208,220` 'recab commit'/'rollback'/'set-next'; `src/systemd_boot.rs:294` 'recab stage'): renaming a command means editing both.
+  - **Why:** Actionable refusals (REQ-ERR-002) must name the command to run; a command rename is rare and a grep finds every message.
+- P282 [needless] `PersistentState.last_trial` is `TrialRecord` (`src/state.rs:9,31`), the public status contract type exported to TypeScript (`lib.rs:101`): the persisted state and the status JSON change together.
+  - **Why:** status reports the stored record as it is; the persisted record and its JSON change together by design. The type now lives in state.rs with the rest of the state file.
 
 ## Progress
-
-(Empty until untangle-refactor starts.)
+- [x] **F12 Layering and the public surface.** `Slot` and `TrialRecord` live in `state.rs` (no clap derive; one `FromStr`/`Display` spelling); `status.rs` owns `Status`/`SlotView` and builds the slot views from small backend queries; `init.rs`/`stage.rs` own their request types; `lib.rs` re-exports only what other crates use; the store's pass-through file helpers are gone (callers use `target_root`), its fields are private and it owns the clock; the schema check lives in `state.rs`; `InitSystemName` is gone (`distro-profile` gained a `contracts` feature). Left as is, with reasons: P055, P249, P282. P008 moved to F11 (the trial message). Moving `System`/`change()`/`trial()` out of `lib.rs` is left to F04/F06, which rewrite them. **Behaviour changes (intended):** `status` text also lists each slot's entry, kernel dir, root, device, bootable and trial options; `health` text names the init (`systemd startup finished (running)`); a wrong argument combination for `init` or `stage` is a clap usage error (exit 2) instead of exit 1 or a panic. Checks: `cargo test -p recab` 20/20, `cargo check -p install-tests -p levitate-xtask`, `cargo xtask gen` regenerated the recab schemas and `recab-tui/src/generated/recab.ts`.

@@ -16,13 +16,32 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::carried::{self, Carry};
-use crate::store::write_durable;
 use crate::systemd_boot::{Boot, SystemdBoot};
-use crate::{tagged_err, ErrorClass, Slot, StageRequest};
+use crate::state::Slot;
+use crate::{tagged_err, ErrorClass};
 use distro_profile::{Flavour, Profile};
 use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
 use recpart::types::Role;
 use target_root::ErofsImage;
+
+/// The prebuilt system `stage` writes: files, or a release medium holding them.
+#[derive(Debug, Clone)]
+pub enum StageSource {
+    Files(StageRequest),
+    /// A release medium (its device, or where it is mounted): the rootfs,
+    /// kernel and, when it carries one, the installed initramfs at the live
+    /// protocol's paths.
+    Media(PathBuf),
+}
+
+/// The prebuilt system `stage` writes, as files.
+#[derive(Debug, Clone)]
+pub struct StageRequest {
+    /// EROFS rootfs image (a file or a partition), extracted with recstrap.
+    pub rootfs: PathBuf,
+    pub kernel: PathBuf,
+    pub initrd: Option<PathBuf>,
+}
 
 /// The slot's role in the disk layout, which gives its filesystem and label.
 fn slot_role(slot: Slot) -> Role {
@@ -384,7 +403,7 @@ fn write_baseline(root: &Path, list: &[Carry]) -> Result<()> {
             None => format!("{sig}\t{path}\n"),
         })
         .collect();
-    write_durable(&root.join(BASELINE), text.as_bytes())
+    Ok(target_root::write_durable(&root.join(BASELINE), text.as_bytes(), None)?)
 }
 
 /// The baseline of the slot under `root` as path -> signature; empty when it
@@ -561,7 +580,7 @@ fn write_fstab(running: &Path, dest: &Path, partuuid: &str, filesystem: &str) ->
     if !found_root {
         bail!("'{}' has no entry for /", running.display());
     }
-    write_durable(dest, (lines.join("\n") + "\n").as_bytes())
+    target_root::write_durable(dest, (lines.join("\n") + "\n").as_bytes(), None)
         .with_context(|| format!("writing '{}'", dest.display()))
 }
 

@@ -15,8 +15,8 @@ pub fn export() -> Result<Contract> {
         .schema::<Health>(docs, "health")?
         .schema::<ErrorPayload>(docs, "error")?;
     c.types_from::<Status>().types_from::<Health>().types_from::<ErrorPayload>();
-    c.value_enum::<Slot>("SLOTS", "SLOT_HELP")?;
-    c.constant("ERROR_SCHEMA_VERSION", "", &crate::ERROR_SCHEMA_VERSION)?;
+    c.constant("SLOTS", "The slots, as every recab command and document spells them.", &Slot::ALL)?;
+    c.constant("ERROR_SCHEMA_VERSION", "The schema of the error a failed `--json` command prints.", &crate::error::ERROR_SCHEMA_VERSION)?;
     let classes: BTreeMap<String, serde_json::Value> = ErrorClass::ALL
         .iter()
         .map(|class| {

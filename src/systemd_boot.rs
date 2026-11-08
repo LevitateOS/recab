@@ -15,9 +15,8 @@ use crate::config::{Config, RunningRoot};
 use crate::error::{tagged_err, ErrorClass};
 use distro_profile::os_release_value;
 use crate::state::{BootChange, Selection};
-use crate::store::{copy_durable, read_optional, sync_dir, write_durable};
 use crate::init_system::crash_option;
-use crate::Slot;
+use crate::state::Slot;
 use distro_profile::InitSystem;
 use recinit::live::FAIL_REBOOT_OPTION;
 
@@ -32,7 +31,7 @@ pub const KERNEL_FILE: &str = "vmlinuz";
 pub const INITRD_FILE: &str = "initramfs.img";
 
 /// Where the target ships systemd-boot's EFI binaries, relative to its root.
-pub const SYSTEMD_BOOT_SOURCE_DIR: &str = "usr/lib/systemd/boot/efi";
+const SYSTEMD_BOOT_SOURCE_DIR: &str = "usr/lib/systemd/boot/efi";
 /// systemd-boot's EFI binary per firmware architecture suffix, and the
 /// firmware's default loader name for it (`EFI/BOOT/BOOT<ARCH>.EFI`).
 const SYSTEMD_BOOT_ARCHES: &[(&str, &str)] = &[("x64", "BOOTX64.EFI"), ("aa64", "BOOTAA64.EFI")];
@@ -40,7 +39,7 @@ const SYSTEMD_BOOT_ARCHES: &[(&str, &str)] = &[("x64", "BOOTX64.EFI"), ("aa64", 
 /// Seconds after a kernel panic before the kernel reboots, on every entry
 /// recab writes: a trial that panics reboots into the default slot.
 const PANIC_KEY: &str = "panic=";
-pub(crate) const PANIC_OPTION: &str = "panic=10";
+const PANIC_OPTION: &str = "panic=10";
 /// The root options of every entry recab writes: the root is mounted read-only
 /// and remounted read-write by the installed system's fstab.
 const ROOT_OPTIONS: &[&str] = &["ro", "rootwait"];
@@ -121,7 +120,7 @@ impl SystemdBoot {
         // systemd-boot tries the LoaderEntryDefault firmware variable,
         // then loader.conf's `default`, skipping entries it cannot boot.
         let efivar_default = self.loader_efivar("LoaderEntryDefault")?;
-        let conf_default = read_optional(&self.loader_conf)?.as_deref().and_then(loader_default);
+        let conf_default = target_root::read_optional(&self.loader_conf)?.as_deref().and_then(loader_default);
         let prefix = self.entry_prefix()?;
         let active = self.active_slot(&prefix)?;
         let bootable_slot = |entry: Option<&str>| -> Result<Option<Slot>> {
@@ -162,7 +161,7 @@ impl SystemdBoot {
         };
         let default = match self.loader_efivar("LoaderEntryDefault")? {
             Some(default) => Some(default),
-            None => read_optional(&self.loader_conf)?.as_deref().and_then(loader_default),
+            None => target_root::read_optional(&self.loader_conf)?.as_deref().and_then(loader_default),
         };
         let Some((def_prefix, default)) = default.as_deref().and_then(parse_entry_name) else {
             return Ok(None);
@@ -262,14 +261,14 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
                     }
                 };
                 self.set_trial_options(&entry, None).map_err(failed)?;
-                let before = read_optional(&self.loader_conf).map_err(failed)?;
+                let before = target_root::read_optional(&self.loader_conf).map_err(|err| failed(err.into()))?;
                 let content = loader_with_default(before.as_deref(), &entry);
-                write_durable(&self.loader_conf, content.as_bytes())
+                target_root::write_durable(&self.loader_conf, content.as_bytes(), None)
                     .with_context(|| format!("writing '{}'", self.loader_conf.display()))
                     .map_err(failed)?;
                 if let Err(cause) = self.set_loader_efivar("LoaderEntryDefault", Some(&entry)) {
                     let restore = match &before {
-                        Some(content) => write_durable(&self.loader_conf, content.as_bytes()),
+                        Some(content) => target_root::write_durable(&self.loader_conf, content.as_bytes(), None).map_err(Into::into),
                         None => fs::remove_file(&self.loader_conf).map_err(Into::into),
                     };
                     return Err(match restore {
@@ -301,7 +300,7 @@ Write a system into slot {slot} with 'recab stage' first."
     /// The first file the entry loads that the ESP lacks; the entry itself
     /// when it is missing.
     fn missing_boot_file(&self, entry: &str) -> Result<Option<String>> {
-        let Some(content) = read_optional(&self.entries_dir.join(entry))? else {
+        let Some(content) = target_root::read_optional(&self.entries_dir.join(entry))? else {
             return Ok(Some(entry.to_string()));
         };
         for file in entry_boot_files(&content) {
@@ -324,7 +323,7 @@ Write a system into slot {slot} with 'recab stage' first."
             return Ok(());
         }
         let path = self.entries_dir.join(entry);
-        write_durable(&path, updated.as_bytes()).with_context(|| format!("writing '{}'", path.display()))
+        target_root::write_durable(&path, updated.as_bytes(), None).with_context(|| format!("writing '{}'", path.display()))
     }
 
     /// The block device the slot's entry names with `root=`. The entries are
@@ -373,7 +372,7 @@ Write a system into slot {slot} with 'recab stage' first."
         if dir.exists() {
             fs::remove_dir_all(&dir)
                 .with_context(|| format!("removing slot {slot}'s kernel '{}'", dir.display()))?;
-            sync_dir(&self.boot_root)?;
+            target_root::sync_dir(&self.boot_root)?;
         }
         Ok(())
     }
@@ -394,9 +393,9 @@ Write a system into slot {slot} with 'recab stage' first."
         let dir_name = slot_boot_dir(&boot.prefix, slot);
         let dir = self.boot_root.join(&dir_name);
         fs::create_dir_all(&dir).with_context(|| format!("creating '{}'", dir.display()))?;
-        copy_durable(kernel, &dir.join(KERNEL_FILE))?;
+        target_root::copy_durable(kernel, &dir.join(KERNEL_FILE))?;
         if let Some(initrd) = initrd {
-            copy_durable(initrd, &dir.join(INITRD_FILE))?;
+            target_root::copy_durable(initrd, &dir.join(INITRD_FILE))?;
         }
         let content = entry_with_boot_files(
             &content,
@@ -412,7 +411,7 @@ Write a system into slot {slot} with 'recab stage' first."
         let wanted = trial_options(&content, init);
         let content = entry_with_options(&content, |options| options.extend(wanted.iter().map(|o| o.to_string())));
         let path = self.entries_dir.join(&entry);
-        write_durable(&path, content.as_bytes())
+        target_root::write_durable(&path, content.as_bytes(), None)
             .with_context(|| format!("writing '{}'", path.display()))
     }
 
@@ -595,6 +594,16 @@ Expected matching root=... options in '{}' and '{}'.",
         Ok(matched)
     }
 
+    /// The slot's entry file as written, if it exists.
+    pub fn entry_text(&self, boot: &Boot, slot: Slot) -> Result<Option<String>> {
+        Ok(target_root::read_optional(&self.entries_dir.join(entry_name(&boot.prefix, slot)))?)
+    }
+
+    /// Every file the slot's entry loads is on the ESP.
+    pub fn bootable(&self, boot: &Boot, slot: Slot) -> Result<bool> {
+        Ok(self.missing_boot_file(&entry_name(&boot.prefix, slot))?.is_none())
+    }
+
     /// The entries' prefix: configured (`RECAB_ENTRY_PREFIX`), else the
     /// system's os-release `ID`, lower-cased: the rule `recab init` names
     /// them by.
@@ -602,7 +611,7 @@ Expected matching root=... options in '{}' and '{}'.",
         if let Some(prefix) = &self.entry_prefix {
             return Ok(prefix.clone());
         }
-        read_optional(&self.os_release)?
+        target_root::read_optional(&self.os_release)?
             .and_then(|text| os_release_value(&text, "ID"))
             .map(|id| os_prefix(&id))
             .ok_or_else(|| {
@@ -614,31 +623,6 @@ Expected matching root=... options in '{}' and '{}'.",
                     ),
                 )
             })
-    }
-
-    /// The layout of each slot on the ESP, as `status` reports it.
-    pub fn slot_views(&self, boot: &Boot) -> Result<Vec<crate::SlotView>> {
-        let mut views = Vec::new();
-        for slot in [Slot::A, Slot::B] {
-            let entry = entry_name(&boot.prefix, slot);
-            let content = read_optional(&self.entries_dir.join(&entry))?;
-            let root = content.as_deref().and_then(root_selector_from_entry_content);
-            let device = match &root {
-                Some(root) => root.device()?.map(|d| d.display().to_string()),
-                None => None,
-            };
-            let options = content.as_deref().map(entry_options).unwrap_or_default();
-            views.push(crate::SlotView {
-                slot,
-                entry: format!("{ENTRIES_DIR}/{entry}"),
-                boot_dir: slot_boot_dir(&boot.prefix, slot),
-                root: root.map(|r| r.to_string()),
-                device,
-                bootable: self.missing_boot_file(&entry)?.is_none(),
-                trial: options.iter().any(|o| is_trial_option(o)),
-            });
-        }
-        Ok(views)
     }
 }
 
@@ -668,7 +652,7 @@ pub fn entry_name(prefix: &str, slot: Slot) -> String {
 }
 
 /// The slot's kernel directory on the ESP, relative to its root.
-fn slot_boot_dir(prefix: &str, slot: Slot) -> String {
+pub(crate) fn slot_boot_dir(prefix: &str, slot: Slot) -> String {
     layout_name(prefix, Some(slot))
 }
 
@@ -714,7 +698,7 @@ pub(crate) fn install_loader(root: &Path, esp: &Path) -> Result<()> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating '{}'", parent.display()))?;
         }
-        copy_durable(&source, &dest)?;
+        target_root::copy_durable(&source, &dest)?;
     }
     Ok(())
 }
@@ -928,6 +912,20 @@ fn root_selector_from_entry_content(content: &str) -> Option<RootSelector> {
         .filter(|rest| rest.starts_with(char::is_whitespace))
         .collect();
     root_selector_from_cmdline(&options.join(" "))
+}
+
+/// An entry's `root=`, as written (`PARTUUID=...`), and the block device it
+/// names on this machine.
+pub(crate) fn entry_root(content: &str) -> Result<Option<(String, Option<PathBuf>)>> {
+    match root_selector_from_entry_content(content) {
+        Some(root) => Ok(Some((root.to_string(), root.device()?))),
+        None => Ok(None),
+    }
+}
+
+/// The entry carries a trial's options.
+pub(crate) fn has_trial_options(content: &str) -> bool {
+    entry_options(content).iter().any(|o| is_trial_option(o))
 }
 
 /// Clear `FS_IMMUTABLE_FL`; filesystems without file flags have nothing to clear.

@@ -6,12 +6,75 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{tagged_err, ErrorClass};
-use crate::{Slot, TrialRecord};
+
+/// System slot identifier (A/B). Its one spelling (`A`, `B`) is used by the
+/// CLI, the JSON and the state file.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Slot {
+    A,
+    B,
+}
+
+impl Slot {
+    pub const ALL: [Slot; 2] = [Slot::A, Slot::B];
+
+    pub fn other(self) -> Slot {
+        match self {
+            Slot::A => Slot::B,
+            Slot::B => Slot::A,
+        }
+    }
+
+    /// The slot's suffix in entry and directory names (`<prefix>-a`).
+    pub(crate) fn entry_suffix(self) -> &'static str {
+        match self {
+            Slot::A => "a",
+            Slot::B => "b",
+        }
+    }
+}
+
+impl std::fmt::Display for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Slot::A => "A",
+            Slot::B => "B",
+        })
+    }
+}
+
+impl std::str::FromStr for Slot {
+    type Err = String;
+
+    /// `A` or `B`, in either case; nothing else (REQ-SEC-002).
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Slot::ALL
+            .into_iter()
+            .find(|slot| slot.to_string().eq_ignore_ascii_case(text))
+            .ok_or_else(|| format!("'{text}' is not a slot (A or B)"))
+    }
+}
+
+/// How the last judged trial boot ended (kept in the state file, and shown
+/// as is by `status`).
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrialRecord {
+    pub slot: Slot,
+    /// The trial was healthy and committed; otherwise it was abandoned.
+    pub committed: bool,
+    /// How startup ended, and the failed units if any.
+    pub detail: String,
+    pub unix_time: u64,
+}
 
 /// The schema recab writes. Both slots' recab read the same file (it lives
 /// on the shared /var), so newer schemas only add fields: an older recab
 /// reads them, keeps the fields it does not know, and never lowers the number.
 pub(crate) const STATE_SCHEMA_VERSION: u32 = 1;
+/// The oldest schema recab has written.
+const FIRST_STATE_SCHEMA: u32 = 1;
 
 /// What recab keeps in its state file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -36,6 +99,17 @@ pub(crate) struct PersistentState {
     /// Fields a newer recab wrote, kept as they are.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
+}
+
+impl PersistentState {
+    /// A state file of a schema recab can read: the first schema or any
+    /// newer one, since newer schemas only add fields.
+    pub fn check_schema(&self) -> Result<(), String> {
+        if self.schema < FIRST_STATE_SCHEMA {
+            return Err(format!("schema {} is not a recab state schema", self.schema));
+        }
+        Ok(())
+    }
 }
 
 impl Default for PersistentState {
@@ -258,17 +332,17 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
     Ok(Some(transition))
 }
 
-/// How system startup ended, as `recab trial` sees it.
+/// How system startup ended, as the init adapter reports it to the trial
+/// judgment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Startup {
     /// Started with nothing failed.
     Running,
-    /// Started with failed units or services, or ended in the init's
-    /// emergency state (systemd maintenance, OpenRC single-user).
+    /// Started with something failed, or ended in the init's emergency state.
     Failed(String),
     /// Still starting when the deadline passed.
     TimedOut,
-    /// Anything else (shutting down, the init unreachable): no verdict.
+    /// No verdict (shutting down, the init unreachable).
     Inconclusive(String),
 }
 

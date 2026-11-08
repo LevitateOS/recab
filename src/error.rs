@@ -4,15 +4,15 @@
 
 use serde::Serialize;
 
-pub const EXIT_CODE_GENERIC: u8 = 1;
-pub const EXIT_CODE_PERMISSION: u8 = 13;
-pub const EXIT_CODE_BACKEND_UNAVAILABLE: u8 = 20;
-pub const EXIT_CODE_STATE_OR_DETECTION: u8 = 21;
-pub const EXIT_CODE_PARTIAL_UPDATE: u8 = 22;
-pub const EXIT_CODE_TRIAL_FAILED: u8 = 23;
+const EXIT_CODE_GENERIC: u8 = 1;
+const EXIT_CODE_PERMISSION: u8 = 13;
+const EXIT_CODE_BACKEND_UNAVAILABLE: u8 = 20;
+const EXIT_CODE_STATE_OR_DETECTION: u8 = 21;
+const EXIT_CODE_PARTIAL_UPDATE: u8 = 22;
+const EXIT_CODE_TRIAL_FAILED: u8 = 23;
 
 /// The schema of [`ErrorPayload`].
-pub const ERROR_SCHEMA_VERSION: u32 = 1;
+pub(crate) const ERROR_SCHEMA_VERSION: u32 = 1;
 
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -83,7 +83,7 @@ pub(crate) fn tagged_err(class: ErrorClass, message: impl Into<String>) -> anyho
 
 /// The outermost classified error's class: a partial update caused by a
 /// backend failure is a partial update.
-pub fn error_class(err: &anyhow::Error) -> Option<ErrorClass> {
+pub(crate) fn error_class(err: &anyhow::Error) -> Option<ErrorClass> {
     err.chain()
         .find_map(|cause| cause.downcast_ref::<ClassifiedError>())
         .map(|classified| classified.class)

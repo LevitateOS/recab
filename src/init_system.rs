@@ -66,7 +66,7 @@ pub fn crash_option(init: InitSystem) -> Option<&'static str> {
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
-    pub init: InitSystemName,
+    pub init: InitSystem,
     /// Startup ran to its end (systemd `running` or `degraded`; OpenRC's
     /// default runlevel entered with nothing starting).
     pub finished: bool,
@@ -83,24 +83,6 @@ pub struct Health {
     pub(crate) startup: Startup,
 }
 
-/// The init system's name, as the profile spells it.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InitSystemName {
-    Systemd,
-    Openrc,
-}
-
-impl From<InitSystem> for InitSystemName {
-    fn from(init: InitSystem) -> Self {
-        match init {
-            InitSystem::Systemd => InitSystemName::Systemd,
-            InitSystem::Openrc => InitSystemName::Openrc,
-        }
-    }
-}
-
 /// The word `state` takes when the deadline passed.
 const TIMED_OUT: &str = "timed out";
 /// How often an init's progress is looked at while waiting.
@@ -114,7 +96,7 @@ pub(crate) fn wait_finished(config: &Config, init: InitSystem, timeout: Duration
     };
     failed.sort();
     failed.dedup();
-    Ok(Health { init: init.into(), finished, state, failed, startup })
+    Ok(Health { init, finished, state, failed, startup })
 }
 
 type Waited = (bool, String, Vec<String>, Startup);

@@ -276,7 +276,7 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
     assert_eq!(tree.status()["next_boot"], "B");
     // The fixture's entries boot without an initramfs: the trial option is
     // systemd's crash option alone.
-    let crash = recab::crash_option(recab::InitSystem::Systemd).unwrap();
+    let crash = "systemd.crash_action=reboot";
     let entry = tree.read("boot/loader/entries/lev-b.conf");
     assert!(entry.contains(crash) && !entry.contains("rd.emergency"), "{entry}");
 
@@ -308,7 +308,7 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
         .starts_with("default lev-b.conf\n"));
     let entry = tree.read("boot/loader/entries/lev-b.conf");
     assert!(
-        !entry.contains(recab::crash_option(recab::InitSystem::Systemd).unwrap()),
+        !entry.contains("systemd.crash_action=reboot"),
         "a default loses the trial options: {entry}"
     );
 
@@ -623,15 +623,15 @@ fn install_unit_writes_and_enables_the_trial_service() {
         tree.path("target").to_str().unwrap(),
     ]);
     let unit = tree.read("target/usr/lib/systemd/system/recab-trial.service");
-    let exec = format!("ExecStart={} trial --timeout {}", recab::RECAB_BIN, recab::TRIAL_TIMEOUT_SECS);
+    let exec = format!("ExecStart={} trial --timeout {}", "/usr/bin/recab", recab::TRIAL_TIMEOUT_SECS);
     assert!(unit.contains(&exec), "{unit}");
     let link = tree.path("target").join(recab::trial_service_link(recab::InitSystem::Systemd));
     assert_eq!(
         fs::read_link(link).unwrap(),
         Path::new("/usr/lib/systemd/system/recab-trial.service")
     );
-    let carried = recab::carried::read(&tree.path("target")).unwrap();
-    assert!(carried.iter().any(|c| c.path() == "etc/sudoers.d"), "{carried:?}");
+    let carried = fs::read_to_string(tree.path("target/usr/lib/recab/carried")).unwrap();
+    assert!(carried.lines().any(|l| l == "dir etc/sudoers.d"), "{carried}");
 }
 
 #[test]
@@ -856,11 +856,11 @@ fn install_unit_writes_and_enables_the_openrc_service() {
     );
     let service = tree.read("target/etc/init.d/recab-trial");
     assert!(
-        service.starts_with("#!/sbin/openrc-run") && service.contains(&format!("{} trial", recab::RECAB_BIN)),
+        service.starts_with("#!/sbin/openrc-run") && service.contains(&format!("{} trial", "/usr/bin/recab")),
         "{service}"
     );
     let link = tree.path("target").join(recab::trial_service_link(recab::InitSystem::Openrc));
     assert_eq!(fs::read_link(link).unwrap(), Path::new("/etc/init.d/recab-trial"));
-    let carried = recab::carried::read(&target).unwrap();
-    assert!(carried.iter().any(|c| c.path() == "etc/wpa_supplicant"), "{carried:?}");
+    let carried = fs::read_to_string(target.join("usr/lib/recab/carried")).unwrap();
+    assert!(carried.lines().any(|l| l == "dir etc/wpa_supplicant"), "{carried}");
 }

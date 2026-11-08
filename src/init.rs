@@ -16,12 +16,36 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::state::{Operation, PersistentState};
-use crate::store::{copy_durable, read_optional, write_durable, Store};
+use crate::store::Store;
 use crate::systemd_boot::{
     install_loader, layout_entry_name, layout_name, loader_with_default, new_entry, os_prefix, SystemdBoot,
     ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
 };
-use crate::{tagged_err, ErrorClass, InitLayout, InitRequest, Slot};
+use crate::state::Slot;
+use crate::{tagged_err, ErrorClass};
+use std::path::PathBuf;
+
+/// The root partitions `init` writes entries for.
+#[derive(Debug, Clone)]
+pub enum InitLayout {
+    /// Slot A's partition (holding the installed system) and slot B's.
+    Ab { slot_a: PathBuf, slot_b: PathBuf },
+    /// The one root partition of a mutable install.
+    Mutable { root_device: PathBuf },
+}
+
+/// The installed system `init` sets up.
+#[derive(Debug, Clone)]
+pub struct InitRequest {
+    /// The installed system's root, with its ESP and its state partition
+    /// mounted where the layout puts them (`boot/`, `var/`).
+    pub root: PathBuf,
+    pub layout: InitLayout,
+    pub kernel: PathBuf,
+    pub initrd: Option<PathBuf>,
+    /// Extra kernel options for the entries (consoles, for example).
+    pub options: String,
+}
 
 /// Set up the system under `request.root`; `config` is that system's
 /// ([`Config::install_target`]).
@@ -53,9 +77,9 @@ pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
     // entry cannot boot until `recab stage` fills it.
     let dir = esp.join(layout_name(&prefix, installed));
     fs::create_dir_all(&dir).with_context(|| format!("creating '{}'", dir.display()))?;
-    copy_durable(&request.kernel, &dir.join(KERNEL_FILE))?;
+    target_root::copy_durable(&request.kernel, &dir.join(KERNEL_FILE))?;
     if let Some(initrd) = &request.initrd {
-        copy_durable(initrd, &dir.join(INITRD_FILE))?;
+        target_root::copy_durable(initrd, &dir.join(INITRD_FILE))?;
     }
 
     let entries_dir = esp.join(ENTRIES_DIR);
@@ -63,13 +87,13 @@ pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
     for (slot, title, partuuid) in &entries {
         let entry = new_entry(title, &prefix, *slot, request.initrd.is_some(), partuuid, &request.options);
         let path = entries_dir.join(layout_entry_name(&prefix, *slot));
-        write_durable(&path, entry.as_bytes()).with_context(|| format!("writing '{}'", path.display()))?;
+        target_root::write_durable(&path, entry.as_bytes(), None).with_context(|| format!("writing '{}'", path.display()))?;
     }
 
     let default_entry = layout_entry_name(&prefix, installed);
     let loader_conf = esp.join(LOADER_CONF);
-    let before = read_optional(&loader_conf)?;
-    write_durable(&loader_conf, loader_with_default(before.as_deref(), &default_entry).as_bytes())
+    let before = target_root::read_optional(&loader_conf)?;
+    target_root::write_durable(&loader_conf, loader_with_default(before.as_deref(), &default_entry).as_bytes(), None)
         .with_context(|| format!("writing '{}'", loader_conf.display()))?;
 
     if let InitLayout::Ab { .. } = request.layout {

@@ -1,10 +1,10 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use recab::{
-    stable_exit_code, InitLayout, InitRequest, Slot, StageRequest, StageSource, Status, TrialOutcome,
+    stable_exit_code, Health, InitLayout, InitRequest, Slot, SlotView, StageRequest, StageSource, Status, TrialOutcome,
 };
 use recpart::types::InstallMode;
 
@@ -42,13 +42,13 @@ enum Command {
         #[arg(long, value_enum, default_value_t = InstallMode::Ab)]
         mode: InstallMode,
         /// A/B: slot A's partition, holding the installed system.
-        #[arg(long, required_if_eq("mode", "ab"))]
+        #[arg(long)]
         slot_a: Option<PathBuf>,
         /// A/B: slot B's partition.
-        #[arg(long, required_if_eq("mode", "ab"))]
+        #[arg(long)]
         slot_b: Option<PathBuf>,
         /// Mutable: the root partition.
-        #[arg(long, required_if_eq("mode", "mutable"), conflicts_with_all = ["slot_a", "slot_b"])]
+        #[arg(long)]
         root_device: Option<PathBuf>,
         /// Kernel image of the installed system.
         #[arg(long)]
@@ -65,13 +65,13 @@ enum Command {
     Stage {
         /// A release medium (its device, or where it is mounted): stage its
         /// rootfs, kernel and, when it carries one, the installed initramfs.
-        #[arg(long, value_name = "MEDIA", conflicts_with_all = ["rootfs", "kernel", "initrd"])]
+        #[arg(long, value_name = "MEDIA")]
         from_media: Option<PathBuf>,
         /// EROFS rootfs image: a file, or a partition holding it.
-        #[arg(long, required_unless_present = "from_media")]
+        #[arg(long)]
         rootfs: Option<PathBuf>,
         /// Kernel image for the slot.
-        #[arg(long, required_unless_present = "from_media")]
+        #[arg(long)]
         kernel: Option<PathBuf>,
         /// Initramfs for the slot, if it boots through one.
         #[arg(long)]
@@ -84,7 +84,7 @@ enum Command {
 
     /// Stage a one-shot trial boot for a slot.
     SetNext {
-        #[arg(value_enum, ignore_case = true)]
+        #[arg(value_name = "A|B", value_parser = str::parse::<Slot>)]
         slot: Slot,
     },
 
@@ -150,10 +150,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             print_status(&st, json)?;
         }
         Command::Stage { from_media, rootfs, kernel, initrd, change_flavour } => {
-            let source = match (from_media, rootfs, kernel) {
-                (Some(media), _, _) => StageSource::Media(media),
-                (None, Some(rootfs), Some(kernel)) => StageSource::Files(StageRequest { rootfs, kernel, initrd }),
-                _ => unreachable!("clap requires --rootfs and --kernel without --from-media"),
+            let source = match (from_media, rootfs, kernel, initrd) {
+                (Some(media), None, None, None) => StageSource::Media(media),
+                (None, Some(rootfs), Some(kernel), initrd) => StageSource::Files(StageRequest { rootfs, kernel, initrd }),
+                _ => usage("stage takes --from-media, or --rootfs and --kernel (and --initrd)"),
             };
             recab::stage(&source, change_flavour)?;
         }
@@ -161,7 +161,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let layout = match (mode, slot_a, slot_b, root_device) {
                 (InstallMode::Ab, Some(slot_a), Some(slot_b), None) => InitLayout::Ab { slot_a, slot_b },
                 (InstallMode::Mutable, None, None, Some(root_device)) => InitLayout::Mutable { root_device },
-                _ => anyhow::bail!("--mode ab takes --slot-a and --slot-b; --mode mutable takes --root-device"),
+                _ => usage("--mode ab takes --slot-a and --slot-b; --mode mutable takes --root-device"),
             };
             recab::init(&InitRequest { root, layout, kernel, initrd, options })?
         }
@@ -179,11 +179,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string(&health)?);
             } else {
-                let finished = if health.finished { "finished" } else { "did not finish" };
-                println!("startup {finished} ({})", health.state);
-                for name in &health.failed {
-                    println!("failed: {name}");
-                }
+                print_health(&health);
             }
         }
         Command::InstallUnit { root, package } => recab::install_unit(&root, package)?,
@@ -191,26 +187,70 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A command-line usage error, reported the way clap reports its own (exit 2).
+fn usage(message: &str) -> ! {
+    Cli::command().error(clap::error::ErrorKind::ArgumentConflict, message).exit()
+}
+
+/// One sentinel for every unset slot.
+fn slot_text(slot: Option<Slot>) -> String {
+    slot.map_or("none".to_string(), |s| s.to_string())
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+/// `Status` as text: every field (no `..`, so a new field cannot be left out).
 fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(st)?);
         return Ok(());
     }
-    // One sentinel for every unset slot.
-    let slot = |slot: Option<Slot>| slot.map_or("none".to_string(), |s| s.to_string());
-    let yes_no = |value: bool| if value { "yes" } else { "no" };
-    println!("active: {}", st.active_slot);
-    println!("inactive: {}", st.inactive_slot);
-    println!("known_good: {}", slot(st.known_good_slot));
-    println!("default: {}", slot(st.default_slot));
-    println!("committed: {}", yes_no(st.committed));
-    println!("rollback: {}", slot(st.rollback_slot));
-    println!("trial_pending: {}", yes_no(st.trial_pending));
-    println!("next_boot: {}", slot(st.next_boot));
-    if let Some(trial) = &st.last_trial {
+    let Status {
+        active_slot,
+        inactive_slot,
+        trial_pending,
+        next_boot,
+        default_slot,
+        known_good_slot,
+        committed,
+        rollback_slot,
+        last_trial,
+        entry_prefix,
+        slots,
+    } = st;
+    println!("active: {active_slot}");
+    println!("inactive: {inactive_slot}");
+    println!("known_good: {}", slot_text(*known_good_slot));
+    println!("default: {}", slot_text(*default_slot));
+    println!("committed: {}", yes_no(*committed));
+    println!("rollback: {}", slot_text(*rollback_slot));
+    println!("trial_pending: {}", yes_no(*trial_pending));
+    println!("next_boot: {}", slot_text(*next_boot));
+    if let Some(trial) = last_trial {
         let outcome = if trial.committed { "committed" } else { "abandoned" };
         println!("last_trial: slot {} {outcome} ({})", trial.slot, trial.detail);
     }
-    println!("entry_prefix: {}", st.entry_prefix);
+    println!("entry_prefix: {entry_prefix}");
+    for SlotView { slot, entry, boot_dir, root, device, bootable, trial } in slots {
+        println!(
+            "slot {slot}: entry {entry}, kernel /{boot_dir}, root {}, device {}, bootable {}, trial options {}",
+            root.as_deref().unwrap_or("none"),
+            device.as_deref().unwrap_or("none"),
+            yes_no(*bootable),
+            yes_no(*trial),
+        );
+    }
     Ok(())
+}
+
+/// `Health` as text: every public field.
+fn print_health(health: &Health) {
+    let Health { init, finished, state, failed, .. } = health;
+    let finished = if *finished { "finished" } else { "did not finish" };
+    println!("{init} startup {finished} ({state})");
+    for name in failed {
+        println!("failed: {name}");
+    }
 }

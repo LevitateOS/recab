@@ -4,20 +4,20 @@ use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::error::{tagged_err, ErrorClass};
-use crate::state::{Operation, PersistentState};
+use crate::state::{Operation, PersistentState, Slot};
 
-/// The audit log record's schema (one JSON object per line), versioned apart
-/// from the state file's.
+/// The audit log record's schema (one JSON object per line). Each record
+/// embeds the state before and after the transition, which carries its own
+/// `schema`, so this number covers only the record's own fields.
 const AUDIT_SCHEMA_VERSION: u32 = 1;
-use crate::Slot;
 
 pub(crate) struct Store {
-    pub state_path: PathBuf,
-    pub audit_path: PathBuf,
+    state_path: PathBuf,
+    audit_path: PathBuf,
     lock_path: PathBuf,
 }
 
@@ -79,21 +79,18 @@ impl Store {
                 format!("failed loading recab state '{}': {message}", path.display()),
             )
         };
-        let Some(content) = read_optional(path).map_err(|err| fail(format!("{err:#}")))? else {
+        let Some(content) = target_root::read_optional(path).map_err(|err| fail(err.to_string()))? else {
             return Ok(PersistentState::default());
         };
         let state: PersistentState =
             serde_json::from_str(&content).map_err(|err| fail(err.to_string()))?;
-        // A newer schema only adds fields (see STATE_SCHEMA_VERSION).
-        if state.schema < 1 {
-            return Err(fail(format!("schema {} is not a recab state schema", state.schema)));
-        }
+        state.check_schema().map_err(fail)?;
         Ok(state)
     }
 
     pub fn save(&self, state: &PersistentState, during: &str) -> Result<()> {
         let payload = serde_json::to_vec_pretty(state).context("serializing recab state")?;
-        write_durable(&self.state_path, &payload).map_err(|err| {
+        target_root::write_durable(&self.state_path, &payload, None).map_err(|err| {
             tagged_err(
                 ErrorClass::StateOrDetection,
                 format!(
@@ -116,7 +113,7 @@ impl Store {
         let result = (|| -> Result<()> {
             let event = AuditEvent {
                 schema: AUDIT_SCHEMA_VERSION,
-                timestamp_unix: crate::now()?,
+                timestamp_unix: now()?,
                 operation: operation.name(),
                 active_slot,
                 before,
@@ -145,19 +142,10 @@ impl Store {
     }
 }
 
-pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
-    Ok(target_root::read_optional(path)?)
-}
-
-/// Durably replace `path` (see [`target_root::write_durable`]).
-pub(crate) fn write_durable(path: &Path, content: &[u8]) -> Result<()> {
-    Ok(target_root::write_durable(path, content, None)?)
-}
-
-pub(crate) fn copy_durable(source: &Path, dest: &Path) -> Result<()> {
-    Ok(target_root::copy_durable(source, dest)?)
-}
-
-pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    Ok(target_root::sync_dir(dir)?)
+/// Seconds since the epoch, for the state's and the audit log's timestamps.
+pub(crate) fn now() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| anyhow!("system clock before UNIX_EPOCH"))?
+        .as_secs())
 }

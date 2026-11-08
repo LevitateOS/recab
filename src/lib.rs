@@ -12,7 +12,7 @@
 //! installed ESP (writes and reads entries, loader.conf and the boot
 //! selection); `store` keeps recab's state and audit log.
 
-pub mod carried;
+mod carried;
 mod config;
 #[cfg(feature = "contracts")]
 pub mod contract;
@@ -22,175 +22,33 @@ mod init_system;
 mod package;
 mod stage;
 mod state;
+mod status;
 mod store;
 mod systemd_boot;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::time::Duration;
 
 pub use config::state_file;
-pub use systemd_boot::{
-    entry_name, layout_entry_name, layout_name, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
-};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-pub use error::{
-    error_class, stable_exit_code, ErrorClass, ErrorPayload, ERROR_SCHEMA_VERSION, EXIT_CODE_BACKEND_UNAVAILABLE, EXIT_CODE_GENERIC, EXIT_CODE_PARTIAL_UPDATE,
-    EXIT_CODE_PERMISSION, EXIT_CODE_STATE_OR_DETECTION, EXIT_CODE_TRIAL_FAILED,
-};
+pub use init::{InitLayout, InitRequest};
+pub use stage::{StageRequest, StageSource};
 pub use distro_profile::InitSystem;
-pub use init_system::{crash_option, Health, InitSystemName};
-pub use package::{trial_service_link, RECAB_BIN, TRIAL_TIMEOUT_SECS};
+pub use error::{stable_exit_code, ErrorClass, ErrorPayload};
+pub use init_system::Health;
+pub use package::{trial_service_link, TRIAL_TIMEOUT_SECS};
+pub use state::{Slot, TrialRecord};
+pub use status::{status, SlotView, Status};
+pub use systemd_boot::{entry_name, layout_name, ENTRIES_DIR};
 
-use error::tagged_err;
 use config::Config;
+use error::tagged_err;
 use state::{
-    committed, judge_trial, known_good, plan, plan_stage, rollback_target, BootChange, Operation,
-    PersistentState, Request, Startup, Transition, TrialVerdict, TrialView,
+    judge_trial, known_good, plan, plan_stage, BootChange, Operation, PersistentState, Request, Startup,
+    Transition, TrialVerdict, TrialView,
 };
-use store::{Lock, Store};
+use store::{now, Lock, Store};
 use systemd_boot::{ApplyError, Boot, SystemdBoot};
-
-/// System slot identifier (A/B).
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, clap::ValueEnum,
-)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum Slot {
-    #[value(name = "A")]
-    A,
-    #[value(name = "B")]
-    B,
-}
-
-impl Slot {
-    pub fn other(self) -> Slot {
-        match self {
-            Slot::A => Slot::B,
-            Slot::B => Slot::A,
-        }
-    }
-
-    pub fn as_letter(self) -> &'static str {
-        match self {
-            Slot::A => "A",
-            Slot::B => "B",
-        }
-    }
-
-    /// The slot's suffix in entry and directory names (`<prefix>-a`).
-    pub(crate) fn entry_suffix(self) -> &'static str {
-        match self {
-            Slot::A => "a",
-            Slot::B => "b",
-        }
-    }
-}
-
-impl std::fmt::Display for Slot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_letter())
-    }
-}
-
-/// How the last judged trial boot ended.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TrialRecord {
-    pub slot: Slot,
-    /// The trial was healthy and committed; otherwise it was abandoned.
-    pub committed: bool,
-    /// How startup ended, and the failed units if any.
-    pub detail: String,
-    pub unix_time: u64,
-}
-
-/// One slot's layout on the ESP, as recab wrote it.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SlotView {
-    pub slot: Slot,
-    /// The entry file, relative to the ESP (`loader/entries/<prefix>-a.conf`).
-    pub entry: String,
-    /// The directory of its kernel and initramfs, relative to the ESP.
-    pub boot_dir: String,
-    /// The entry's `root=` (`PARTUUID=...`), if it has one.
-    pub root: Option<String>,
-    /// The block device `root` names on this machine, if present.
-    pub device: Option<String>,
-    /// Every file the entry loads is on the ESP.
-    pub bootable: bool,
-    /// The entry carries a trial's options (it was staged or scheduled and
-    /// not yet committed).
-    pub trial: bool,
-}
-
-/// Current A/B view exported by `recab status --json`.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Status {
-    pub active_slot: Slot,
-    pub inactive_slot: Slot,
-    /// A one-shot trial boot is set in the firmware and not yet taken.
-    pub trial_pending: bool,
-    /// The slot the next boot starts: the trial slot, else the default.
-    pub next_boot: Option<Slot>,
-    pub default_slot: Option<Slot>,
-    pub known_good_slot: Option<Slot>,
-    /// The running slot is the known-good slot. After a trial boot this is
-    /// false until it is committed; an uncommitted slot is left on next boot.
-    pub committed: bool,
-    /// The slot `recab rollback` would select, if any.
-    pub rollback_slot: Option<Slot>,
-    /// How the last judged trial boot ended.
-    pub last_trial: Option<TrialRecord>,
-    pub entry_prefix: String,
-    /// Each slot's entry, kernel directory and partition.
-    pub slots: Vec<SlotView>,
-}
-
-/// The prebuilt system `stage` writes: files, or a release medium holding them.
-#[derive(Debug, Clone)]
-pub enum StageSource {
-    Files(StageRequest),
-    /// A release medium (its device, or where it is mounted): the rootfs,
-    /// kernel and, when it carries one, the installed initramfs at the live
-    /// protocol's paths.
-    Media(PathBuf),
-}
-
-/// The prebuilt system `stage` writes, as files.
-#[derive(Debug, Clone)]
-pub struct StageRequest {
-    /// EROFS rootfs image (a file or a partition), extracted with recstrap.
-    pub rootfs: PathBuf,
-    pub kernel: PathBuf,
-    pub initrd: Option<PathBuf>,
-}
-
-/// The root partitions `init` writes entries for.
-#[derive(Debug, Clone)]
-pub enum InitLayout {
-    /// Slot A's partition (holding the installed system) and slot B's.
-    Ab { slot_a: PathBuf, slot_b: PathBuf },
-    /// The one root partition of a mutable install.
-    Mutable { root_device: PathBuf },
-}
-
-/// The installed system `init` sets up.
-#[derive(Debug, Clone)]
-pub struct InitRequest {
-    /// The installed system's root, with its ESP and its state partition
-    /// mounted where the layout puts them (`boot/`, `var/`).
-    pub root: PathBuf,
-    pub layout: InitLayout,
-    pub kernel: PathBuf,
-    pub initrd: Option<PathBuf>,
-    /// Extra kernel options for the entries (consoles, for example).
-    pub options: String,
-}
 
 /// What `trial` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,29 +103,6 @@ impl System {
         let state = store.load()?;
         Ok(Self { config, backend, store, boot, state, _lock: lock })
     }
-}
-
-/// Query current A/B state from the boot configuration and recab's state, of
-/// this system or of the system installed under `root` (its root partition
-/// mounted there, the ESP and state partitions below it). Only reads, so it
-/// works anywhere the files are readable.
-pub fn status(root: Option<&Path>) -> Result<Status> {
-    let sys = System::read(root)?;
-    let slots = sys.backend.slot_views(&sys.boot)?;
-    let (sel, state) = (&sys.boot.selection, &sys.state);
-    Ok(Status {
-        active_slot: sel.active,
-        inactive_slot: sel.active.other(),
-        trial_pending: sel.oneshot.is_some(),
-        next_boot: sel.next_boot(),
-        default_slot: sel.default,
-        known_good_slot: known_good(state, sel),
-        committed: committed(state, sel),
-        rollback_slot: rollback_target(state, sel),
-        last_trial: state.last_trial.clone(),
-        entry_prefix: sys.boot.prefix,
-        slots,
-    })
 }
 
 /// Set up the boot layout of a freshly installed system: the target's
@@ -455,13 +290,6 @@ fn require_root(operation: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-pub(crate) fn now() -> Result<u64> {
-    Ok(SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| anyhow::anyhow!("system clock before UNIX_EPOCH"))?
-        .as_secs())
 }
 
 /// The transition's next state, stamped with the operation and time.

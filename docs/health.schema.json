@@ -16,7 +16,7 @@
       "type": "boolean"
     },
     "init": {
-      "$ref": "#/$defs/InitSystemName"
+      "$ref": "#/$defs/InitSystem"
     },
     "state": {
       "description": "The init's own word: systemd's `is-system-running` answer, OpenRC's\nsoftlevel, or `timed out`.",
@@ -30,8 +30,8 @@
     "failed"
   ],
   "$defs": {
-    "InitSystemName": {
-      "description": "The init system's name, as the profile spells it.",
+    "InitSystem": {
+      "description": "PID 1 and its service manager.",
       "type": "string",
       "enum": [
         "systemd",
