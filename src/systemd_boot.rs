@@ -649,7 +649,7 @@ pub(crate) fn os_prefix(id: &str) -> String {
 
 /// An entry's directory name: `<prefix>-a` for an A/B slot, `<prefix>` for
 /// the one root of a mutable install.
-pub(crate) fn layout_name(prefix: &str, slot: Option<Slot>) -> String {
+pub fn layout_name(prefix: &str, slot: Option<Slot>) -> String {
     match slot {
         Some(slot) => format!("{prefix}-{}", slot.entry_suffix()),
         None => prefix.to_string(),

@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 pub use config::state_file;
 pub use systemd_boot::{
-    entry_name, layout_entry_name, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
+    entry_name, layout_entry_name, layout_name, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
