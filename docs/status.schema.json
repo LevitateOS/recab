@@ -70,6 +70,13 @@
         }
       ]
     },
+    "slots": {
+      "description": "Each slot's entry, kernel directory and partition.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SlotView"
+      }
+    },
     "trial_pending": {
       "description": "A one-shot trial boot is set in the firmware and not yet taken.",
       "type": "boolean"
@@ -80,7 +87,8 @@
     "inactive_slot",
     "trial_pending",
     "committed",
-    "entry_prefix"
+    "entry_prefix",
+    "slots"
   ],
   "$defs": {
     "Slot": {
@@ -89,6 +97,52 @@
       "enum": [
         "A",
         "B"
+      ]
+    },
+    "SlotView": {
+      "description": "One slot's layout on the ESP, as recab wrote it.",
+      "type": "object",
+      "properties": {
+        "boot_dir": {
+          "description": "The directory of its kernel and initramfs, relative to the ESP.",
+          "type": "string"
+        },
+        "bootable": {
+          "description": "Every file the entry loads is on the ESP.",
+          "type": "boolean"
+        },
+        "device": {
+          "description": "The block device `root` names on this machine, if present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "entry": {
+          "description": "The entry file, relative to the ESP (`loader/entries/<prefix>-a.conf`).",
+          "type": "string"
+        },
+        "root": {
+          "description": "The entry's `root=` (`PARTUUID=...`), if it has one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "slot": {
+          "$ref": "#/$defs/Slot"
+        },
+        "trial": {
+          "description": "The entry carries a trial's options (it was staged or scheduled and\nnot yet committed).",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "slot",
+        "entry",
+        "boot_dir",
+        "bootable",
+        "trial"
       ]
     },
     "TrialRecord": {

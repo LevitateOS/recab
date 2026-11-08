@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ErrorPayload",
+  "description": "A failed command's error, as `--json` prints it on stderr.",
+  "type": "object",
+  "properties": {
+    "class": {
+      "description": "`None` for an error without a class (exit status 1).",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ErrorClass"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "code": {
+      "description": "The exit status.",
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "message": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "schema_version",
+    "code",
+    "message"
+  ],
+  "$defs": {
+    "ErrorClass": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "permission",
+            "backend_unavailable",
+            "state_or_detection",
+            "partial_update"
+          ]
+        },
+        {
+          "description": "A trial boot was not healthy and was not committed.",
+          "type": "string",
+          "const": "trial_failed"
+        }
+      ]
+    }
+  }
+}

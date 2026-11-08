@@ -14,6 +14,8 @@
 
 pub mod carried;
 mod config;
+#[cfg(feature = "contracts")]
+pub mod contract;
 mod error;
 mod init;
 mod init_system;
@@ -34,14 +36,14 @@ pub use systemd_boot::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use error::{
-    stable_exit_code, EXIT_CODE_BACKEND_UNAVAILABLE, EXIT_CODE_GENERIC, EXIT_CODE_PARTIAL_UPDATE,
+    error_class, stable_exit_code, ErrorClass, ErrorPayload, ERROR_SCHEMA_VERSION, EXIT_CODE_BACKEND_UNAVAILABLE, EXIT_CODE_GENERIC, EXIT_CODE_PARTIAL_UPDATE,
     EXIT_CODE_PERMISSION, EXIT_CODE_STATE_OR_DETECTION, EXIT_CODE_TRIAL_FAILED,
 };
 pub use distro_profile::InitSystem;
 pub use init_system::{crash_option, Health, InitSystemName};
 pub use package::{trial_service_link, RECAB_BIN, TRIAL_TIMEOUT_SECS};
 
-use error::{tagged_err, ErrorClass};
+use error::tagged_err;
 use config::Config;
 use state::{
     committed, judge_trial, known_good, plan, plan_stage, rollback_target, BootChange, Operation,

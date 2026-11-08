@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Health",
+  "description": "How startup of the running system ended (`recab health --json`).",
+  "type": "object",
+  "properties": {
+    "failed": {
+      "description": "The units or services that failed (and, on OpenRC, crashed daemons),\nsorted, by bare name; listed even when startup did not finish.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "finished": {
+      "description": "Startup ran to its end (systemd `running` or `degraded`; OpenRC's\ndefault runlevel entered with nothing starting).",
+      "type": "boolean"
+    },
+    "init": {
+      "$ref": "#/$defs/InitSystemName"
+    },
+    "state": {
+      "description": "The init's own word: systemd's `is-system-running` answer, OpenRC's\nsoftlevel, or `timed out`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "init",
+    "finished",
+    "state",
+    "failed"
+  ],
+  "$defs": {
+    "InitSystemName": {
+      "description": "The init system's name, as the profile spells it.",
+      "type": "string",
+      "enum": [
+        "systemd",
+        "openrc"
+      ]
+    }
+  }
+}

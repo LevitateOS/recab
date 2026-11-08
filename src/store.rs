@@ -8,7 +8,11 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::{tagged_err, ErrorClass};
-use crate::state::{Operation, PersistentState, STATE_SCHEMA_VERSION};
+use crate::state::{Operation, PersistentState};
+
+/// The audit log record's schema (one JSON object per line), versioned apart
+/// from the state file's.
+const AUDIT_SCHEMA_VERSION: u32 = 1;
 use crate::Slot;
 
 pub(crate) struct Store {
@@ -111,7 +115,7 @@ impl Store {
     ) {
         let result = (|| -> Result<()> {
             let event = AuditEvent {
-                schema: STATE_SCHEMA_VERSION,
+                schema: AUDIT_SCHEMA_VERSION,
                 timestamp_unix: crate::now()?,
                 operation: operation.name(),
                 active_slot,

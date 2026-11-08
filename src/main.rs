@@ -124,17 +124,22 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let cli = Cli::parse();
+    // A command that prints JSON prints its error as JSON too.
+    let json = matches!(cli.cmd, Command::Status { json: true, .. } | Command::Health { json: true, .. });
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("recab: {err:#}");
+            match serde_json::to_string(&recab::ErrorPayload::of(&err)) {
+                Ok(payload) if json => eprintln!("{payload}"),
+                _ => eprintln!("recab: {err:#}"),
+            }
             ExitCode::from(stable_exit_code(&err))
         }
     }
 }
 
-fn run() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
         Command::Status { json, root } => {
             let st = recab::status(root.as_deref())?;
@@ -187,16 +192,17 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(st)?);
         return Ok(());
     }
-    let slot = |slot: Option<Slot>, none: &str| slot.map_or(none.to_string(), |s| s.to_string());
+    // One sentinel for every unset slot.
+    let slot = |slot: Option<Slot>| slot.map_or("none".to_string(), |s| s.to_string());
     let yes_no = |value: bool| if value { "yes" } else { "no" };
     println!("active: {}", st.active_slot);
     println!("inactive: {}", st.inactive_slot);
-    println!("known_good: {}", slot(st.known_good_slot, "unknown"));
-    println!("default: {}", slot(st.default_slot, "unknown"));
+    println!("known_good: {}", slot(st.known_good_slot));
+    println!("default: {}", slot(st.default_slot));
     println!("committed: {}", yes_no(st.committed));
-    println!("rollback: {}", slot(st.rollback_slot, "none"));
+    println!("rollback: {}", slot(st.rollback_slot));
     println!("trial_pending: {}", yes_no(st.trial_pending));
-    println!("next_boot: {}", slot(st.next_boot, "none"));
+    println!("next_boot: {}", slot(st.next_boot));
     if let Some(trial) = &st.last_trial {
         let outcome = if trial.committed { "committed" } else { "abandoned" };
         println!("last_trial: slot {} {outcome} ({})", trial.slot, trial.detail);
