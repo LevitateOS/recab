@@ -19,7 +19,7 @@ use crate::carried::{self, Carry};
 use crate::store::write_durable;
 use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::{tagged_err, ErrorClass, Slot, StageRequest};
-use distro_profile::Profile;
+use distro_profile::{Flavour, Profile};
 use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
 use recpart::types::Role;
 use target_root::ErofsImage;
@@ -64,6 +64,40 @@ pub(crate) fn open_media(config: &Config, media: &Path) -> Result<(Option<Mounte
 /// rootfs image, canonical.
 pub(crate) struct Inputs {
     rootfs: ErofsImage,
+}
+
+/// Refuse, before anything is changed, an image of another flavour than the
+/// running system's: the base system staged onto a desktop install would
+/// turn it back into the base system, and the reverse. `change_flavour`
+/// stages it anyway. Each flavour is its os-release's `REC_FLAVOUR`; the
+/// image's is read from the image, mounted read-only under the stage
+/// directory.
+pub(crate) fn check_flavour(config: &Config, inputs: &Inputs, change_flavour: bool) -> Result<()> {
+    if change_flavour {
+        return Ok(());
+    }
+    let running = fs::read_to_string(&config.os_release)
+        .with_context(|| format!("reading '{}'", config.os_release.display()))?;
+    let running = Flavour::from_os_release(&running)
+        .map_err(|err| refuse(format!("the running system's {}: {err}", config.os_release.display())))?;
+    let image = &inputs.rootfs.path;
+    let point = config.stage_dir.join("image");
+    fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
+    let mounted = Mounted::mount_image_ro(image, inputs.rootfs.rdev.is_some(), &point)?;
+    let text = target_root::os_release(&point);
+    mounted.unmount()?;
+    let text = text?.ok_or_else(|| refuse(format!("rootfs image '{}' has no os-release", image.display())))?;
+    let staged = Flavour::from_os_release(&text)
+        .map_err(|err| refuse(format!("rootfs image '{}': {err}", image.display())))?;
+    if staged != running {
+        return Err(refuse(format!(
+            "rootfs image '{}' is the {staged} system and this machine runs the {running} system: staging it \
+would turn this machine into the {staged} system. Stage a {running} image (the rootfs of a {running} ISO), \
+or pass --change-flavour to change this machine to the {staged} system",
+            image.display()
+        )));
+    }
+    Ok(())
 }
 
 /// The partition a stage will write, checked before anything is changed.
@@ -540,6 +574,21 @@ pub(crate) struct Mounted {
 impl Mounted {
     fn mount(device: &Path, point: &Path) -> Result<Self> {
         target_root::run(Command::new("mount").arg(device).arg(point))?;
+        Ok(Self {
+            point: point.to_path_buf(),
+            active: true,
+        })
+    }
+
+    /// An EROFS image, read-only: a partition holding it, or an image file
+    /// through a loop device.
+    fn mount_image_ro(image: &Path, block_device: bool, point: &Path) -> Result<Self> {
+        target_root::run(
+            Command::new("mount")
+                .args(["-t", "erofs", "-o", if block_device { "ro" } else { "ro,loop" }])
+                .arg(image)
+                .arg(point),
+        )?;
         Ok(Self {
             point: point.to_path_buf(),
             active: true,

@@ -76,6 +76,10 @@ enum Command {
         /// Initramfs for the slot, if it boots through one.
         #[arg(long)]
         initrd: Option<PathBuf>,
+        /// Stage an image of the other flavour (the base system over a
+        /// desktop install, or the reverse), which stage otherwise refuses.
+        #[arg(long)]
+        change_flavour: bool,
     },
 
     /// Stage a one-shot trial boot for a slot.
@@ -145,13 +149,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let st = recab::status(root.as_deref())?;
             print_status(&st, json)?;
         }
-        Command::Stage { from_media, rootfs, kernel, initrd } => {
+        Command::Stage { from_media, rootfs, kernel, initrd, change_flavour } => {
             let source = match (from_media, rootfs, kernel) {
                 (Some(media), _, _) => StageSource::Media(media),
                 (None, Some(rootfs), Some(kernel)) => StageSource::Files(StageRequest { rootfs, kernel, initrd }),
                 _ => unreachable!("clap requires --rootfs and --kernel without --from-media"),
             };
-            recab::stage(&source)?;
+            recab::stage(&source, change_flavour)?;
         }
         Command::Init { root, mode, slot_a, slot_b, root_device, kernel, initrd, options } => {
             let layout = match (mode, slot_a, slot_b, root_device) {

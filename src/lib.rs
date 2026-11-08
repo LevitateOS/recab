@@ -282,7 +282,9 @@ pub fn init(request: &InitRequest) -> Result<()> {
 /// Write a prebuilt system into the inactive slot: format it, extract the
 /// rootfs image, carry the machine's configuration over, and install the
 /// slot's kernel and boot entry. The slot is not booted until `set_next`.
-pub fn stage(source: &StageSource) -> Result<()> {
+/// An image of another flavour than the running system's is refused unless
+/// `change_flavour`.
+pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     let sys = System::locked("stage")?;
     // A medium stays mounted (read-only) until the slot is written.
     let (_media, request) = match source {
@@ -306,6 +308,7 @@ pub fn stage(source: &StageSource) -> Result<()> {
     // default (if any); this changes nothing systemd-boot boots now.
     sys.backend.reset_stale_selection(&sys.boot, active, slot)?;
     let target = stage::check_target(&sys.backend, &sys.boot, slot, &inputs)?;
+    stage::check_flavour(&sys.config, &inputs, change_flavour)?;
     // Recorded before the slot is touched: from here its old system is gone,
     // so nothing may roll back to it, even if the write fails.
     let next = stamped(&transition)?;
