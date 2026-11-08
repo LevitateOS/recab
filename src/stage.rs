@@ -18,6 +18,8 @@ use crate::store::write_durable;
 use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::{tagged_err, ErrorClass, Slot, StageRequest};
 use distro_profile::Profile;
+use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
+use recpart::types::Role;
 use target_root::ErofsImage;
 
 /// Machine configuration every new system keeps from the running one:
@@ -43,8 +45,41 @@ const ACCOUNT_FILES: &[&str] = &["etc/passwd", "etc/group", "etc/shadow", "etc/g
 const SSH_DIR: &str = "etc/ssh";
 const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 
-/// The filesystem stage makes on a slot.
-const SLOT_FILESYSTEM: &str = "ext4";
+/// The slot's role in the disk layout, which gives its filesystem and label.
+fn slot_role(slot: Slot) -> Role {
+    match slot {
+        Slot::A => Role::RootA,
+        Slot::B => Role::RootB,
+    }
+}
+
+/// A release medium's system: the rootfs, kernel and, when the medium carries
+/// one, the installed initramfs, at the live protocol's paths. A block device
+/// is mounted read-only under the stage directory, and stays mounted while
+/// the returned guard lives; a directory is taken as the mounted medium.
+pub(crate) fn open_media(config: &Config, media: &Path) -> Result<(Option<Mounted>, StageRequest)> {
+    use std::os::unix::fs::FileTypeExt;
+    let meta = fs::metadata(media).map_err(|err| refuse(format!("release medium '{}': {err}", media.display())))?;
+    let (mounted, root) = if meta.is_dir() {
+        (None, media.to_path_buf())
+    } else if meta.file_type().is_block_device() {
+        let point = config.stage_dir.join("media");
+        fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
+        (Some(Mounted::mount_ro(media, &point)?), point)
+    } else {
+        return Err(refuse(format!(
+            "release medium '{}' is neither a block device nor a directory",
+            media.display()
+        )));
+    };
+    let initrd = root.join(INITRAMFS_INSTALLED_ISO_PATH);
+    let request = StageRequest {
+        rootfs: root.join(ROOTFS_ISO_PATH),
+        kernel: root.join(KERNEL_ISO_PATH),
+        initrd: target_root::exists(&initrd)?.then_some(initrd),
+    };
+    Ok((mounted, request))
+}
 
 /// The inputs a stage reads, checked before anything is changed: the
 /// rootfs image, canonical.
@@ -192,9 +227,10 @@ pub(crate) fn write_slot(
 
     backend.remove_slot_boot_files(boot, slot)?;
 
-    let label = target_root::blkid_tag(device, "LABEL")?.unwrap_or_else(|| format!("ROOT_{slot}"));
+    let role = slot_role(slot);
+    let label = role.label().expect("slot roles have labels");
     target_root::run(
-        Command::new(format!("mkfs.{SLOT_FILESYSTEM}"))
+        Command::new(format!("mkfs.{}", role.filesystem().as_str()))
             .args(["-F", "-q", "-L", &label])
             .arg(device),
     )?;
@@ -219,6 +255,7 @@ pub(crate) fn write_slot(
         &running_root.join("etc/fstab"),
         &mount_point.join("etc/fstab"),
         &target.partuuid,
+        role.filesystem().as_str(),
     )?;
     sync_filesystem(&mount_point)?;
     mounted.unmount()?;
@@ -356,7 +393,7 @@ fn write_preserving_mode(path: &Path, content: &[u8]) -> Result<()> {
 }
 
 /// The running fstab with the root line pointed at the new slot's partition.
-fn write_fstab(running: &Path, dest: &Path, partuuid: &str) -> Result<()> {
+fn write_fstab(running: &Path, dest: &Path, partuuid: &str, filesystem: &str) -> Result<()> {
     let content =
         fs::read_to_string(running).with_context(|| format!("reading '{}'", running.display()))?;
     let mut found_root = false;
@@ -371,7 +408,7 @@ fn write_fstab(running: &Path, dest: &Path, partuuid: &str) -> Result<()> {
             let spec = format!("PARTUUID={partuuid}");
             fields[0] = &spec;
             if let Some(fstype) = fields.get_mut(2) {
-                *fstype = SLOT_FILESYSTEM;
+                *fstype = filesystem;
             }
             fields.join("\t")
         })
@@ -384,7 +421,7 @@ fn write_fstab(running: &Path, dest: &Path, partuuid: &str) -> Result<()> {
 }
 
 /// A filesystem mounted for the stage, unmounted when dropped.
-struct Mounted {
+pub(crate) struct Mounted {
     point: PathBuf,
     active: bool,
 }
@@ -392,6 +429,14 @@ struct Mounted {
 impl Mounted {
     fn mount(device: &Path, point: &Path) -> Result<Self> {
         target_root::run(Command::new("mount").arg(device).arg(point))?;
+        Ok(Self {
+            point: point.to_path_buf(),
+            active: true,
+        })
+    }
+
+    fn mount_ro(device: &Path, point: &Path) -> Result<Self> {
+        target_root::run(Command::new("mount").args(["-o", "ro"]).arg(device).arg(point))?;
         Ok(Self {
             point: point.to_path_buf(),
             active: true,

@@ -1,17 +1,17 @@
-//! The systemd-boot backend: which slot booted and which boots next (slot
-//! entries, loader.conf and systemd-boot's EFI variables), changing that
-//! selection by writing those variables, and each slot's entry and kernel
-//! files on the ESP. It needs no `bootctl`, so it works where only
-//! systemd-boot's EFI binary is installed.
+//! The installed ESP, which recab alone writes and reads: systemd-boot's EFI
+//! binary (copied from the target), loader.conf, the boot entries and each
+//! entry's kernel directory, for the A/B and the one-root (mutable) layout;
+//! which slot booted and which boots next (entries, loader.conf and
+//! systemd-boot's EFI variables), and changing that selection by writing
+//! those variables. It needs no `bootctl`.
 
 use anyhow::{anyhow, Context, Result};
-use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::{Config, RunningRoot};
 use crate::error::{tagged_err, ErrorClass};
 use distro_profile::os_release_value;
 use crate::state::{BootChange, Selection};
@@ -21,9 +21,26 @@ use crate::Slot;
 /// systemd-boot's vendor GUID, which names its EFI variables.
 const LOADER_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
 
-/// Seconds after a kernel panic before the kernel reboots, on every slot
-/// entry recab writes: a trial that panics reboots into the default slot.
+/// systemd-boot's loader configuration and entries, relative to the ESP.
+pub const LOADER_CONF: &str = "loader/loader.conf";
+pub const ENTRIES_DIR: &str = "loader/entries";
+/// The kernel and initramfs file names in an entry's directory on the ESP.
+pub const KERNEL_FILE: &str = "vmlinuz";
+pub const INITRD_FILE: &str = "initramfs.img";
+
+/// Where the target ships systemd-boot's EFI binaries, relative to its root.
+pub const SYSTEMD_BOOT_SOURCE_DIR: &str = "usr/lib/systemd/boot/efi";
+/// systemd-boot's EFI binary per firmware architecture suffix, and the
+/// firmware's default loader name for it (`EFI/BOOT/BOOT<ARCH>.EFI`).
+const SYSTEMD_BOOT_ARCHES: &[(&str, &str)] = &[("x64", "BOOTX64.EFI"), ("aa64", "BOOTAA64.EFI")];
+
+/// Seconds after a kernel panic before the kernel reboots, on every entry
+/// recab writes: a trial that panics reboots into the default slot.
+const PANIC_KEY: &str = "panic=";
 pub(crate) const PANIC_OPTION: &str = "panic=10";
+/// The root options of every entry recab writes: the root is mounted read-only
+/// and remounted read-write by the installed system's fstab.
+const ROOT_OPTIONS: &[&str] = &["ro", "rootwait"];
 
 /// Every kernel option any init system uses as a trial option (see
 /// `InitSystemExt::trial_options`): an entry that becomes the default loses
@@ -35,16 +52,13 @@ const EFI_VARIABLE_ATTRIBUTES: u32 = 0x7;
 /// `FS_IMMUTABLE_FL`, which efivarfs sets on variables.
 const FS_IMMUTABLE_FL: libc::c_int = 0x10;
 
-const KERNEL_FILE: &str = "vmlinuz";
-const INITRD_FILE: &str = "initramfs.img";
-
 /// Where the backend reads and writes (from the run's [`Config`]).
 pub(crate) struct SystemdBoot {
     boot_root: PathBuf,
     loader_conf: PathBuf,
     entries_dir: PathBuf,
     os_release: PathBuf,
-    proc_cmdline: PathBuf,
+    running_root: RunningRoot,
     sys_firmware_efi: PathBuf,
     efivars: PathBuf,
     /// `efivars` is efivarfs; else a scratch tree of plain files.
@@ -79,10 +93,10 @@ impl SystemdBoot {
     pub fn new(config: &Config) -> Self {
         Self {
             boot_root: config.boot_root.clone(),
-            loader_conf: config.boot_root.join("loader/loader.conf"),
-            entries_dir: config.boot_root.join("loader/entries"),
+            loader_conf: config.boot_root.join(LOADER_CONF),
+            entries_dir: config.boot_root.join(ENTRIES_DIR),
             os_release: config.os_release.clone(),
-            proc_cmdline: config.proc_cmdline.clone(),
+            running_root: config.running_root.clone(),
             sys_firmware_efi: config.sys_firmware_efi.clone(),
             efivars: config.efivars.clone(),
             efivarfs: config.efivarfs,
@@ -95,7 +109,7 @@ impl SystemdBoot {
         // then loader.conf's `default`, skipping entries it cannot boot.
         let efivar_default = self.loader_efivar("LoaderEntryDefault")?;
         let conf_default = read_optional(&self.loader_conf)?.as_deref().and_then(loader_default);
-        let prefix = self.entry_prefix(efivar_default.as_deref().or(conf_default.as_deref()))?;
+        let prefix = self.entry_prefix()?;
         let active = self.active_slot(&prefix)?;
         let bootable_slot = |entry: Option<&str>| -> Result<Option<Slot>> {
             let Some(slot) = entry
@@ -317,9 +331,7 @@ Write a system into slot {slot} with 'recab stage' first."
         let device = selector
             .device()?
             .ok_or_else(|| state_err(format!("entry '{entry}' names root '{selector}', which is not present")))?;
-        let cmdline = fs::read_to_string(&self.proc_cmdline)
-            .with_context(|| format!("reading '{}'", self.proc_cmdline.display()))?;
-        let running = match root_selector_from_cmdline(&cmdline) {
+        let running = match self.running_root_selector()? {
             Some(selector) => selector.device()?,
             None => None,
         };
@@ -378,7 +390,7 @@ Write a system into slot {slot} with 'recab stage' first."
             initrd.map(|_| format!("/{dir_name}/{INITRD_FILE}")).as_deref(),
         );
         let content = entry_with_options(&content, |options| {
-            if !options.iter().any(|o| o.starts_with("panic=")) {
+            if !options.iter().any(|o| o.starts_with(PANIC_KEY)) {
                 options.push(PANIC_OPTION.to_string());
             }
             options.retain(|o| !ALL_TRIAL_OPTIONS.contains(&o.as_str()));
@@ -479,27 +491,48 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
         Ok((!value.is_empty()).then_some(value))
     }
 
+    /// The root selector of the system recab reads: the kernel command line's
+    /// last `root=`, or the PARTUUID of the partition mounted at an install
+    /// target. `None` when the command line names no root.
+    fn running_root_selector(&self) -> Result<Option<RootSelector>> {
+        match &self.running_root {
+            RunningRoot::Cmdline(path) => {
+                let cmdline = fs::read_to_string(path).map_err(|err| {
+                    tagged_err(
+                        ErrorClass::StateOrDetection,
+                        format!("unable to determine active slot: cannot read '{}': {err}", path.display()),
+                    )
+                })?;
+                Ok(root_selector_from_cmdline(&cmdline))
+            }
+            RunningRoot::Mounted(root) => {
+                let table = target_root::mount_table()?;
+                let mount = table.iter().rev().find(|m| m.mount_point == *root).ok_or_else(|| {
+                    tagged_err(
+                        ErrorClass::StateOrDetection,
+                        format!("'{}' is not a mount point; mount the installed system's root there", root.display()),
+                    )
+                })?;
+                let partuuid = target_root::partuuid(Path::new(&mount.source))?.ok_or_else(|| {
+                    tagged_err(
+                        ErrorClass::StateOrDetection,
+                        format!("'{}' (mounted at '{}') has no PARTUUID", mount.source, root.display()),
+                    )
+                })?;
+                Ok(Some(RootSelector::PartUuid(partuuid)))
+            }
+        }
+    }
+
     /// The active slot: the slot entry whose root= names the running root.
     fn active_slot(&self, prefix: &str) -> Result<Slot> {
-        let cmdline = fs::read_to_string(&self.proc_cmdline).map_err(|err| {
-            tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
-                    "unable to determine active slot: cannot read '{}': {err}",
-                    self.proc_cmdline.display()
-                ),
-            )
-        })?;
         // The slot entries' root= selectors, written at install time, are the
         // record of which partition is which slot. The loader default is what
         // boots next, not what booted, so it is never used as the answer.
-        let Some(root_selector) = root_selector_from_cmdline(&cmdline) else {
+        let Some(root_selector) = self.running_root_selector()? else {
             return Err(tagged_err(
                 ErrorClass::StateOrDetection,
-                format!(
-                    "unable to determine active slot: '{}' has no root=",
-                    self.proc_cmdline.display()
-                ),
+                "unable to determine active slot: the kernel command line has no root=",
             ));
         };
         self.slot_from_entry_roots(prefix, &root_selector)?.ok_or_else(|| {
@@ -547,64 +580,128 @@ Expected matching root=... options in '{}' and '{}'.",
         Ok(matched)
     }
 
-    /// The slot entries' prefix: configured, else the default entry's, else
-    /// the os-release ID when both entries carry it, else the one prefix that
-    /// has both entries.
-    fn entry_prefix(&self, default_entry: Option<&str>) -> Result<String> {
+    /// The entries' prefix: configured (`RECAB_ENTRY_PREFIX`), else the
+    /// system's os-release `ID`, lower-cased: the rule `recab init` names
+    /// them by.
+    fn entry_prefix(&self) -> Result<String> {
         if let Some(prefix) = &self.entry_prefix {
             return Ok(prefix.clone());
         }
-        if let Some((prefix, _)) = default_entry.and_then(parse_entry_name) {
-            return Ok(prefix);
-        }
-        let has_pair = |prefix: &str| {
-            [Slot::A, Slot::B]
-                .iter()
-                .all(|slot| self.entries_dir.join(entry_name(prefix, *slot)).is_file())
-        };
-        let id = read_optional(&self.os_release)?
+        read_optional(&self.os_release)?
             .and_then(|text| os_release_value(&text, "ID"))
-            .map(|id| id.to_ascii_lowercase());
-        if let Some(id) = id {
-            if has_pair(&id) {
-                return Ok(id);
-            }
+            .map(|id| os_prefix(&id))
+            .ok_or_else(|| {
+                tagged_err(
+                    ErrorClass::StateOrDetection,
+                    format!(
+                        "'{}' has no ID, which names the boot entries; set RECAB_ENTRY_PREFIX",
+                        self.os_release.display()
+                    ),
+                )
+            })
+    }
+
+    /// The layout of each slot on the ESP, as `status` reports it.
+    pub fn slot_views(&self, boot: &Boot) -> Result<Vec<crate::SlotView>> {
+        let mut views = Vec::new();
+        for slot in [Slot::A, Slot::B] {
+            let entry = entry_name(&boot.prefix, slot);
+            let content = read_optional(&self.entries_dir.join(&entry))?;
+            let root = content.as_deref().and_then(root_selector_from_entry_content);
+            let device = match &root {
+                Some(root) => root.device()?.map(|d| d.display().to_string()),
+                None => None,
+            };
+            let options = content.as_deref().map(entry_options).unwrap_or_default();
+            views.push(crate::SlotView {
+                slot,
+                entry: format!("{ENTRIES_DIR}/{entry}"),
+                boot_dir: slot_boot_dir(&boot.prefix, slot),
+                root: root.map(|r| r.to_string()),
+                device,
+                bootable: self.missing_boot_file(&entry)?.is_none(),
+                trial: options.iter().any(|o| ALL_TRIAL_OPTIONS.contains(&o.as_str())),
+            });
         }
-        let mut slots_by_prefix: BTreeMap<String, BTreeSet<Slot>> = BTreeMap::new();
-        for name in target_root::dir_names(&self.entries_dir)? {
-            if let Some((prefix, slot)) = parse_entry_name(&name.to_string_lossy()) {
-                slots_by_prefix.entry(prefix).or_default().insert(slot);
-            }
-        }
-        let mut paired = slots_by_prefix.into_iter().filter(|(_, slots)| slots.len() == 2);
-        match (paired.next(), paired.next()) {
-            (Some((prefix, _)), None) => Ok(prefix),
-            (Some((first, _)), Some((second, _))) => Err(tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
-                    "both '{first}' and '{second}' have A/B entries in '{}'; set RECAB_ENTRY_PREFIX to the one this system uses",
-                    self.entries_dir.display()
-                ),
-            )),
-            _ => Err(tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
-                    "unable to determine A/B entry prefix in '{}'. Expected '<prefix>-a.conf' and '<prefix>-b.conf'.\n\
-Name the entries after the os-release ID, or set RECAB_ENTRY_PREFIX.",
-                    self.entries_dir.display()
-                ),
-            )),
-        }
+        Ok(views)
     }
 }
 
-fn entry_name(prefix: &str, slot: Slot) -> String {
-    format!("{prefix}-{}.conf", slot.entry_suffix())
+/// The entry prefix of an os-release `ID`.
+pub(crate) fn os_prefix(id: &str) -> String {
+    id.to_ascii_lowercase()
+}
+
+/// An entry's directory name: `<prefix>-a` for an A/B slot, `<prefix>` for
+/// the one root of a mutable install.
+pub(crate) fn layout_name(prefix: &str, slot: Option<Slot>) -> String {
+    match slot {
+        Some(slot) => format!("{prefix}-{}", slot.entry_suffix()),
+        None => prefix.to_string(),
+    }
+}
+
+/// The entry file name of an A/B slot (`<prefix>-a.conf`), or of the mutable
+/// layout's one root (`<prefix>.conf`), in [`ENTRIES_DIR`].
+pub fn layout_entry_name(prefix: &str, slot: Option<Slot>) -> String {
+    format!("{}.conf", layout_name(prefix, slot))
+}
+
+/// A slot's entry file name in [`ENTRIES_DIR`].
+pub fn entry_name(prefix: &str, slot: Slot) -> String {
+    layout_entry_name(prefix, Some(slot))
 }
 
 /// The slot's kernel directory on the ESP, relative to its root.
 fn slot_boot_dir(prefix: &str, slot: Slot) -> String {
-    format!("{prefix}-{}", slot.entry_suffix())
+    layout_name(prefix, Some(slot))
+}
+
+/// A new entry: `title`, the kernel (and initramfs) in `dir` on the ESP, and
+/// [`entry_options`] for the root `partuuid` plus the variant's `extra`
+/// options.
+pub(crate) fn new_entry(title: &str, prefix: &str, slot: Option<Slot>, initrd: bool, partuuid: &str, extra: &str) -> String {
+    let dir = layout_name(prefix, slot);
+    let mut entry = format!("title {title}\nlinux /{dir}/{KERNEL_FILE}\n");
+    if initrd {
+        entry.push_str(&format!("initrd /{dir}/{INITRD_FILE}\n"));
+    }
+    let mut options = vec![format!("root=PARTUUID={partuuid}")];
+    options.extend(ROOT_OPTIONS.iter().map(|o| o.to_string()));
+    options.push(PANIC_OPTION.to_string());
+    options.extend(extra.split_whitespace().map(str::to_string));
+    entry.push_str(&format!("options {}\n", options.join(" ")));
+    entry
+}
+
+/// Copy the target's own systemd-boot onto its ESP, under its own name
+/// (`EFI/systemd/`) and as the firmware's default loader (`EFI/BOOT/`). The
+/// target ships one binary, for its architecture.
+pub(crate) fn install_loader(root: &Path, esp: &Path) -> Result<()> {
+    let source_dir = root.join(SYSTEMD_BOOT_SOURCE_DIR);
+    let mut found = Vec::new();
+    for (arch, fallback) in SYSTEMD_BOOT_ARCHES {
+        let name = format!("systemd-boot{arch}.efi");
+        if target_root::exists(&source_dir.join(&name))? {
+            found.push((name, *fallback));
+        }
+    }
+    let (name, fallback) = match found.as_slice() {
+        [one] => one.clone(),
+        [] => anyhow::bail!(
+            "'{}' has no systemd-boot EFI binary; extract a complete system first",
+            source_dir.display()
+        ),
+        _ => anyhow::bail!("'{}' has systemd-boot for more than one architecture", source_dir.display()),
+    };
+    let source = source_dir.join(&name);
+    for dest in [esp.join("EFI/systemd").join(&name), esp.join("EFI/BOOT").join(fallback)] {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating '{}'", parent.display()))?;
+        }
+        copy_durable(&source, &dest)?;
+    }
+    Ok(())
 }
 
 /// `<prefix>-a.conf` → (prefix, A); bootctl reports names without `.conf`.
@@ -688,6 +785,16 @@ fn entry_with_boot_files(content: &str, kernel: &str, initrd: Option<&str>) -> S
     lines.join("\n") + "\n"
 }
 
+/// An entry's options, all `options` lines joined.
+fn entry_options(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("options"))
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .flat_map(|rest| rest.split_whitespace().map(str::to_string))
+        .collect()
+}
+
 /// The entry with its `options` edited as one list (systemd-boot joins all
 /// `options` lines); the result has a single `options` line where the first
 /// one was, or at the end.
@@ -749,19 +856,24 @@ impl RootSelector {
         Some(Self::DevicePath(token.to_string()))
     }
 
-    /// The block device this selector names on the running system, through
-    /// the kernel's /dev/disk links.
+    /// The block device this selector names on the running system, found by
+    /// blkid (no udev or /dev/disk links needed), or a device path resolved.
     fn device(&self) -> Result<Option<PathBuf>> {
-        let link = match self {
-            Self::PartUuid(v) => PathBuf::from(format!("/dev/disk/by-partuuid/{v}")),
-            Self::Uuid(v) => PathBuf::from(format!("/dev/disk/by-uuid/{v}")),
-            Self::Label(v) => PathBuf::from(format!("/dev/disk/by-label/{v}")),
-            Self::DevicePath(v) => PathBuf::from(v),
+        let (tag, value) = match self {
+            Self::PartUuid(v) => ("PARTUUID", v),
+            Self::Uuid(v) => ("UUID", v),
+            Self::Label(v) => ("LABEL", v),
+            Self::DevicePath(v) => {
+                return match fs::canonicalize(v) {
+                    Ok(device) => Ok(Some(device)),
+                    Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+                    Err(err) => Err(anyhow!(err).context(format!("resolving '{v}'"))),
+                }
+            }
         };
-        match fs::canonicalize(&link) {
-            Ok(device) => Ok(Some(device)),
-            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(anyhow!(err).context(format!("resolving '{}'", link.display()))),
+        match target_root::device_with_tag(tag, value)? {
+            Some(device) => Ok(Some(fs::canonicalize(&device).with_context(|| format!("resolving '{}'", device.display()))?)),
+            None => Ok(None),
         }
     }
 

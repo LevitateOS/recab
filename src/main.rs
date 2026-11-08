@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use recab::{stable_exit_code, InitRequest, Slot, StageRequest, Status, TrialOutcome};
+use recab::{
+    stable_exit_code, InitLayout, InitRequest, Slot, StageRequest, StageSource, Status, TrialOutcome,
+};
+use recpart::types::InstallMode;
 
 #[derive(Parser)]
 #[command(name = "recab")]
@@ -21,38 +24,55 @@ enum Command {
         /// Emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
+        /// Read the system installed under this root (its root partition
+        /// mounted here, the ESP and state partition below it) instead of the
+        /// running one.
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
 
-    /// Set up the A/B boot layout of a freshly installed system (slot A).
+    /// Set up the boot layout of a freshly installed system: systemd-boot,
+    /// the boot entries (both A/B slots, or the one mutable root) and the
+    /// installed kernel.
     Init {
         /// The installed system's root, with its ESP at boot/ and state at var/.
         #[arg(long)]
         root: PathBuf,
-        /// Slot A's partition, holding the installed system.
-        #[arg(long)]
-        slot_a: PathBuf,
-        /// Slot B's partition.
-        #[arg(long)]
-        slot_b: PathBuf,
-        /// Kernel image for slot A.
+        /// The disk layout: two A/B slots, or one mutable root.
+        #[arg(long, value_enum, default_value_t = InstallMode::Ab)]
+        mode: InstallMode,
+        /// A/B: slot A's partition, holding the installed system.
+        #[arg(long, required_if_eq("mode", "ab"))]
+        slot_a: Option<PathBuf>,
+        /// A/B: slot B's partition.
+        #[arg(long, required_if_eq("mode", "ab"))]
+        slot_b: Option<PathBuf>,
+        /// Mutable: the root partition.
+        #[arg(long, required_if_eq("mode", "mutable"), conflicts_with_all = ["slot_a", "slot_b"])]
+        root_device: Option<PathBuf>,
+        /// Kernel image of the installed system.
         #[arg(long)]
         kernel: PathBuf,
-        /// Initramfs for slot A, if it boots through one.
+        /// Its initramfs, if it boots through one.
         #[arg(long)]
         initrd: Option<PathBuf>,
-        /// Extra kernel options for both slot entries (for example consoles).
+        /// Extra kernel options for the entries (for example consoles).
         #[arg(long, default_value = "")]
         options: String,
     },
 
     /// Write a prebuilt system into the inactive slot (formats the slot).
     Stage {
+        /// A release medium (its device, or where it is mounted): stage its
+        /// rootfs, kernel and, when it carries one, the installed initramfs.
+        #[arg(long, value_name = "MEDIA", conflicts_with_all = ["rootfs", "kernel", "initrd"])]
+        from_media: Option<PathBuf>,
         /// EROFS rootfs image: a file, or a partition holding it.
-        #[arg(long)]
-        rootfs: PathBuf,
+        #[arg(long, required_unless_present = "from_media")]
+        rootfs: Option<PathBuf>,
         /// Kernel image for the slot.
-        #[arg(long)]
-        kernel: PathBuf,
+        #[arg(long, required_unless_present = "from_media")]
+        kernel: Option<PathBuf>,
         /// Initramfs for the slot, if it boots through one.
         #[arg(long)]
         initrd: Option<PathBuf>,
@@ -103,36 +123,26 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Command::Status { json } => {
-            let st = recab::status()?;
+        Command::Status { json, root } => {
+            let st = recab::status(root.as_deref())?;
             print_status(&st, json)?;
         }
-        Command::Stage {
-            rootfs,
-            kernel,
-            initrd,
-        } => {
-            recab::stage(&StageRequest {
-                rootfs,
-                kernel,
-                initrd,
-            })?;
+        Command::Stage { from_media, rootfs, kernel, initrd } => {
+            let source = match (from_media, rootfs, kernel) {
+                (Some(media), _, _) => StageSource::Media(media),
+                (None, Some(rootfs), Some(kernel)) => StageSource::Files(StageRequest { rootfs, kernel, initrd }),
+                _ => unreachable!("clap requires --rootfs and --kernel without --from-media"),
+            };
+            recab::stage(&source)?;
         }
-        Command::Init {
-            root,
-            slot_a,
-            slot_b,
-            kernel,
-            initrd,
-            options,
-        } => recab::init(&InitRequest {
-            root,
-            slot_a,
-            slot_b,
-            kernel,
-            initrd,
-            options,
-        })?,
+        Command::Init { root, mode, slot_a, slot_b, root_device, kernel, initrd, options } => {
+            let layout = match (mode, slot_a, slot_b, root_device) {
+                (InstallMode::Ab, Some(slot_a), Some(slot_b), None) => InitLayout::Ab { slot_a, slot_b },
+                (InstallMode::Mutable, None, None, Some(root_device)) => InitLayout::Mutable { root_device },
+                _ => anyhow::bail!("--mode ab takes --slot-a and --slot-b; --mode mutable takes --root-device"),
+            };
+            recab::init(&InitRequest { root, layout, kernel, initrd, options })?
+        }
         Command::SetNext { slot } => recab::set_next(slot)?,
         Command::Commit => recab::commit()?,
         Command::Rollback => recab::rollback()?,

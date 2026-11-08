@@ -1,14 +1,16 @@
 //! recab - A/B slot management for systemd-boot systems.
 //!
-//! - set up the A/B boot layout at install time (`init`)
+//! - set up the boot layout at install time, A/B or one root (`init`)
 //! - which slot booted, which boots next (`status`)
-//! - write a prebuilt system into the inactive slot (`stage`)
+//! - write a prebuilt system into the inactive slot (`stage`), from files or
+//!   from a release medium
 //! - boot the other slot once (`set_next`)
 //! - keep the running slot (`commit`), or go back (`rollback`)
 //! - on each boot, commit a healthy trial or reboot out of a failed one (`trial`)
 //!
-//! `state` holds the slot state machine without I/O; `systemd_boot` reads and
-//! writes the boot selection; `store` keeps recab's state and audit log.
+//! `state` holds the slot state machine without I/O; `systemd_boot` owns the
+//! installed ESP (writes and reads entries, loader.conf and the boot
+//! selection); `store` keeps recab's state and audit log.
 
 mod config;
 mod error;
@@ -22,6 +24,11 @@ mod systemd_boot;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+pub use config::state_file;
+pub use systemd_boot::{
+    entry_name, layout_entry_name, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub use error::{
@@ -95,6 +102,26 @@ pub struct TrialRecord {
     pub unix_time: u64,
 }
 
+/// One slot's layout on the ESP, as recab wrote it.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlotView {
+    pub slot: Slot,
+    /// The entry file, relative to the ESP (`loader/entries/<prefix>-a.conf`).
+    pub entry: String,
+    /// The directory of its kernel and initramfs, relative to the ESP.
+    pub boot_dir: String,
+    /// The entry's `root=` (`PARTUUID=...`), if it has one.
+    pub root: Option<String>,
+    /// The block device `root` names on this machine, if present.
+    pub device: Option<String>,
+    /// Every file the entry loads is on the ESP.
+    pub bootable: bool,
+    /// The entry carries a trial's options (it was staged or scheduled and
+    /// not yet committed).
+    pub trial: bool,
+}
+
 /// Current A/B view exported by `recab status --json`.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,9 +142,21 @@ pub struct Status {
     /// How the last judged trial boot ended.
     pub last_trial: Option<TrialRecord>,
     pub entry_prefix: String,
+    /// Each slot's entry, kernel directory and partition.
+    pub slots: Vec<SlotView>,
 }
 
-/// The prebuilt system `stage` writes.
+/// The prebuilt system `stage` writes: files, or a release medium holding them.
+#[derive(Debug, Clone)]
+pub enum StageSource {
+    Files(StageRequest),
+    /// A release medium (its device, or where it is mounted): the rootfs,
+    /// kernel and, when it carries one, the installed initramfs at the live
+    /// protocol's paths.
+    Media(PathBuf),
+}
+
+/// The prebuilt system `stage` writes, as files.
 #[derive(Debug, Clone)]
 pub struct StageRequest {
     /// EROFS rootfs image (a file or a partition), extracted with recstrap.
@@ -126,18 +165,25 @@ pub struct StageRequest {
     pub initrd: Option<PathBuf>,
 }
 
+/// The root partitions `init` writes entries for.
+#[derive(Debug, Clone)]
+pub enum InitLayout {
+    /// Slot A's partition (holding the installed system) and slot B's.
+    Ab { slot_a: PathBuf, slot_b: PathBuf },
+    /// The one root partition of a mutable install.
+    Mutable { root_device: PathBuf },
+}
+
 /// The installed system `init` sets up.
 #[derive(Debug, Clone)]
 pub struct InitRequest {
-    /// The installed system's root, with its ESP mounted at `boot/` and its
-    /// state partition at `var/`.
+    /// The installed system's root, with its ESP and its state partition
+    /// mounted where the layout puts them (`boot/`, `var/`).
     pub root: PathBuf,
-    /// Slot A's partition (holding the installed system) and slot B's.
-    pub slot_a: PathBuf,
-    pub slot_b: PathBuf,
+    pub layout: InitLayout,
     pub kernel: PathBuf,
     pub initrd: Option<PathBuf>,
-    /// Extra kernel options for both entries (consoles, for example).
+    /// Extra kernel options for the entries (consoles, for example).
     pub options: String,
 }
 
@@ -163,9 +209,15 @@ struct System {
 }
 
 impl System {
-    /// Read-only view (`status`); works without root.
-    fn read() -> Result<Self> {
-        Self::open(Config::running()?, None)
+    /// Read-only view (`status`) of this system, or of the system installed
+    /// under `root`; works without root.
+    fn read(root: Option<&Path>) -> Result<Self> {
+        let config = Config::running()?;
+        let config = match root {
+            Some(root) => config.install_target(root),
+            None => config,
+        };
+        Self::open(config, None)
     }
 
     /// View for `operation`, which changes the system: refused unless root,
@@ -190,10 +242,13 @@ impl System {
     }
 }
 
-/// Query current A/B state from the boot configuration and recab's state.
-/// Only reads, so it works anywhere the files are readable.
-pub fn status() -> Result<Status> {
-    let sys = System::read()?;
+/// Query current A/B state from the boot configuration and recab's state, of
+/// this system or of the system installed under `root` (its root partition
+/// mounted there, the ESP and state partitions below it). Only reads, so it
+/// works anywhere the files are readable.
+pub fn status(root: Option<&Path>) -> Result<Status> {
+    let sys = System::read(root)?;
+    let slots = sys.backend.slot_views(&sys.boot)?;
     let (sel, state) = (&sys.boot.selection, &sys.state);
     Ok(Status {
         active_slot: sel.active,
@@ -206,12 +261,14 @@ pub fn status() -> Result<Status> {
         rollback_slot: rollback_target(state, sel),
         last_trial: state.last_trial.clone(),
         entry_prefix: sys.boot.prefix,
+        slots,
     })
 }
 
-/// Set up the A/B boot layout of a freshly installed system: both slot
-/// entries, slot A's kernel, loader.conf, recab's state, the trial service,
-/// and systemd-boot's firmware variables pointing at slot A.
+/// Set up the boot layout of a freshly installed system: the target's
+/// systemd-boot, the entries (both slots', or the one root's), the installed
+/// kernel, loader.conf, for A/B recab's state and the trial service, and
+/// systemd-boot's firmware variables pointing at the installed entry.
 pub fn init(request: &InitRequest) -> Result<()> {
     require_root("init")?;
     init::run(Config::running()?.install_target(&request.root), request)
@@ -220,8 +277,17 @@ pub fn init(request: &InitRequest) -> Result<()> {
 /// Write a prebuilt system into the inactive slot: format it, extract the
 /// rootfs image, carry the machine's configuration over, and install the
 /// slot's kernel and boot entry. The slot is not booted until `set_next`.
-pub fn stage(request: &StageRequest) -> Result<()> {
+pub fn stage(source: &StageSource) -> Result<()> {
     let sys = System::locked("stage")?;
+    // A medium stays mounted (read-only) until the slot is written.
+    let (_media, request) = match source {
+        StageSource::Files(request) => (None, request.clone()),
+        StageSource::Media(media) => {
+            let (mounted, request) = stage::open_media(&sys.config, media)?;
+            (mounted, request)
+        }
+    };
+    let request = &request;
     let transition = plan_stage(&sys.boot.selection, &sys.state)?;
     let active = sys.boot.selection.active;
     let slot = active.other();

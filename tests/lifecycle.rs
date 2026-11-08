@@ -636,8 +636,9 @@ fn install_unit_writes_and_enables_the_trial_service() {
 fn init_sets_up_the_boot_layout_of_an_installed_system() {
     let tree = Tree::new();
     let target = tree.path("target");
-    fs::create_dir_all(target.join("boot/EFI/systemd")).unwrap();
-    fs::write(target.join("boot/EFI/systemd/systemd-bootx64.efi"), "efi").unwrap();
+    fs::create_dir_all(target.join("boot")).unwrap();
+    fs::create_dir_all(target.join("usr/lib/systemd/boot/efi")).unwrap();
+    fs::write(target.join("usr/lib/systemd/boot/efi/systemd-bootx64.efi"), "efi").unwrap();
     fs::create_dir_all(target.join("etc")).unwrap();
     fs::write(
         target.join("etc/os-release"),
@@ -706,6 +707,9 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
         .read("target/boot/loader/entries/lev-b.conf")
         .contains("root=PARTUUID=bbbb-2"));
     assert_eq!(tree.read("target/boot/lev-a/vmlinuz"), "new kernel");
+    // The target's own systemd-boot, under its name and as the firmware default.
+    assert_eq!(tree.read("target/boot/EFI/systemd/systemd-bootx64.efi"), "efi");
+    assert_eq!(tree.read("target/boot/EFI/BOOT/BOOTX64.EFI"), "efi");
     assert!(
         !tree.path("target/boot/lev-b").exists(),
         "slot B has no kernel until stage"
