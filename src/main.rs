@@ -94,17 +94,30 @@ enum Command {
     /// known-good slot (run by the trial service on every boot).
     Trial {
         /// Seconds to wait for startup to finish before the trial fails.
-        #[arg(long, default_value_t = 900)]
+        #[arg(long, default_value_t = recab::TRIAL_TIMEOUT_SECS)]
         timeout: u64,
     },
 
-    /// Install and enable the trial service (systemd unit or OpenRC service).
+    /// Wait for startup to finish and report how it ended: the verdict a
+    /// trial judges by (read-only; needs no A/B layout).
+    Health {
+        /// Print the verdict as one JSON object.
+        #[arg(long)]
+        json: bool,
+        /// Seconds to wait for startup to finish.
+        #[arg(long, default_value_t = recab::TRIAL_TIMEOUT_SECS)]
+        timeout: u64,
+    },
+
+    /// Write recab's package contents into a tree: the trial service
+    /// (systemd unit or OpenRC service), enabled, and the list of machine
+    /// state `stage` carries.
     InstallUnit {
-        /// Root of the system to install into (for example an install target).
+        /// Root of the tree (a package tree, or a system).
         #[arg(long, default_value = "/")]
         root: PathBuf,
-        /// Only write this init system's service file into the root (a package
-        /// tree, which has no os-release) and enable nothing.
+        /// The init system to write the service for; without it, the one the
+        /// root's os-release names.
         #[arg(long, value_name = "INIT", value_parser = str::parse::<recab::InitSystem>)]
         package: Option<recab::InitSystem>,
     },
@@ -148,8 +161,20 @@ fn run() -> anyhow::Result<()> {
         Command::Rollback => recab::rollback()?,
         Command::Trial { timeout } => {
             if let TrialOutcome::Committed(slot) = recab::trial(Duration::from_secs(timeout))? {
-                // The journal's record of the decision.
+                // The record of the decision (the journal, or the kernel log on OpenRC).
                 println!("recab: committed slot {slot} after a healthy trial boot");
+            }
+        }
+        Command::Health { json, timeout } => {
+            let health = recab::health(Duration::from_secs(timeout))?;
+            if json {
+                println!("{}", serde_json::to_string(&health)?);
+            } else {
+                let finished = if health.finished { "finished" } else { "did not finish" };
+                println!("startup {finished} ({})", health.state);
+                for name in &health.failed {
+                    println!("failed: {name}");
+                }
             }
         }
         Command::InstallUnit { root, package } => recab::install_unit(&root, package)?,

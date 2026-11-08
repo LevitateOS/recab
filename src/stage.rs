@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::Config;
-use crate::init_system::{self, InitSystemExt};
+use crate::carried::{self, Carry};
 use crate::store::write_durable;
 use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::{tagged_err, ErrorClass, Slot, StageRequest};
@@ -21,29 +21,6 @@ use distro_profile::Profile;
 use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
 use recpart::types::Role;
 use target_root::ErofsImage;
-
-/// Machine configuration every new system keeps from the running one:
-/// identity, locale and time. Everything else under /etc comes from the new
-/// image, except the accounts ([`ACCOUNT_FILES`]) and what the init system
-/// keeps ([`init_system::carried`]).
-const CARRIED_FILES: &[&str] = &[
-    "etc/hostname",
-    "etc/hosts",
-    "etc/machine-id",
-    "etc/subuid",
-    "etc/subgid",
-    "etc/localtime",
-    "etc/locale.conf",
-    "etc/vconsole.conf",
-    "etc/adjtime",
-];
-/// Account databases, merged by name: the image's entries (new system users
-/// and groups) plus the running system's, whose own entries win (passwords,
-/// shells, group members).
-const ACCOUNT_FILES: &[&str] = &["etc/passwd", "etc/group", "etc/shadow", "etc/gshadow"];
-/// SSH host keys, so the machine keeps its SSH identity.
-const SSH_DIR: &str = "etc/ssh";
-const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 
 /// The slot's role in the disk layout, which gives its filesystem and label.
 fn slot_role(slot: Slot) -> Role {
@@ -246,11 +223,8 @@ pub(crate) fn write_slot(
             .arg(&mount_point),
     )
     .context("extracting the rootfs image into the slot")?;
-    carry_configuration(running_root, &mount_point, profile)?;
-    if init.trial_service_enabled(running_root)? {
-        init.enable_trial_service(&mount_point)
-            .context("enabling the new system's packaged trial service")?;
-    }
+    // The new image's list: an image can add or drop what it carries.
+    carry_configuration(running_root, &mount_point, &carried::read(&mount_point)?)?;
     write_fstab(
         &running_root.join("etc/fstab"),
         &mount_point.join("etc/fstab"),
@@ -265,7 +239,7 @@ pub(crate) fn write_slot(
         slot,
         &request.kernel,
         request.initrd.as_deref(),
-        init.trial_options(),
+        init,
     )
 }
 
@@ -278,30 +252,41 @@ fn canonical(path: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-/// Copy the machine configuration from the running root into the new one.
-fn carry_configuration(from: &Path, to: &Path, profile: &Profile) -> Result<()> {
-    let carried = init_system::carried(profile);
-    for rel in CARRIED_FILES.iter().chain(&carried.files) {
+/// Carry the machine state the new image lists from the running root into
+/// the new one. A source that cannot be read fails the stage.
+fn carry_configuration(from: &Path, to: &Path, list: &[Carry]) -> Result<()> {
+    for entry in list {
+        let rel = entry.path();
         let source = from.join(rel);
-        if target_root::exists(&source)? {
-            copy_tree(&source, &to.join(rel))?;
-        }
-    }
-    for rel in ACCOUNT_FILES {
-        merge_accounts(&from.join(rel), &to.join(rel))?;
-    }
-    for rel in &carried.dirs {
-        let source = from.join(rel);
-        if source.is_dir() {
-            copy_tree(&source, &to.join(rel))?;
-        }
-    }
-    for name in target_root::dir_names(&from.join(SSH_DIR))? {
-        if name.to_string_lossy().starts_with(SSH_HOST_KEY_PREFIX) {
-            copy_tree(&from.join(SSH_DIR).join(&name), &to.join(SSH_DIR).join(&name))?;
+        match entry {
+            Carry::File(_) | Carry::Dir(_) => {
+                let Some(meta) = metadata(&source)? else { continue };
+                if matches!(entry, Carry::Dir(_)) && !meta.is_dir() {
+                    bail!("'{}' is listed as a directory to carry but is not one", source.display());
+                }
+                copy_tree(&source, &to.join(rel))?;
+            }
+            Carry::Prefix(_) => {
+                let (dir, prefix) = rel.rsplit_once('/').unwrap_or(("", rel));
+                for name in target_root::dir_names(&from.join(dir))? {
+                    if name.to_string_lossy().starts_with(prefix) {
+                        copy_tree(&from.join(dir).join(&name), &to.join(dir).join(&name))?;
+                    }
+                }
+            }
+            Carry::Accounts(_) => merge_accounts(&source, &to.join(rel))?,
         }
     }
     Ok(())
+}
+
+/// `path`'s own metadata; `None` when it does not exist.
+fn metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("reading '{}'", path.display())),
+    }
 }
 
 /// Copy `source` to `dest` keeping symlinks, permissions and owners. A

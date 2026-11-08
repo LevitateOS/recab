@@ -274,9 +274,11 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
     tree.ok(&["set-next", "B"]);
     assert!(tree.has_efivar("LoaderEntryOneShot"));
     assert_eq!(tree.status()["next_boot"], "B");
-    assert!(tree
-        .read("boot/loader/entries/lev-b.conf")
-        .contains("rd.emergency=reboot"));
+    // The fixture's entries boot without an initramfs: the trial option is
+    // systemd's crash option alone.
+    let crash = recab::crash_option(recab::InitSystem::Systemd).unwrap();
+    let entry = tree.read("boot/loader/entries/lev-b.conf");
+    assert!(entry.contains(crash) && !entry.contains("rd.emergency"), "{entry}");
 
     tree.ok(&["rollback"]);
     assert!(
@@ -306,7 +308,7 @@ fn trial_commit_and_rollback_drive_the_firmware_variables() {
         .starts_with("default lev-b.conf\n"));
     let entry = tree.read("boot/loader/entries/lev-b.conf");
     assert!(
-        !entry.contains("rd.emergency=reboot"),
+        !entry.contains(recab::crash_option(recab::InitSystem::Systemd).unwrap()),
         "a default loses the trial options: {entry}"
     );
 
@@ -621,15 +623,15 @@ fn install_unit_writes_and_enables_the_trial_service() {
         tree.path("target").to_str().unwrap(),
     ]);
     let unit = tree.read("target/usr/lib/systemd/system/recab-trial.service");
-    assert!(unit.contains("ExecStart=/usr/bin/recab trial"), "{unit}");
-    let link = fs::read_link(
-        tree.path("target/etc/systemd/system/sysinit.target.wants/recab-trial.service"),
-    )
-    .unwrap();
+    let exec = format!("ExecStart={} trial --timeout {}", recab::RECAB_BIN, recab::TRIAL_TIMEOUT_SECS);
+    assert!(unit.contains(&exec), "{unit}");
+    let link = tree.path("target").join(recab::trial_service_link(recab::InitSystem::Systemd));
     assert_eq!(
-        link,
+        fs::read_link(link).unwrap(),
         Path::new("/usr/lib/systemd/system/recab-trial.service")
     );
+    let carried = recab::carried::read(&tree.path("target")).unwrap();
+    assert!(carried.iter().any(|c| c.path() == "etc/sudoers.d"), "{carried:?}");
 }
 
 #[test]
@@ -720,10 +722,6 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
     let state: serde_json::Value =
         serde_json::from_str(&tree.read("target/var/lib/recab/state.json")).unwrap();
     assert_eq!(state["known_good_slot"], "A");
-    assert!(tree
-        .path("target/etc/systemd/system/sysinit.target.wants/recab-trial.service")
-        .symlink_metadata()
-        .is_ok());
     // The stale firmware default from an earlier install now names slot A.
     assert_eq!(
         tree.efivar("LoaderEntryDefault").as_deref(),
@@ -858,9 +856,11 @@ fn install_unit_writes_and_enables_the_openrc_service() {
     );
     let service = tree.read("target/etc/init.d/recab-trial");
     assert!(
-        service.starts_with("#!/sbin/openrc-run") && service.contains("/usr/bin/recab trial"),
+        service.starts_with("#!/sbin/openrc-run") && service.contains(&format!("{} trial", recab::RECAB_BIN)),
         "{service}"
     );
-    let link = fs::read_link(tree.path("target/etc/runlevels/boot/recab-trial")).unwrap();
-    assert_eq!(link, Path::new("/etc/init.d/recab-trial"));
+    let link = tree.path("target").join(recab::trial_service_link(recab::InitSystem::Openrc));
+    assert_eq!(fs::read_link(link).unwrap(), Path::new("/etc/init.d/recab-trial"));
+    let carried = recab::carried::read(&target).unwrap();
+    assert!(carried.iter().any(|c| c.path() == "etc/wpa_supplicant"), "{carried:?}");
 }

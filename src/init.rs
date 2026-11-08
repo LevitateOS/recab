@@ -1,7 +1,8 @@
 //! `recab init`: set up the boot layout of a freshly installed system, so
 //! the layout recab later reads and rewrites is written by recab: the
 //! target's systemd-boot on its ESP, the entries, the kernel, loader.conf and,
-//! for A/B, recab's state.
+//! for A/B, recab's state. The trial service comes enabled with recab's
+//! package.
 //!
 //! A/B: slot A holds the installed system; slot B is empty until `recab
 //! stage`. Both entries are written now, because their `root=PARTUUID=` is the
@@ -14,7 +15,6 @@ use std::fs;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::init_system::{self, InitSystemExt};
 use crate::state::{Operation, PersistentState};
 use crate::store::{copy_durable, read_optional, write_durable, Store};
 use crate::systemd_boot::{
@@ -79,7 +79,6 @@ pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
             ..PersistentState::default()
         };
         Store::new(&config).save(&state, "init")?;
-        init_system::installed_profile(root)?.init.enable_trial_service(root)?;
     }
 
     // A previous install may have left systemd-boot variables naming another

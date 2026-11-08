@@ -167,10 +167,11 @@ userspace cannot run when the system does not boot. recab gives one attempt
 (a one-shot entry over a known-good default); fallback happens at the next
 reboot, so REQ-SM-022 makes failed trials reboot.
 
-**REQ-SM-021**: With `recab-trial.service` enabled, the trial boot `set-next`
-scheduled MUST be committed without operator action when its startup ends with
-no failed unit, and MUST NOT be committed when startup ends degraded or in
-maintenance, or does not end within a bounded time. Other boots (a committed
+**REQ-SM-021**: With the trial service enabled (every image enables it), the
+trial boot `set-next` scheduled MUST be committed without operator action when
+its startup ends with nothing failed, and MUST NOT be committed when something
+failed, startup ended in the init's emergency state (systemd maintenance, the
+OpenRC single-user runlevel), or it does not end within a bounded time. Other boots (a committed
 slot, a slot picked from the boot menu, a trial an operator rolled back) and
 startups without a verdict (a shutdown) MUST be left alone.
 
@@ -178,9 +179,9 @@ startups without a verdict (a shutdown) MUST be left alone.
 slot cannot boot: a trial `recab trial` judges failed (REQ-SM-021) is rebooted by
 it, also when the ESP or /var cannot be read (the firmware's selected and
 default entries tell a one-shot trial); slot entries carry `panic=` so a
-panicking kernel reboots; and a trial's entry carries `rd.emergency=reboot`
-(initramfs failures) and `systemd.crash_action=reboot` (PID 1 crashes), which
-it loses when it becomes the default. A kernel or PID 1 that hangs without
+panicking kernel reboots; and a trial's entry carries the initramfs's
+fail-reboot word when it boots through one, and the init's crash option where
+it has one, which it loses when it becomes the default. A kernel or PID 1 that hangs without
 crashing is outside this requirement: it needs a hardware watchdog, which
 recab does not configure.
 
@@ -224,7 +225,8 @@ good slot on next reboot.
 
 **REQ-CLI-010**: Commands MUST be quiet on success (no extraneous logs), and MUST
 print actionable errors to stderr on failure. `recab trial` prints one line when
-it commits, as the journal's record of the decision.
+it commits, the record of the decision (the journal on systemd, the kernel log
+on OpenRC).
 
 **REQ-CLI-011**: `recab status` SHOULD support a machine-readable output mode
 (for example `--json`) suitable for scripts and test harnesses.

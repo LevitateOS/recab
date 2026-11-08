@@ -261,13 +261,14 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
 /// How system startup ended, as `recab trial` sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Startup {
-    /// Started with no failed units.
+    /// Started with nothing failed.
     Running,
-    /// Started with failed units, or ended in the emergency/rescue target.
+    /// Started with failed units or services, or ended in the init's
+    /// emergency state (systemd maintenance, OpenRC single-user).
     Failed(String),
     /// Still starting when the deadline passed.
     TimedOut,
-    /// Anything else (shutting down, systemd unreachable): no verdict.
+    /// Anything else (shutting down, the init unreachable): no verdict.
     Inconclusive(String),
 }
 

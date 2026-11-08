@@ -1,16 +1,16 @@
-//! What depends on the system's distro profile (the `REC_*` fields of its
-//! os-release): how `recab trial` learns that startup finished and what
-//! failed, how it reboots, the service that runs it on every boot, the kernel
-//! options of a trial, and the machine configuration `stage` carries into a
-//! new slot.
+//! recab's init adapter: what a trial needs from the running init system,
+//! the one from the system's distro profile (the `REC_*` fields of its
+//! os-release). Three operations: wait until startup finished and name what
+//! failed ([`wait_finished`]), reboot ([`reboot`]), and the kernel option
+//! that reboots on a crashing PID 1 ([`crash_option`]).
 //!
 //! systemd and OpenRC are supported.
 
-use anyhow::{bail, Context, Result};
-use distro_profile::{InitSystem, PrivilegeTool, Profile};
+use anyhow::{Context, Result};
+use distro_profile::{InitSystem, Profile};
+use serde::Serialize;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,19 +18,6 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::state::Startup;
 use crate::{tagged_err, ErrorClass};
-
-/// What `stage` copies from the running system into the new one, on top of
-/// the identity and account files every system carries.
-pub(crate) struct Carried {
-    /// Files (or symlinks) copied over the image's.
-    pub files: Vec<&'static str>,
-    /// Directories whose contents are copied over the image's, adding what
-    /// the machine enabled or configured without removing what the image adds.
-    pub dirs: Vec<&'static str>,
-}
-
-const SYSTEMD_UNIT: &str = include_str!("services/recab-trial.service");
-const OPENRC_SERVICE: &str = include_str!("services/recab-trial.openrc");
 
 /// The profile of the running system, from its os-release.
 pub(crate) fn running_profile(config: &Config) -> Result<Profile> {
@@ -65,150 +52,76 @@ pub(crate) fn installed_profile(root: &Path) -> Result<Profile> {
     })
 }
 
-/// The machine configuration the system keeps outside the files every system
-/// carries: its init system's and its privilege tool's.
-pub(crate) fn carried(profile: &Profile) -> Carried {
-    let mut carried = match profile.init {
-        InitSystem::Systemd => Carried {
-            files: vec![],
-            dirs: vec![
-                "etc/systemd/system",
-                "etc/NetworkManager/system-connections",
-            ],
-        },
-        InitSystem::Openrc => Carried {
-            files: vec!["etc/network/interfaces", "etc/inittab"],
-            dirs: vec!["etc/runlevels", "etc/conf.d"],
-        },
-    };
-    match profile.privilege {
-        PrivilegeTool::Sudo => {}
-        PrivilegeTool::Doas => {
-            carried.files.push("etc/doas.conf");
-            carried.dirs.push("etc/doas.d");
-        }
-    }
-    carried
-}
-
-/// The trial service's file, relative to the root.
-fn trial_service_path(init: InitSystem) -> &'static str {
+/// The kernel option that turns a crashing PID 1 into a reboot, for an init
+/// that has one; OpenRC's init dying panics the kernel, which `panic=` already
+/// reboots.
+pub fn crash_option(init: InitSystem) -> Option<&'static str> {
     match init {
-        InitSystem::Systemd => "usr/lib/systemd/system/recab-trial.service",
-        InitSystem::Openrc => "etc/init.d/recab-trial",
+        InitSystem::Systemd => Some("systemd.crash_action=reboot"),
+        InitSystem::Openrc => None,
     }
 }
 
-/// What recab does differently per init system.
-pub trait InitSystemExt: Copy {
-    /// The link that enables the trial service, relative to the root.
-    fn trial_service_link(self) -> &'static str;
-
-    /// Kernel options a trial's entry carries until it is committed.
-    fn trial_options(self) -> &'static [&'static str];
-
-    /// The trial service is enabled under `root`.
-    fn trial_service_enabled(self, root: &Path) -> Result<bool>;
-
-    /// Write the trial service's file under `root` (a system, or the package
-    /// tree Recipe packages recab from).
-    fn write_trial_service(self, root: &Path) -> Result<()>;
-
-    /// Enable the packaged service, as `systemctl enable` or `rc-update add`
-    /// would; never replace package contents.
-    fn enable_trial_service(self, root: &Path) -> Result<()>;
-
+/// How startup of the running system ended (`recab health --json`).
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize)]
+pub struct Health {
+    pub init: InitSystemName,
+    /// Startup ran to its end (systemd `running` or `degraded`; OpenRC's
+    /// default runlevel entered with nothing starting).
+    pub finished: bool,
+    /// The init's own word: systemd's `is-system-running` answer, OpenRC's
+    /// softlevel, or `timed out`.
+    pub state: String,
+    /// The units or services that failed (and, on OpenRC, crashed daemons),
+    /// sorted, by bare name; listed even when startup did not finish.
+    pub failed: Vec<String>,
+    /// What a trial makes of it.
+    #[serde(skip)]
+    #[cfg_attr(feature = "contracts", schemars(skip))]
+    #[cfg_attr(feature = "contracts", ts(skip))]
+    pub(crate) startup: Startup,
 }
 
-impl InitSystemExt for InitSystem {
-    fn trial_service_link(self) -> &'static str {
-        match self {
-            InitSystem::Systemd => "etc/systemd/system/sysinit.target.wants/recab-trial.service",
-            InitSystem::Openrc => "etc/runlevels/boot/recab-trial",
-        }
-    }
+/// The init system's name, as the profile spells it.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InitSystemName {
+    Systemd,
+    Openrc,
+}
 
-    /// systemd: the initramfs reboots instead of opening an emergency shell,
-    /// and a crashing PID 1 reboots. OpenRC systems boot without an
-    /// initramfs: a root that cannot mount and a dying init both panic, which
-    /// `panic=` already turns into a reboot.
-    fn trial_options(self) -> &'static [&'static str] {
-        match self {
-            InitSystem::Systemd => &["rd.emergency=reboot", "systemd.crash_action=reboot"],
-            InitSystem::Openrc => &[],
+impl From<InitSystem> for InitSystemName {
+    fn from(init: InitSystem) -> Self {
+        match init {
+            InitSystem::Systemd => InitSystemName::Systemd,
+            InitSystem::Openrc => InitSystemName::Openrc,
         }
-    }
-
-    fn trial_service_enabled(self, root: &Path) -> Result<bool> {
-        Ok(target_root::exists(&root.join(self.trial_service_link()))?)
-    }
-
-    fn write_trial_service(self, root: &Path) -> Result<()> {
-        let (content, mode) = match self {
-            InitSystem::Systemd => (SYSTEMD_UNIT, 0o644),
-            InitSystem::Openrc => (OPENRC_SERVICE, 0o755),
-        };
-        let path = root.join(trial_service_path(self));
-        target_root::write_durable(&path, content.as_bytes(), Some(mode))
-            .with_context(|| format!("writing '{}'", path.display()))
-    }
-
-    fn enable_trial_service(self, root: &Path) -> Result<()> {
-        let path = root.join(trial_service_path(self));
-        if !path.is_file() {
-            bail!(
-                "{} is missing; deploy a complete recab package produced by Recipe",
-                path.display()
-            );
-        }
-        let link = root.join(self.trial_service_link());
-        if let Some(parent) = link.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating '{}'", parent.display()))?;
-        }
-        if target_root::exists(&link)? {
-            fs::remove_file(&link).with_context(|| format!("replacing '{}'", link.display()))?;
-        }
-        let target = Path::new("/").join(trial_service_path(self));
-        symlink(&target, &link).with_context(|| format!("enabling '{}'", link.display()))
     }
 }
 
-/// Ask for a clean reboot without waiting for it.
-pub(crate) fn reboot(init: InitSystem, config: &Config) -> Result<()> {
-    let (program, args): (String, Vec<&str>) = match (&config.reboot, init) {
-        (Some(program), _) => (program.clone(), vec![]),
-        (None, InitSystem::Systemd) => (config.systemctl.clone(), vec!["--no-block", "reboot"]),
-        (None, InitSystem::Openrc) => {
-            // openrc-init is shut down with openrc-shutdown; busybox init
-            // (with an inittab) with reboot.
-            let pid1 = fs::read_to_string("/proc/1/comm").context("reading /proc/1/comm")?;
-            if pid1.trim() == "openrc-init" {
-                ("openrc-shutdown".to_string(), vec!["-r", "now"])
-            } else {
-                ("reboot".to_string(), vec![])
-            }
-        }
+/// The word `state` takes when the deadline passed.
+const TIMED_OUT: &str = "timed out";
+/// How often an init's progress is looked at while waiting.
+const POLL: Duration = Duration::from_millis(250);
+
+/// Wait until startup finished, at most `timeout`, and name what failed.
+pub(crate) fn wait_finished(config: &Config, init: InitSystem, timeout: Duration) -> Result<Health> {
+    let (finished, state, mut failed, startup) = match init {
+        InitSystem::Systemd => systemd_startup(&config.systemctl, timeout)?,
+        InitSystem::Openrc => openrc_startup(config, timeout)?,
     };
-    target_root::run(Command::new(&program).args(&args))?;
-    Ok(())
+    failed.sort();
+    failed.dedup();
+    Ok(Health { init: init.into(), finished, state, failed, startup })
 }
 
-/// Wait until startup finishes, at most `timeout`, and name what failed.
-pub(crate) fn wait_for_startup(
-    config: &Config,
-    init: InitSystem,
-    timeout: Duration,
-) -> Result<(Startup, Vec<String>)> {
-    match init {
-        InitSystem::Systemd => systemd_startup(&config.systemctl, timeout),
-        InitSystem::Openrc => openrc_startup(config, timeout),
-    }
-}
+type Waited = (bool, String, Vec<String>, Startup);
 
 /// `systemctl is-system-running --wait`: `running`, or failed units
 /// (`degraded`), or the emergency/rescue target (`maintenance`).
-fn systemd_startup(systemctl: &str, timeout: Duration) -> Result<(Startup, Vec<String>)> {
+fn systemd_startup(systemctl: &str, timeout: Duration) -> Result<Waited> {
     let mut child = Command::new(systemctl)
         .args(["is-system-running", "--wait"])
         .stdout(Stdio::piped())
@@ -216,30 +129,30 @@ fn systemd_startup(systemctl: &str, timeout: Duration) -> Result<(Startup, Vec<S
         .spawn()
         .with_context(|| format!("running '{systemctl} is-system-running --wait'"))?;
     let deadline = Instant::now() + timeout;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
-        }
+    while child.try_wait()?.is_none() {
         if Instant::now() >= deadline {
             child.kill().context("stopping 'systemctl is-system-running --wait'")?;
             child.wait().context("waiting for 'systemctl is-system-running --wait'")?;
-            return Ok((Startup::TimedOut, systemd_failed_units(systemctl)?));
+            return Ok((false, TIMED_OUT.to_string(), systemd_failed_units(systemctl)?, Startup::TimedOut));
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(POLL);
     }
     let mut state = String::new();
     if let Some(mut stdout) = child.stdout.take() {
         stdout.read_to_string(&mut state)?;
     }
+    let state = state.trim().to_string();
+    let failed = systemd_failed_units(systemctl)?;
     // Anything else (`stopping`, `offline`, `unknown`, ...) is a shutdown or
     // an unreachable systemd: no verdict on the boot.
-    let startup = match state.trim() {
-        "running" => return Ok((Startup::Running, Vec::new())),
-        state @ ("degraded" | "maintenance") => Startup::Failed(state.to_string()),
-        "" => Startup::Inconclusive("no answer".to_string()),
-        other => Startup::Inconclusive(other.to_string()),
+    let (finished, startup) = match state.as_str() {
+        "running" => (true, Startup::Running),
+        "degraded" => (true, Startup::Failed(state.clone())),
+        "maintenance" => (false, Startup::Failed(state.clone())),
+        "" => (false, Startup::Inconclusive("no answer".to_string())),
+        other => (false, Startup::Inconclusive(other.to_string())),
     };
-    Ok((startup, systemd_failed_units(systemctl)?))
+    Ok((finished, state, failed, startup))
 }
 
 fn systemd_failed_units(systemctl: &str) -> Result<Vec<String>> {
@@ -262,34 +175,34 @@ fn systemd_failed_units(systemctl: &str) -> Result<Vec<String>> {
 /// single-user runlevel. OpenRC's state directory holds the runlevel being
 /// entered (`softlevel`) and one entry per service in each state
 /// (`starting/`, `failed/`).
-fn openrc_startup(config: &Config, timeout: Duration) -> Result<(Startup, Vec<String>)> {
+fn openrc_startup(config: &Config, timeout: Duration) -> Result<Waited> {
     let dir = &config.openrc_dir;
     let deadline = Instant::now() + timeout;
     loop {
         let level = target_root::read_optional(&dir.join("softlevel"))?.unwrap_or_default();
-        match level.trim() {
-            "default" if target_root::dir_names(&dir.join("starting"))?.is_empty() && !openrc_running()? => break,
+        let level = level.trim().to_string();
+        match level.as_str() {
+            "default" if target_root::dir_names(&dir.join("starting"))?.is_empty() && !openrc_running()? => {
+                let failed = openrc_failed(config)?;
+                let startup = if failed.is_empty() {
+                    Startup::Running
+                } else {
+                    Startup::Failed("services failed".to_string())
+                };
+                return Ok((true, level, failed, startup));
+            }
             "single" => {
-                return Ok((
-                    Startup::Failed("single-user runlevel".to_string()),
-                    openrc_failed(config)?,
-                ))
+                return Ok((false, level, openrc_failed(config)?, Startup::Failed("single-user runlevel".to_string())))
             }
             "shutdown" | "reboot" => {
-                return Ok((Startup::Inconclusive(level.trim().to_string()), Vec::new()))
+                return Ok((false, level.clone(), openrc_failed(config)?, Startup::Inconclusive(level)))
             }
             _ => {}
         }
         if Instant::now() >= deadline {
-            return Ok((Startup::TimedOut, openrc_failed(config)?));
+            return Ok((false, TIMED_OUT.to_string(), openrc_failed(config)?, Startup::TimedOut));
         }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    let failed = openrc_failed(config)?;
-    if failed.is_empty() {
-        Ok((Startup::Running, failed))
-    } else {
-        Ok((Startup::Failed("services failed".to_string()), failed))
+        std::thread::sleep(POLL);
     }
 }
 
@@ -320,18 +233,14 @@ fn openrc_failed(config: &Config) -> Result<Vec<String>> {
             }
         }
     }
-    // rc-status exits non-zero when it lists a crashed daemon: its output is the answer.
+    // rc-status exits non-zero when it lists a crashed daemon: its output is
+    // the answer; a missing rc-status is an error.
     let out = Command::new(&config.rc_status)
         .arg("--crashed")
         .stderr(Stdio::null())
         .output()
         .with_context(|| format!("running '{} --crashed'", config.rc_status))?;
-    for name in String::from_utf8_lossy(&out.stdout).split_whitespace() {
-        if !failed.iter().any(|f| f == name) {
-            failed.push(format!("{name} (crashed)"));
-        }
-    }
-    failed.sort();
+    failed.extend(String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string));
     Ok(failed)
 }
 
@@ -351,4 +260,24 @@ fn openrc_running() -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Ask for a clean reboot without waiting for it.
+pub(crate) fn reboot(init: InitSystem, config: &Config) -> Result<()> {
+    let (program, args): (String, Vec<&str>) = match (&config.reboot, init) {
+        (Some(program), _) => (program.clone(), vec![]),
+        (None, InitSystem::Systemd) => (config.systemctl.clone(), vec!["--no-block", "reboot"]),
+        (None, InitSystem::Openrc) => {
+            // openrc-init is shut down with openrc-shutdown; busybox init
+            // (with an inittab) with reboot.
+            let pid1 = fs::read_to_string("/proc/1/comm").context("reading /proc/1/comm")?;
+            if pid1.trim() == "openrc-init" {
+                ("openrc-shutdown".to_string(), vec!["-r", "now"])
+            } else {
+                ("reboot".to_string(), vec![])
+            }
+        }
+    };
+    target_root::run(Command::new(&program).args(&args))?;
+    Ok(())
 }

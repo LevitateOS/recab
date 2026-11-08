@@ -12,10 +12,12 @@
 //! installed ESP (writes and reads entries, loader.conf and the boot
 //! selection); `store` keeps recab's state and audit log.
 
+pub mod carried;
 mod config;
 mod error;
 mod init;
 mod init_system;
+mod package;
 mod stage;
 mod state;
 mod store;
@@ -36,7 +38,8 @@ pub use error::{
     EXIT_CODE_PERMISSION, EXIT_CODE_STATE_OR_DETECTION, EXIT_CODE_TRIAL_FAILED,
 };
 pub use distro_profile::InitSystem;
-pub use init_system::InitSystemExt;
+pub use init_system::{crash_option, Health, InitSystemName};
+pub use package::{trial_service_link, RECAB_BIN, TRIAL_TIMEOUT_SECS};
 
 use error::{tagged_err, ErrorClass};
 use config::Config;
@@ -267,7 +270,7 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
 
 /// Set up the boot layout of a freshly installed system: the target's
 /// systemd-boot, the entries (both slots', or the one root's), the installed
-/// kernel, loader.conf, for A/B recab's state and the trial service, and
+/// kernel, loader.conf, for A/B recab's state, and
 /// systemd-boot's firmware variables pointing at the installed entry.
 pub fn init(request: &InitRequest) -> Result<()> {
     require_root("init")?;
@@ -333,7 +336,14 @@ pub fn rollback() -> Result<()> {
 pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     let config = Config::running()?;
     let init = init_system::running_profile(&config)?.init;
-    let (startup, failed) = init_system::wait_for_startup(&config, init, timeout)?;
+    // Every image runs the trial service: with no recab state and no one-shot
+    // boot in the firmware, this is no trial (a live or mutable system).
+    let firmware = SystemdBoot::new(&config);
+    if !Store::new(&config).exists()? && firmware.firmware_trial()? != Some(true) {
+        return Ok(TrialOutcome::NotATrial);
+    }
+    let health = init_system::wait_finished(&config, init, timeout)?;
+    let (startup, failed) = (health.startup, health.failed);
     let problem = match &startup {
         Startup::Running | Startup::Inconclusive(_) => String::new(),
         Startup::Failed(state) => format!("finished starting in state '{state}'"),
@@ -346,7 +356,6 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     };
     let fail = |message: String| tagged_err(ErrorClass::TrialFailed, message);
 
-    let firmware = SystemdBoot::new(&config);
     // The ESP or /var may be what broke; the firmware still knows whether
     // this boot was a one-shot trial, and its default is the fallback.
     let sys = System::open(config.clone(), Some("trial"));
@@ -414,17 +423,23 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     )))
 }
 
-/// Write and enable the trial service of the system under `root` (`/` for
-/// this system, or an install target), for the init system its os-release
-/// names. With `package`, only write that init system's service file into
-/// `root`, a package tree without an os-release, and enable nothing.
+/// How startup of the running system ended, waiting at most `timeout` for
+/// it to finish. Only reads; needs no A/B layout or state.
+pub fn health(timeout: Duration) -> Result<Health> {
+    let config = Config::running()?;
+    let init = init_system::running_profile(&config)?.init;
+    init_system::wait_finished(&config, init, timeout)
+}
+
+/// Write recab's package contents into the tree `root` (what Recipe
+/// packages): the trial service for `init` (else the init system of `root`'s
+/// os-release), enabled, and the carried-state list.
 pub fn install_unit(root: &Path, package: Option<InitSystem>) -> Result<()> {
-    if let Some(init) = package {
-        return init.write_trial_service(root);
-    }
-    let init = init_system::installed_profile(root)?.init;
-    init.write_trial_service(root)?;
-    init.enable_trial_service(root)
+    let init = match package {
+        Some(init) => init,
+        None => init_system::installed_profile(root)?.init,
+    };
+    package::write(root, init)
 }
 
 fn require_root(operation: &str) -> Result<()> {
@@ -477,8 +492,8 @@ fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentSt
 
     let mut next = stamped(&transition)?;
     annotate(&mut next);
-    let trial_options = init_system::running_profile(&sys.config)?.init.trial_options();
-    match sys.backend.apply(&sys.boot, transition.boot, trial_options) {
+    let init = init_system::running_profile(&sys.config)?.init;
+    match sys.backend.apply(&sys.boot, transition.boot, init) {
         Ok(()) => {}
         Err(ApplyError::Untouched(cause)) => {
             return Err(cause.context(format!("{name} aborted; the boot selection is unchanged")));

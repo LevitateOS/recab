@@ -1,0 +1,36 @@
+# Machine state `recab stage` carries from the running system into the new
+# slot. Packaged by `recab install-unit`; `stage` reads the list of the image it
+# writes, so an image can add or drop entries. Paths are relative to /.
+#   file PATH      copied over the image's (skipped when the machine has none)
+#   dir PATH       its entries copied over the image's directory; the image's
+#                  other entries stay
+#   prefix PATH    every entry of the directory whose name starts so
+#   accounts PATH  merged by account name with the image's; the machine's win
+#
+# Identity, locale and time.
+file etc/hostname
+file etc/hosts
+file etc/machine-id
+file etc/subuid
+file etc/subgid
+file etc/localtime
+file etc/locale.conf
+file etc/vconsole.conf
+file etc/adjtime
+accounts etc/passwd
+accounts etc/group
+accounts etc/shadow
+accounts etc/gshadow
+prefix etc/ssh/ssh_host_
+# The services and init configuration the machine set.
+dir etc/systemd/system
+dir etc/runlevels
+dir etc/conf.d
+# Saved wired and WiFi networks.
+dir etc/NetworkManager/system-connections
+dir etc/wpa_supplicant
+file etc/network/interfaces
+# Local privilege rules: the drop-in directories (the main policy file
+# comes from the image).
+dir etc/sudoers.d
+dir etc/doas.d

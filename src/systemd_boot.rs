@@ -16,7 +16,10 @@ use crate::error::{tagged_err, ErrorClass};
 use distro_profile::os_release_value;
 use crate::state::{BootChange, Selection};
 use crate::store::{copy_durable, read_optional, sync_dir, write_durable};
+use crate::init_system::crash_option;
 use crate::Slot;
+use distro_profile::InitSystem;
+use recinit::live::FAIL_REBOOT_OPTION;
 
 /// systemd-boot's vendor GUID, which names its EFI variables.
 const LOADER_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
@@ -42,10 +45,20 @@ pub(crate) const PANIC_OPTION: &str = "panic=10";
 /// and remounted read-write by the installed system's fstab.
 const ROOT_OPTIONS: &[&str] = &["ro", "rootwait"];
 
-/// Every kernel option any init system uses as a trial option (see
-/// `InitSystemExt::trial_options`): an entry that becomes the default loses
-/// all of them.
-const ALL_TRIAL_OPTIONS: &[&str] = &["rd.emergency=reboot", "systemd.crash_action=reboot"];
+/// The kernel options a trial boot's entry carries until it is committed: the
+/// initramfs's fail-reboot word when the entry boots through one (a root that
+/// cannot mount reboots instead of opening a shell), and the init's crash
+/// option. A failure the kernel sees (no initramfs, a dying init) panics,
+/// which `panic=` reboots.
+fn trial_options(content: &str, init: InitSystem) -> Vec<&'static str> {
+    let initrd = content.lines().any(|line| line.split_whitespace().next() == Some("initrd"));
+    initrd.then_some(FAIL_REBOOT_OPTION).into_iter().chain(crash_option(init)).collect()
+}
+
+/// Any option some trial carries: what a committed entry loses.
+fn is_trial_option(option: &str) -> bool {
+    option == FAIL_REBOOT_OPTION || InitSystem::ALL.iter().any(|init| crash_option(*init) == Some(option))
+}
 
 /// EFI variable attributes: non-volatile, boot-service and runtime access.
 const EFI_VARIABLE_ATTRIBUTES: u32 = 0x7;
@@ -218,16 +231,16 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
         Ok(())
     }
 
-    /// Write `change`. A one-shot entry first gets `trial_options`. For a
+    /// Write `change`. A one-shot entry first gets the trial options. For a
     /// new default, a pending one-shot is cleared first (so the riskier boot
     /// is the one dropped), the entry loses the trial options, then
     /// loader.conf and the firmware variable name it.
-    pub fn apply(&self, boot: &Boot, change: BootChange, trial_options: &[&str]) -> Result<(), ApplyError> {
+    pub fn apply(&self, boot: &Boot, change: BootChange, init: InitSystem) -> Result<(), ApplyError> {
         match change {
             BootChange::None => Ok(()),
             BootChange::OneShot(slot) => {
                 let entry = self.entry_for(boot, slot).map_err(ApplyError::Untouched)?;
-                self.set_trial_options(&entry, trial_options).map_err(ApplyError::Untouched)?;
+                self.set_trial_options(&entry, Some(init)).map_err(ApplyError::Untouched)?;
                 self.set_loader_efivar("LoaderEntryOneShot", Some(&entry)).map_err(ApplyError::Untouched)
             }
             BootChange::Default(slot) => {
@@ -248,7 +261,7 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
                         ApplyError::Untouched(cause)
                     }
                 };
-                self.set_trial_options(&entry, &[]).map_err(failed)?;
+                self.set_trial_options(&entry, None).map_err(failed)?;
                 let before = read_optional(&self.loader_conf).map_err(failed)?;
                 let content = loader_with_default(before.as_deref(), &entry);
                 write_durable(&self.loader_conf, content.as_bytes())
@@ -299,12 +312,13 @@ Write a system into slot {slot} with 'recab stage' first."
         Ok(None)
     }
 
-    /// Make `trial_options` the entry's only trial options (none: a default).
-    fn set_trial_options(&self, entry: &str, trial_options: &[&str]) -> Result<()> {
+    /// Give the entry a trial's options for `trial`'s init, or none (a default).
+    fn set_trial_options(&self, entry: &str, trial: Option<InitSystem>) -> Result<()> {
         let content = self.entry_content(entry)?;
+        let wanted = trial.map(|init| trial_options(&content, init)).unwrap_or_default();
         let updated = entry_with_options(&content, |options| {
-            options.retain(|o| !ALL_TRIAL_OPTIONS.contains(&o.as_str()));
-            options.extend(trial_options.iter().map(|o| o.to_string()));
+            options.retain(|o| !is_trial_option(o));
+            options.extend(wanted.iter().map(|o| o.to_string()));
         });
         if updated == content {
             return Ok(());
@@ -366,14 +380,14 @@ Write a system into slot {slot} with 'recab stage' first."
 
     /// Install the slot's kernel (and initrd) in its ESP directory and point
     /// its entry at them. The entry gets `panic=` and, the slot being
-    /// uncommitted, `trial_options`.
+    /// uncommitted, the trial options for `init`.
     pub fn install_slot_boot_files(
         &self,
         boot: &Boot,
         slot: Slot,
         kernel: &Path,
         initrd: Option<&Path>,
-        trial_options: &[&str],
+        init: InitSystem,
     ) -> Result<()> {
         let entry = self.entry_for(boot, slot)?;
         let content = self.entry_content(&entry)?;
@@ -393,9 +407,10 @@ Write a system into slot {slot} with 'recab stage' first."
             if !options.iter().any(|o| o.starts_with(PANIC_KEY)) {
                 options.push(PANIC_OPTION.to_string());
             }
-            options.retain(|o| !ALL_TRIAL_OPTIONS.contains(&o.as_str()));
-            options.extend(trial_options.iter().map(|o| o.to_string()));
+            options.retain(|o| !is_trial_option(o));
         });
+        let wanted = trial_options(&content, init);
+        let content = entry_with_options(&content, |options| options.extend(wanted.iter().map(|o| o.to_string())));
         let path = self.entries_dir.join(&entry);
         write_durable(&path, content.as_bytes())
             .with_context(|| format!("writing '{}'", path.display()))
@@ -620,7 +635,7 @@ Expected matching root=... options in '{}' and '{}'.",
                 root: root.map(|r| r.to_string()),
                 device,
                 bootable: self.missing_boot_file(&entry)?.is_none(),
-                trial: options.iter().any(|o| ALL_TRIAL_OPTIONS.contains(&o.as_str())),
+                trial: options.iter().any(|o| is_trial_option(o)),
             });
         }
         Ok(views)
