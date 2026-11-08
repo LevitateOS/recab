@@ -12,7 +12,7 @@
 //! installed ESP (writes and reads entries, loader.conf and the boot
 //! selection); `store` keeps recab's state and audit log.
 
-mod carried;
+mod carry;
 mod efivars;
 mod entry;
 #[cfg(feature = "contracts")]
@@ -44,7 +44,7 @@ pub use init_system::{Health, TRIAL_TIMEOUT_SECS};
 pub use state::Startup;
 pub use package::{trial_service_link, RECAB_BIN};
 pub use state::{Slot, TrialRecord};
-pub use status::{status, SlotView, Status};
+pub use status::{status, Action, ActionView, After, SlotView, Status, Verdict, STATUS_SCHEMA_VERSION};
 pub use trial::{trial, TrialOutcome};
 pub use entry::{entry_name, layout_name, ENTRIES_DIR};
 
@@ -71,24 +71,16 @@ pub fn init(request: &InitRequest) -> Result<()> {
 /// `change_flavour`.
 pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     let sys = System::locked("stage")?;
-    // A medium stays mounted (read-only) until the slot is written.
-    let (_media, request) = match source {
-        StageSource::Files(request) => (None, request.clone()),
-        StageSource::Media(media) => stage::open_media(&sys.target, media)?,
-    };
     let transition = plan(Request::Stage, &sys.boot.selection, &sys.state)?.expect("a stage always writes the slot");
-    let slot = sys.boot.selection.active.other();
-    let init = sys.target.init()?;
+    let slot = transition.operation_slot();
     // Stage resets stale firmware variables before it writes the slot.
     sys.backend.can_change()?;
-    let inputs = stage::check_inputs(&sys.backend, &sys.boot, slot, &request)?;
-    let partition = stage::check_target(&sys.target, &sys.backend, &sys.boot, slot, &inputs)?;
-    stage::check_flavour(&sys.target, &inputs, change_flavour)?;
+    let staged = stage::check(&sys.target, &sys.backend, &sys.boot, slot, source, change_flavour)?;
     // Recorded before the slot is touched: from here its old system is gone,
     // so nothing may roll back to it, even if the write fails.
     sys.apply(&transition)?;
     let write = sys.backend.begin_slot_write(&sys.boot, slot)?;
-    stage::write_slot(&sys.target, write, slot, &request, &partition, init)
+    stage::write(&sys.target, staged, write)
 }
 
 /// Schedule one trial boot of the inactive `slot`.
@@ -110,6 +102,13 @@ pub fn rollback() -> Result<()> {
 /// it to finish. Only reads; needs no A/B layout or state.
 pub fn health(timeout: Duration) -> Result<Health> {
     init_system::health(&Target::running()?, timeout)
+}
+
+/// Record the baseline of the image tree `root`: what it ships at the paths
+/// its carried list names.
+pub fn baseline(root: &Path) -> Result<()> {
+    let list = carry::read_list(root)?;
+    carry::Baseline::write(root, &list)
 }
 
 /// Write recab's package contents for `init` into the tree `root` (what

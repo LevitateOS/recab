@@ -23,6 +23,7 @@ pub fn export() -> Result<Contract> {
         .collect();
     c.constant("ERROR_CLASSES", "Each error class's exit status and the tag its text message starts with.", &classes)?;
     c.constant("STATE_FILE", "Where recab keeps its state on an installed system.", &crate::state_file())?;
+    c.constant("AUDIT_FILE", "Where recab keeps its audit log (JSON lines) on an installed system.", &crate::target::audit_file())?;
     c.constant("TRIAL_TIMEOUT_SECS", "How long a trial waits for startup to finish.", &crate::TRIAL_TIMEOUT_SECS)?;
     Ok(c)
 }

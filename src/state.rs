@@ -209,7 +209,7 @@ impl Operation {
         }
     }
 
-    fn slot(self) -> Slot {
+    pub fn slot(self) -> Slot {
         match self {
             Operation::Init(slot)
             | Operation::Stage(slot)
@@ -242,6 +242,13 @@ pub(crate) struct Transition {
     pub next: PersistentState,
     /// The boot selection to write first, if it changes.
     pub boot: Option<BootChange>,
+}
+
+impl Transition {
+    /// The slot the transition is about.
+    pub fn operation_slot(&self) -> Slot {
+        self.operation.slot()
+    }
 }
 
 /// The transition `request` makes from `state` and `sel`, `None` when the

@@ -233,25 +233,17 @@ impl SystemdBoot {
             .with_context(|| format!("writing '{}'", path.display()))
     }
 
-    /// The partition the slot's entry names by `root=PARTUUID=`, and that
-    /// PARTUUID. The entries are the record of which partition is which
-    /// slot; the running root is never returned for the other slot.
-    pub fn slot_device(&self, boot: &Boot, slot: Slot) -> Result<(PathBuf, String)> {
+    /// The PARTUUID the slot's entry names its root by: the entries are the
+    /// record of which partition is which slot.
+    pub fn slot_partuuid(&self, boot: &Boot, slot: Slot) -> Result<String> {
         let id = entry_name(&boot.prefix, slot);
         let entry = self.entry(&boot.prefix, Some(slot))?.ok_or_else(|| self.missing_entry(&id))?;
-        let partuuid = entry.root_partuuid().ok_or_else(|| {
+        entry.root_partuuid().ok_or_else(|| {
             refuse(format!(
-                "entry '{id}' names its root as '{}', not by root=PARTUUID=, which formatting does not change",
+                "entry '{id}' names its root as '{}', not by root=PARTUUID=",
                 entry.root_text().unwrap_or_default()
             ))
-        })?;
-        if partuuid == self.running_root()? {
-            return Err(refuse(format!("entry '{id}' names the running root (PARTUUID={partuuid}); refusing to overwrite it")));
-        }
-        let device = target_root::device_with_tag("PARTUUID", &partuuid)?
-            .ok_or_else(|| refuse(format!("entry '{id}' names root PARTUUID={partuuid}, which is not present")))?;
-        let device = target_root::canonical(&device)?.unwrap_or(device);
-        Ok((device, partuuid))
+        })
     }
 
     /// The slot's kernel directory on the ESP.
@@ -344,7 +336,7 @@ impl SystemdBoot {
 
     /// The PARTUUID of the root of the system recab reads: the kernel command
     /// line's `root=`, or the partition mounted at an install target.
-    fn running_root(&self) -> Result<String> {
+    pub fn running_root(&self) -> Result<String> {
         match self.target.kind {
             Kind::Running => {
                 let path = self.target.cmdline_path();

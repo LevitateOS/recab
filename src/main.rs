@@ -111,6 +111,16 @@ enum Command {
         timeout: u64,
     },
 
+    /// Record what the image extracted under ROOT ships at the paths its
+    /// carried list names (usr/lib/recab/baseline), so the first update of
+    /// the slot carries only the machine's changes. Run right after the
+    /// image is extracted, before anything personalizes it (recsetup does).
+    Baseline {
+        /// The image tree.
+        #[arg(long)]
+        root: PathBuf,
+    },
+
     /// Write recab's package contents into a tree: the trial service
     /// (systemd unit or OpenRC service), enabled, and the list of machine
     /// state `stage` carries.
@@ -182,6 +192,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 print_health(&health, Duration::from_secs(timeout));
             }
         }
+        Command::Baseline { root } => recab::baseline(&root)?,
         Command::InstallUnit { root, init, bin } => recab::install_unit(&root, init, &bin)?,
     }
     Ok(())
@@ -208,6 +219,9 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let Status {
+        schema_version: _,
+        scheduled_trial,
+        actions,
         active_slot,
         inactive_slot,
         trial_pending,
@@ -228,6 +242,7 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
     println!("rollback: {}", slot_text(*rollback_slot));
     println!("trial_pending: {}", yes_no(*trial_pending));
     println!("next_boot: {}", slot_text(*next_boot));
+    println!("scheduled_trial: {}", slot_text(*scheduled_trial));
     if let Some(trial) = last_trial {
         let outcome = if trial.committed { "committed" } else { "abandoned" };
         println!("last_trial: slot {} {outcome} ({})", trial.slot, trial.detail);
@@ -241,6 +256,10 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
             yes_no(*bootable),
             yes_no(*trial),
         );
+    }
+    for recab::ActionView { action, slot, verdict, reason, .. } in actions {
+        let reason = reason.as_deref().map(|r| format!(": {r}")).unwrap_or_default();
+        println!("{action:?} {slot}: {verdict:?}{reason}");
     }
     Ok(())
 }

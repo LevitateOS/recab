@@ -1,7 +1,7 @@
 //! What recab's package carries besides the binary, written by `recab
 //! install-unit --init <init>` into the tree Recipe packages: the trial
 //! service for the image's init system, enabled, and the list of machine
-//! state `stage` carries ([`crate::carried`]). Every image with recab runs
+//! state `stage` carries ([`crate::carry`]). Every image with recab runs
 //! the trial service; with no trial pending it exits at once.
 
 use anyhow::{Context, Result};
@@ -10,7 +10,7 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use crate::carried::CARRIED_LIST;
+use crate::carry::CARRIED_LIST;
 use crate::error::refuse;
 
 /// Where the package installs recab, unless the packager says otherwise.

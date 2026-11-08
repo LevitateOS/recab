@@ -1,36 +1,62 @@
 # Machine state `recab stage` carries from the running system into the new
 # slot. Packaged by `recab install-unit`; `stage` reads the list of the image it
 # writes, so an image can add or drop entries. Paths are relative to /.
-#   file PATH      copied over the image's (skipped when the machine has none)
-#   dir PATH       its entries copied over the image's directory; the image's
-#                  other entries stay
+#
+# Each image records what it ships at these paths (usr/lib/recab/baseline). An
+# update keeps what the machine changed relative to that: a file it edited,
+# added or chmodded wins, one it removed stays removed, everything else comes
+# from the new image.
+#   file PATH      one file
+#   dir PATH       every entry under a directory, one by one
 #   prefix PATH    every entry of the directory whose name starts so
-#   accounts PATH  merged by account name with the image's; the machine's win
+#   accounts PATH  an account file, merged by account name with the image's
+#                  (an id the new image gives another name is refused)
+#   fstab PATH     the fstab, its root line pointed at the new slot
 #
 # Identity, locale and time.
 file etc/hostname
 file etc/hosts
 file etc/machine-id
+file etc/machine-info
 file etc/subuid
 file etc/subgid
 file etc/localtime
+file etc/timezone
 file etc/locale.conf
 file etc/vconsole.conf
 file etc/adjtime
+file etc/environment
 accounts etc/passwd
 accounts etc/group
 accounts etc/shadow
 accounts etc/gshadow
 prefix etc/ssh/ssh_host_
-# The services and init configuration the machine set.
+dir etc/ssh/sshd_config.d
+fstab etc/fstab
+file etc/crypttab
+# root's home (the other homes live on /var).
+dir root
+# The services, init and kernel configuration the machine set.
 dir etc/systemd/system
+dir etc/systemd/network
 dir etc/runlevels
 dir etc/conf.d
+dir etc/init.d
+dir etc/local.d
+file etc/inittab
+dir etc/sysctl.d
+dir etc/modprobe.d
+dir etc/modules-load.d
+dir etc/udev/rules.d
+dir etc/tmpfiles.d
+dir etc/X11/xorg.conf.d
 # Saved wired and WiFi networks.
 dir etc/NetworkManager/system-connections
+dir etc/NetworkManager/conf.d
 dir etc/wpa_supplicant
 file etc/network/interfaces
-# Local privilege rules: the drop-in directories (the main policy file
-# comes from the image).
+# Privilege rules (sudo's or doas's, whichever the image has).
+file etc/sudoers
 dir etc/sudoers.d
+file etc/doas.conf
 dir etc/doas.d

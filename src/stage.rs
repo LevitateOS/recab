@@ -1,35 +1,31 @@
-//! `recab stage`: write a prebuilt system into the inactive slot.
-//!
-//! The slot's partition is the one its boot entry's `root=` names (written
-//! at install time). Staging makes the slot unbootable first (its kernel
-//! goes), then formats and fills the partition, and installs the kernel and
-//! entry last, so an interrupted stage never leaves a half-written slot
-//! bootable.
+//! `recab stage`: write a prebuilt system into the inactive slot. Every
+//! check runs first ([`check`]) and yields a [`StagePlan`]; only [`write`]
+//! changes anything. It makes the slot unbootable (its kernel goes), formats
+//! and fills the partition, carries the machine's state, and installs the
+//! kernel and entry last, so an interrupted stage never leaves a half-written
+//! slot bootable.
 
-use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use anyhow::{Context, Result};
+use distro_profile::{os_release_fact, os_release_value, Flavour, InitSystem};
 use std::fs;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::target::Target;
-use crate::carried::{self, Carry};
-use crate::systemd_boot::{Boot, SlotWrite, SystemdBoot};
+use crate::carry::{self, fstab_for_slot, merge_accounts, Baseline, Carry};
+use crate::error::{classified, refuse, ErrorClass};
 use crate::state::Slot;
-use crate::error::refuse;
-use distro_profile::{Flavour, InitSystem};
+use crate::systemd_boot::{Boot, SlotWrite, SystemdBoot};
+use crate::target::Target;
 use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
 use recpart::types::Role;
-use target_root::ErofsImage;
 
 /// The prebuilt system `stage` writes: files, or a release medium holding them.
 #[derive(Debug, Clone)]
 pub enum StageSource {
     Files(StageRequest),
     /// A release medium (its device, or where it is mounted): the rootfs,
-    /// kernel and, when it carries one, the installed initramfs at the live
-    /// protocol's paths.
+    /// kernel and installed initramfs at the live protocol's paths.
     Media(PathBuf),
 }
 
@@ -42,20 +38,104 @@ pub struct StageRequest {
     pub initrd: Option<PathBuf>,
 }
 
-/// The slot's role in the disk layout, which gives its filesystem and label.
-fn slot_role(slot: Slot) -> Role {
-    match slot {
-        Slot::A => Role::RootA,
-        Slot::B => Role::RootB,
-    }
+/// Where the fstab is, when the image's list does not say.
+const FSTAB: &str = "etc/fstab";
+
+/// Everything a stage writes, checked: nothing has changed yet.
+pub(crate) struct StagePlan {
+    slot: Slot,
+    device: PathBuf,
+    rootfs: PathBuf,
+    kernel: PathBuf,
+    initrd: Option<PathBuf>,
+    /// The image's carried list, and the running slot's baseline.
+    list: Vec<Carry>,
+    baseline: Option<Baseline>,
+    /// Files written into the new slot as prepared: merged account files
+    /// and the fstab, with their mode.
+    prepared: Vec<(String, String, u32)>,
+    /// The image's init system (the running system's).
+    init: InitSystem,
+    /// The release medium, mounted until the slot is written.
+    _medium: Option<Mounted>,
 }
 
-/// A release medium's system: the rootfs, kernel and, when the medium carries
-/// one, the installed initramfs, at the live protocol's paths. A block device
-/// is mounted read-only under the stage directory, and stays mounted while
-/// the returned guard lives; a directory is taken as the mounted medium.
-pub(crate) fn open_media(target: &Target, media: &Path) -> Result<(Option<Mounted>, StageRequest)> {
-    use std::os::unix::fs::FileTypeExt;
+/// Check a stage of the inactive `slot` from `source`: the inputs, the
+/// slot's partition, the image itself (its distro, init and flavour, its
+/// carried list and account files), the running fstab, and that the kernel
+/// can read EROFS. A refusal here has changed nothing (exit 21).
+pub(crate) fn check(
+    target: &Target,
+    backend: &SystemdBoot,
+    boot: &Boot,
+    slot: Slot,
+    source: &StageSource,
+    change_flavour: bool,
+) -> Result<StagePlan> {
+    let (medium, request) = match source {
+        StageSource::Files(request) => (None, request.clone()),
+        StageSource::Media(media) => open_media(target, media)?,
+    };
+    let rootfs = target_root::erofs_image(&request.rootfs)
+        .map_err(|err| refuse(format!("rootfs image: {err}")))?
+        .map_err(|why| {
+            refuse(format!(
+                "rootfs '{}' is not an EROFS image ({why}); pass the system's .erofs image, or the partition holding it",
+                request.rootfs.display()
+            ))
+        })?;
+    let is_partition = rootfs.rdev.is_some();
+    let (kernel, initrd) = check_files(backend, boot, slot, &request)?;
+    let (device, partuuid) = check_partition(target, backend, boot, slot, &rootfs)?;
+
+    let filesystems = target_root::read_optional(&target.proc_dir.join("filesystems"))?.unwrap_or_default();
+    if !filesystems.split_whitespace().any(|fs| fs == "erofs") {
+        return Err(refuse("the running kernel cannot read EROFS images (no erofs in /proc/filesystems)"));
+    }
+
+    // The image, read once, read-only.
+    let point = target.stage_mount("image");
+    fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
+    let options = if is_partition { "ro" } else { "ro,loop" };
+    let mounted = Mounted::new(target, &["-t", "erofs", "-o", options], &rootfs.path, &point)?;
+    let image = read_image(target, &point, &rootfs.path, change_flavour);
+    mounted.unmount()?;
+    let image = image?;
+
+    let mut prepared = Vec::new();
+    for (rel, text, mode) in &image.accounts {
+        let machine = target_root::read_optional(&target.root.join(rel))?;
+        let merged = match machine {
+            Some(machine) => account_merge(rel, text, &machine)?,
+            None => text.clone(),
+        };
+        prepared.push((rel.clone(), merged, *mode));
+    }
+    let fstab = image.list.iter().find_map(|c| matches!(c, Carry::Fstab(_)).then(|| c.path().to_string()));
+    let fstab = fstab.unwrap_or_else(|| FSTAB.to_string());
+    let machine_fstab = fs::read_to_string(target.root.join(&fstab))
+        .with_context(|| format!("reading '{}'", target.root.join(&fstab).display()))?;
+    let role = slot_role(slot);
+    prepared.push((fstab, fstab_for_slot(&machine_fstab, &partuuid, role.filesystem().as_str())?, 0o644));
+
+    Ok(StagePlan {
+        slot,
+        device,
+        rootfs: rootfs.path,
+        kernel,
+        initrd,
+        list: image.list,
+        baseline: Baseline::read(&target.root)?,
+        prepared,
+        init: image.init,
+        _medium: medium,
+    })
+}
+
+/// A release medium's system: the rootfs, kernel and installed initramfs at
+/// the live protocol's paths. A block device is mounted read-only under the
+/// stage directory; a directory is taken as the mounted medium.
+fn open_media(target: &Target, media: &Path) -> Result<(Option<Mounted>, StageRequest)> {
     let meta = fs::metadata(media).map_err(|err| refuse(format!("release medium '{}': {err}", media.display())))?;
     let (mounted, root) = if meta.is_dir() {
         (None, media.to_path_buf())
@@ -64,129 +144,61 @@ pub(crate) fn open_media(target: &Target, media: &Path) -> Result<(Option<Mounte
         fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
         (Some(Mounted::new(target, &["-o", "ro"], media, &point)?), point)
     } else {
-        return Err(refuse(format!(
-            "release medium '{}' is neither a block device nor a directory",
-            media.display()
-        )));
+        return Err(refuse(format!("release medium '{}' is neither a block device nor a directory", media.display())));
     };
+    // Every release medium carries the installed initramfs; one without it
+    // is not a release medium.
     let initrd = root.join(INITRAMFS_INSTALLED_ISO_PATH);
-    let request = StageRequest {
-        rootfs: root.join(ROOTFS_ISO_PATH),
-        kernel: root.join(KERNEL_ISO_PATH),
-        initrd: target_root::exists(&initrd)?.then_some(initrd),
-    };
+    if !target_root::exists(&initrd)? {
+        return Err(refuse(format!("release medium '{}' has no installed initramfs ('{}')", media.display(), initrd.display())));
+    }
+    let request =
+        StageRequest { rootfs: root.join(ROOTFS_ISO_PATH), kernel: root.join(KERNEL_ISO_PATH), initrd: Some(initrd) };
     Ok((mounted, request))
 }
 
-/// The inputs a stage reads, checked before anything is changed: the
-/// rootfs image, canonical.
-pub(crate) struct Inputs {
-    rootfs: ErofsImage,
-}
-
-/// Refuse, before anything is changed, an image of another flavour than the
-/// running system's: the base system staged onto a desktop install would
-/// turn it back into the base system, and the reverse. `change_flavour`
-/// stages it anyway. Each flavour is its os-release's `REC_FLAVOUR`; the
-/// image's is read from the image, mounted read-only under the stage
-/// directory.
-pub(crate) fn check_flavour(target: &Target, inputs: &Inputs, change_flavour: bool) -> Result<()> {
-    if change_flavour {
-        return Ok(());
-    }
-    let running = target.flavour()?;
-    let image = &inputs.rootfs.path;
-    let point = target.stage_mount("image");
-    fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
-    let options = if inputs.rootfs.rdev.is_some() { "ro" } else { "ro,loop" };
-    let mounted = Mounted::new(target, &["-t", "erofs", "-o", options], image, &point)?;
-    let text = target_root::os_release(&point);
-    mounted.unmount()?;
-    let text = text?.ok_or_else(|| refuse(format!("rootfs image '{}' has no os-release", image.display())))?;
-    let staged = Flavour::from_os_release(&text)
-        .map_err(|err| refuse(format!("rootfs image '{}': {err}", image.display())))?;
-    if staged != running {
-        return Err(refuse(format!(
-            "rootfs image '{}' is the {staged} system and this machine runs the {running} system: staging it \
-would turn this machine into the {staged} system. Stage a {running} image (the rootfs of a {running} ISO), \
-or pass --change-flavour to change this machine to the {staged} system",
-            image.display()
-        )));
-    }
-    Ok(())
-}
-
-/// The partition a stage will write, checked before anything is changed.
-pub(crate) struct SlotPartition {
-    device: PathBuf,
-    /// Its PARTUUID, which the new system's fstab names its root by.
-    partuuid: String,
-}
-
-/// Check the inputs without changing anything: an EROFS rootfs image (a
-/// file or a partition), a kernel and initrd, and none of them inside the
-/// slot's kernel directory, which stage removes first.
-pub(crate) fn check_inputs(
-    backend: &SystemdBoot,
-    boot: &Boot,
-    slot: Slot,
-    request: &StageRequest,
-) -> Result<Inputs> {
-    let rootfs = &request.rootfs;
-    // The rootfs may be an image file or a partition holding the image.
-    let image = target_root::erofs_image(rootfs)
-        .map_err(|err| refuse(format!("rootfs image: {err}")))?
-        .map_err(|why| {
-            refuse(format!(
-                "rootfs '{}' is not an EROFS image ({why}); pass the system's .erofs image, or the partition holding it",
-                rootfs.display()
-            ))
-        })?;
-    for (what, path) in [
-        ("kernel", Some(&request.kernel)),
-        ("initrd", request.initrd.as_ref()),
-    ] {
-        if let Some(path) = path {
-            if !target_root::metadata(path)?.is_some_and(|meta| meta.is_file()) {
-                return Err(refuse(format!("{what} '{}' is not a file", path.display())));
-            }
+/// The kernel and initrd, canonical: files, and none of them (nor the
+/// rootfs) inside the slot's kernel directory, which the write removes.
+fn check_files(backend: &SystemdBoot, boot: &Boot, slot: Slot, request: &StageRequest) -> Result<(PathBuf, Option<PathBuf>)> {
+    let inputs = [("rootfs", Some(&request.rootfs)), ("kernel", Some(&request.kernel)), ("initrd", request.initrd.as_ref())];
+    let slot_dir = target_root::canonical(&backend.kernel_dir(boot, slot))?;
+    let mut canonical = Vec::new();
+    for (what, path) in inputs {
+        let Some(path) = path else { continue };
+        if what != "rootfs" && !target_root::metadata(path)?.is_some_and(|meta| meta.is_file()) {
+            return Err(refuse(format!("{what} '{}' is not a file", path.display())));
         }
-    }
-    // Stage removes this directory before it installs the kernel and initrd.
-    let slot_dir = backend.kernel_dir(boot, slot);
-    if let Some(slot_dir) = target_root::canonical(&slot_dir)? {
-        for (what, path) in [
-            ("rootfs", Some(rootfs)),
-            ("kernel", Some(&request.kernel)),
-            ("initrd", request.initrd.as_ref()),
-        ] {
-            let Some(path) = path else { continue };
-            if target_root::canonical(path)?.is_some_and(|p| p.starts_with(&slot_dir)) {
-                return Err(refuse(format!(
-                    "{what} '{}' is inside slot {slot}'s kernel directory '{}', which stage removes before installing the new kernel; \
+        let resolved = target_root::canonical(path)?.unwrap_or_else(|| path.clone());
+        if slot_dir.as_ref().is_some_and(|dir| resolved.starts_with(dir)) {
+            return Err(refuse(format!(
+                "{what} '{}' is inside slot {slot}'s kernel directory, which stage removes before installing the new kernel; \
 copy it elsewhere first (for example to /var/tmp) and pass that path",
-                    path.display(),
-                    slot_dir.display()
-                )));
-            }
+                path.display()
+            )));
         }
+        canonical.push((what, resolved));
     }
-    Ok(Inputs { rootfs: image })
+    let find = |name: &str| canonical.iter().find(|(what, _)| *what == name).map(|(_, p)| p.clone());
+    Ok((find("kernel").expect("checked above"), find("initrd")))
 }
 
-/// Check the slot's partition without changing anything: named by
-/// PARTUUID, not the running root, not mounted, not the rootfs itself, and
-/// large enough for the rootfs image. The rootfs partition, if it is one,
-/// must not be mounted either.
-pub(crate) fn check_target(
+/// The slot's partition, by the PARTUUID its entry names: present, not the
+/// running root, not mounted, not the rootfs itself, and large enough for
+/// the image; a rootfs partition must not be mounted either.
+fn check_partition(
     target: &Target,
     backend: &SystemdBoot,
     boot: &Boot,
     slot: Slot,
-    inputs: &Inputs,
-) -> Result<SlotPartition> {
-    use std::os::unix::fs::MetadataExt;
-    let (device, partuuid) = backend.slot_device(boot, slot)?;
+    rootfs: &target_root::ErofsImage,
+) -> Result<(PathBuf, String)> {
+    let partuuid = backend.slot_partuuid(boot, slot)?;
+    if partuuid == backend.running_root()? {
+        return Err(refuse(format!("slot {slot}'s entry names the running root (PARTUUID={partuuid}); refusing to overwrite it")));
+    }
+    let device = target_root::device_with_tag("PARTUUID", &partuuid)?
+        .ok_or_else(|| refuse(format!("slot {slot}'s entry names root PARTUUID={partuuid}, which is not present")))?;
+    let device = target_root::canonical(&device)?.unwrap_or(device);
     let table = target.mount_table()?;
     if let Some(point) = target_root::mounted_at(&table, &device)? {
         return Err(refuse(format!(
@@ -195,7 +207,6 @@ pub(crate) fn check_target(
             point.display()
         )));
     }
-    let rootfs = &inputs.rootfs;
     if rootfs.path == device || rootfs.rdev.is_some() && rootfs.rdev == Some(target_root::block_rdev(&device)?) {
         return Err(refuse(format!(
             "rootfs '{}' is slot {slot}'s partition, which stage formats; pass the EROFS image file or the partition holding it",
@@ -203,14 +214,10 @@ pub(crate) fn check_target(
         )));
     }
     if rootfs.rdev.is_some() {
+        let root_dev = fs::metadata(&target.root).with_context(|| format!("reading '{}'", target.root.display()))?.dev();
         let point = match target_root::mounted_at(&table, &rootfs.path)? {
             Some(point) => Some(point),
-            None => {
-                let root_dev = fs::metadata(&target.root)
-                    .with_context(|| format!("reading '{}'", target.root.display()))?
-                    .dev();
-                (Some(root_dev) == rootfs.rdev).then(|| target.root.clone())
-            }
+            None => (Some(root_dev) == rootfs.rdev).then(|| target.root.clone()),
         };
         if let Some(point) = point {
             return Err(refuse(format!(
@@ -229,252 +236,125 @@ pub(crate) fn check_target(
             device.display()
         )));
     }
-    Ok(SlotPartition { device, partuuid })
+    Ok((device, partuuid))
 }
 
-/// Write the slot. Its kernel goes first, so the slot cannot be booted
-/// until the kernel and entry are installed at the end.
-pub(crate) fn write_slot(
-    target: &Target,
-    write: SlotWrite,
-    slot: Slot,
-    request: &StageRequest,
-    partition: &SlotPartition,
+/// What a stage needs from the image itself.
+struct Image {
     init: InitSystem,
-) -> Result<()> {
-    let device = &partition.device;
-    let running_root = target.root.as_path();
+    list: Vec<Carry>,
+    /// Each account file the list names: path, the image's text, its mode.
+    accounts: Vec<(String, String, u32)>,
+}
 
-    let role = slot_role(slot);
-    let label = role.label().expect("slot roles have labels");
-    target_root::run(
-        Command::new(format!("mkfs.{}", role.filesystem().as_str()))
-            .args(["-F", "-q", "-L", label])
-            .arg(device),
-    )?;
+/// Read the image mounted at `point`: it must be of the running system's
+/// distro and init (and flavour, unless `change_flavour`); its carried list
+/// and account files.
+fn read_image(target: &Target, point: &Path, image: &Path, change_flavour: bool) -> Result<Image> {
+    let text = target_root::os_release(point)?
+        .ok_or_else(|| refuse(format!("rootfs image '{}' has no os-release", image.display())))?;
+    let id = os_release_value(&text, "ID").unwrap_or_default().to_ascii_lowercase();
+    let running_id = target.entry_prefix()?;
+    if id != running_id {
+        return Err(refuse(format!(
+            "rootfs image '{}' is a '{id}' system and this machine runs '{running_id}'; stage only updates a system with its own distro's images",
+            image.display()
+        )));
+    }
+    let init: InitSystem = os_release_fact(&text, "REC_INIT").map_err(|err| refuse(format!("rootfs image '{}': {err}", image.display())))?;
+    let running_init = target.init()?;
+    if init != running_init {
+        return Err(refuse(format!(
+            "rootfs image '{}' runs {init} and this machine runs {running_init}; stage only updates a system with images of its own init",
+            image.display()
+        )));
+    }
+    if !change_flavour {
+        let running = target.flavour()?;
+        let staged = Flavour::from_os_release(&text).map_err(|err| refuse(format!("rootfs image '{}': {err}", image.display())))?;
+        if staged != running {
+            return Err(refuse(format!(
+                "rootfs image '{}' is the {staged} system and this machine runs the {running} system: staging it \
+would turn this machine into the {staged} system. Stage a {running} image (the rootfs of a {running} ISO), \
+or pass --change-flavour to change this machine to the {staged} system",
+                image.display()
+            )));
+        }
+    }
+    let list = carry::read_list(point)?;
+    let mut accounts = Vec::new();
+    for entry in &list {
+        if let Carry::Accounts(rel) = entry {
+            let path = point.join(rel);
+            if let Some(meta) = target_root::metadata(&path)? {
+                let text = fs::read_to_string(&path).with_context(|| format!("reading '{}'", path.display()))?;
+                accounts.push((rel.clone(), text, meta.mode() & 0o7777));
+            }
+        }
+    }
+    Ok(Image { init, list, accounts })
+}
 
-    let mount_point = target.stage_mount(&format!("slot-{}", slot.to_string().to_ascii_lowercase()));
-    fs::create_dir_all(&mount_point)
-        .with_context(|| format!("creating '{}'", mount_point.display()))?;
-    let mounted = Mounted::new(target, &[], device, &mount_point)?;
-    target_root::run(
-        Command::new(&target.programs.recstrap)
-            .args(["--quiet", "--rootfs"])
-            .arg(&request.rootfs)
-            .arg(&mount_point),
-    )
-    .context("extracting the rootfs image into the slot")?;
-    // The new image's list: an image can add or drop what it carries.
-    let list = carried::read(&mount_point)?;
-    // What the image ships in the directories it carries, before the carry
+/// Merge an account file by its kind: passwd and group by name with their
+/// ids checked, group and gshadow with their members joined.
+fn account_merge(rel: &str, image: &str, machine: &str) -> Result<String> {
+    let (id, members) = match Path::new(rel).file_name().and_then(|n| n.to_str()) {
+        Some("passwd") => (Some(2), None),
+        Some("group") => (Some(2), Some(3)),
+        Some("gshadow") => (None, Some(3)),
+        _ => (None, None),
+    };
+    merge_accounts(image, machine, id, members)
+}
+
+/// The slot's role in the disk layout, which gives its filesystem and label.
+fn slot_role(slot: Slot) -> Role {
+    let letter = slot.to_string().chars().next().expect("a slot is one letter");
+    Role::slot(letter).expect("A and B are slot roles")
+}
+
+/// Write the slot as `plan` checked it. From here its old system is gone:
+/// a failure leaves the slot without a kernel (it cannot boot) and says so
+/// (exit 22).
+pub(crate) fn write(target: &Target, plan: StagePlan, write: SlotWrite) -> Result<()> {
+    let slot = plan.slot;
+    fill(target, &plan).map_err(|err| {
+        classified(
+            ErrorClass::PartialUpdate,
+            format!("slot {slot} was not written: its old system is gone and it cannot boot until a stage succeeds: {err:#}"),
+        )
+    })?;
+    write
+        .finish(&plan.kernel, plan.initrd.as_deref(), plan.init)
+        .map_err(|err| classified(ErrorClass::PartialUpdate, format!("slot {slot}'s kernel and entry were not installed: {err:#}")))
+}
+
+fn fill(target: &Target, plan: &StagePlan) -> Result<()> {
+    let role = slot_role(plan.slot);
+    let (program, mut args) = role.filesystem().mkfs(role.label());
+    args.push(plan.device.display().to_string());
+    target_root::run(Command::new(program).args(&args))?;
+
+    let point = target.stage_mount(&format!("slot-{}", plan.slot.to_string().to_ascii_lowercase()));
+    fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
+    let mounted = Mounted::new(target, &[], &plan.device, &point)?;
+    target_root::run(Command::new(&target.programs.recstrap).args(["--quiet", "--rootfs"]).arg(&plan.rootfs).arg(&point))
+        .context("extracting the rootfs image into the slot")?;
+    // What the new image ships in the carried paths, before the carry
     // changes them: the next update tells the machine's changes from it.
-    write_baseline(&mount_point, &list)?;
-    carry_configuration(running_root, &mount_point, &list)?;
-    write_fstab(
-        &running_root.join("etc/fstab"),
-        &mount_point.join("etc/fstab"),
-        &partition.partuuid,
-        role.filesystem().as_str(),
-    )?;
-    sync_filesystem(&mount_point)?;
-    mounted.unmount()?;
-
-    write.finish(&request.kernel, request.initrd.as_deref(), init)
-}
-
-
-/// Carry the machine state the new image lists from the running root into
-/// the new one. A source that cannot be read fails the stage.
-fn carry_configuration(from: &Path, to: &Path, list: &[Carry]) -> Result<()> {
-    // A running slot staged before baselines existed has none: its
-    // directories are carried whole, once.
-    let baseline = read_baseline(from)?;
-    for entry in list {
-        let rel = entry.path();
-        let source = from.join(rel);
-        match entry {
-            Carry::File(_) | Carry::Dir(_) => {
-                let meta = target_root::metadata(&source)?;
-                if matches!(entry, Carry::Dir(_)) && meta.as_ref().is_some_and(|m| !m.is_dir()) {
-                    bail!("'{}' is listed as a directory to carry but is not one", source.display());
-                }
-                // A directory the running slot's baseline covers carries
-                // only the machine's changes to it.
-                if matches!(entry, Carry::Dir(_)) && baseline.get(rel).is_some_and(|s| s == "d") {
-                    copy_changed(from, to, rel, &baseline)?;
-                    remove_whiteouts(from, to, rel, &baseline)?;
-                } else if meta.is_some() {
-                    copy_tree(&source, &to.join(rel))?;
-                }
-            }
-            Carry::Prefix(_) => {
-                let (dir, prefix) = rel.rsplit_once('/').unwrap_or(("", rel));
-                for name in target_root::dir_names(&from.join(dir))? {
-                    if name.to_string_lossy().starts_with(prefix) {
-                        copy_tree(&from.join(dir).join(&name), &to.join(dir).join(&name))?;
-                    }
-                }
-            }
-            Carry::Accounts(_) => merge_accounts(&source, &to.join(rel))?,
+    Baseline::write(&point, &plan.list)?;
+    carry::carry(&target.root, &point, &plan.list, plan.baseline.as_ref())?;
+    for (rel, text, mode) in &plan.prepared {
+        let path = point.join(rel);
+        let meta = target_root::metadata(&path)?;
+        fs::write(&path, text).with_context(|| format!("writing '{}'", path.display()))?;
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(*mode))?;
+        if let Some(meta) = meta {
+            std::os::unix::fs::chown(&path, Some(meta.uid()), Some(meta.gid()))?;
         }
     }
-    Ok(())
-}
-
-/// Where `stage` records what the image shipped in the carried directories,
-/// relative to the slot's root. One line per entry, tab separated: `d<TAB>path`
-/// for a directory, `l<TAB>path<TAB>target` for a symlink and
-/// `f<TAB>path<TAB>sha256` for a file.
-const BASELINE: &str = "usr/lib/recab/baseline";
-
-/// What an entry is, as the baseline records it: `d`, `l<TAB>target` or
-/// `f<TAB>sha256`.
-fn signature(path: &Path) -> Result<String> {
-    let meta = fs::symlink_metadata(path).with_context(|| format!("reading '{}'", path.display()))?;
-    Ok(if meta.is_dir() {
-        "d".to_string()
-    } else if meta.file_type().is_symlink() {
-        format!("l\t{}", fs::read_link(path)?.display())
-    } else {
-        let content = fs::read(path).with_context(|| format!("reading '{}'", path.display()))?;
-        format!("f\t{:x}", Sha256::digest(content))
-    })
-}
-
-/// Every entry under `root/rel` (itself included) as (path, signature).
-fn walk(root: &Path, rel: &str, out: &mut Vec<(String, String)>) -> Result<()> {
-    let path = root.join(rel);
-    let sig = signature(&path)?;
-    let is_dir = sig == "d";
-    out.push((rel.to_string(), sig));
-    if is_dir {
-        let mut names = target_root::dir_names(&path)?;
-        names.sort();
-        for name in names {
-            walk(root, &format!("{rel}/{}", name.to_string_lossy()), out)?;
-        }
-    }
-    Ok(())
-}
-
-/// Record the tree of every carried directory under `root`, as the image
-/// shipped it.
-fn write_baseline(root: &Path, list: &[Carry]) -> Result<()> {
-    let mut entries = Vec::new();
-    for entry in list {
-        if let Carry::Dir(rel) = entry {
-            if target_root::metadata(&root.join(rel))?.is_some_and(|m| m.is_dir()) {
-                walk(root, rel, &mut entries)?;
-            }
-        }
-    }
-    let text: String = entries
-        .iter()
-        .map(|(path, sig)| match sig.split_once('\t') {
-            Some((kind, value)) => format!("{kind}\t{path}\t{value}\n"),
-            None => format!("{sig}\t{path}\n"),
-        })
-        .collect();
-    Ok(target_root::write_durable(&root.join(BASELINE), text.as_bytes(), None)?)
-}
-
-/// The baseline of the slot under `root` as path -> signature; empty when it
-/// has none.
-fn read_baseline(root: &Path) -> Result<BTreeMap<String, String>> {
-    let path = root.join(BASELINE);
-    let Some(text) = target_root::read_optional(&path)? else { return Ok(BTreeMap::new()) };
-    text.lines()
-        .map(|line| {
-            let mut fields = line.splitn(3, '\t');
-            match (fields.next(), fields.next(), fields.next()) {
-                (Some("d"), Some(path), None) => Ok((path.to_string(), "d".to_string())),
-                (Some(kind @ ("l" | "f")), Some(path), Some(value)) => {
-                    Ok((path.to_string(), format!("{kind}\t{value}")))
-                }
-                _ => bail!("'{}': '{line}' is not a baseline entry", path.display()),
-            }
-        })
-        .collect()
-}
-
-/// Copy the machine's entries of `rel` that the baseline lacks or records
-/// differently over the new image's; the rest stays as the image ships it.
-fn copy_changed(from: &Path, to: &Path, rel: &str, baseline: &BTreeMap<String, String>) -> Result<()> {
-    for name in target_root::dir_names(&from.join(rel))? {
-        let child = format!("{rel}/{}", name.to_string_lossy());
-        let sig = signature(&from.join(&child))?;
-        if sig == "d" && baseline.get(&child).is_some_and(|s| s == "d") {
-            copy_changed(from, to, &child, baseline)?;
-        } else if baseline.get(&child) != Some(&sig) {
-            copy_tree(&from.join(&child), &to.join(&child))?;
-        }
-    }
-    Ok(())
-}
-
-/// Delete from the new slot what the baseline has under `rel` and the
-/// machine removed.
-fn remove_whiteouts(from: &Path, to: &Path, rel: &str, baseline: &BTreeMap<String, String>) -> Result<()> {
-    let prefix = format!("{rel}/");
-    for path in baseline.keys().filter(|p| p.starts_with(&prefix)) {
-        if target_root::metadata(&from.join(path))?.is_some() {
-            continue;
-        }
-        let gone = to.join(path);
-        match target_root::metadata(&gone)? {
-            Some(m) if m.is_dir() => fs::remove_dir_all(&gone),
-            Some(_) => fs::remove_file(&gone),
-            None => Ok(()),
-        }
-        .with_context(|| format!("removing '{}'", gone.display()))?;
-    }
-    Ok(())
-}
-
-
-/// Copy `source` to `dest` keeping symlinks, permissions and owners. A
-/// directory's entries are copied into `dest`, replacing same-named ones
-/// and keeping the others (as `cp -a source/. dest`); anything else
-/// replaces `dest`. Done here rather than with `cp`, whose options differ
-/// between GNU coreutils and busybox.
-fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
-    use std::os::unix::fs::{lchown, MetadataExt};
-    let meta =
-        fs::symlink_metadata(source).with_context(|| format!("reading '{}'", source.display()))?;
-    let context = || format!("copying '{}' to '{}'", source.display(), dest.display());
-    let existing = target_root::metadata(dest).with_context(context)?;
-    if meta.is_dir() {
-        if existing.as_ref().is_some_and(|e| !e.is_dir()) {
-            fs::remove_file(dest).with_context(context)?;
-        }
-        fs::create_dir_all(dest).with_context(context)?;
-        for entry in fs::read_dir(source).with_context(context)? {
-            let entry = entry?;
-            copy_tree(&entry.path(), &dest.join(entry.file_name()))?;
-        }
-    } else {
-        match existing {
-            Some(e) if e.is_dir() => fs::remove_dir_all(dest).with_context(context)?,
-            Some(_) => fs::remove_file(dest).with_context(context)?,
-            None => {
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent).with_context(context)?;
-                }
-            }
-        }
-        if meta.file_type().is_symlink() {
-            std::os::unix::fs::symlink(fs::read_link(source)?, dest).with_context(context)?;
-        } else {
-            fs::copy(source, dest).with_context(context)?;
-        }
-    }
-    lchown(dest, Some(meta.uid()), Some(meta.gid())).with_context(context)?;
-    if !meta.file_type().is_symlink() {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dest, fs::Permissions::from_mode(meta.mode() & 0o7777))
-            .with_context(context)?;
-    }
-    Ok(())
+    sync_filesystem(&point)?;
+    mounted.unmount()
 }
 
 /// Flush the filesystem holding `path` to disk.
@@ -483,65 +363,9 @@ fn sync_filesystem(path: &Path) -> Result<()> {
     let dir = fs::File::open(path).with_context(|| format!("opening '{}'", path.display()))?;
     // SAFETY: syncfs on a file descriptor this function owns.
     if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("syncing '{}'", path.display()));
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("syncing '{}'", path.display()));
     }
     Ok(())
-}
-
-/// Merge a colon-separated account file by its first field: the image's
-/// lines in their order with the running system's line for the same name in
-/// their place, then the running system's other lines. Keeps the image
-/// file's owner and mode (shadow files are not world-readable).
-fn merge_accounts(running: &Path, image: &Path) -> Result<()> {
-    let Some(running_content) = target_root::read_optional(running)? else {
-        return Ok(());
-    };
-    let Some(image_content) = target_root::read_optional(image)? else {
-        return copy_tree(running, image);
-    };
-    write_preserving_mode(
-        image,
-        target_root::merge_accounts(&image_content, &running_content).as_bytes(),
-    )
-}
-
-/// Replace `path`'s content durably, keeping its owner and permissions.
-fn write_preserving_mode(path: &Path, content: &[u8]) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = fs::metadata(path).with_context(|| format!("reading '{}'", path.display()))?;
-    target_root::write_durable(path, content, Some(meta.mode() & 0o7777))
-        .with_context(|| format!("writing '{}'", path.display()))?;
-    std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()))
-        .with_context(|| format!("restoring the owner of '{}'", path.display()))
-}
-
-/// The running fstab with the root line pointed at the new slot's partition.
-fn write_fstab(running: &Path, dest: &Path, partuuid: &str, filesystem: &str) -> Result<()> {
-    let content =
-        fs::read_to_string(running).with_context(|| format!("reading '{}'", running.display()))?;
-    let mut found_root = false;
-    let lines: Vec<String> = content
-        .lines()
-        .map(|line| {
-            let mut fields: Vec<&str> = line.split_whitespace().collect();
-            if line.trim_start().starts_with('#') || fields.get(1) != Some(&"/") {
-                return line.to_string();
-            }
-            found_root = true;
-            let spec = format!("PARTUUID={partuuid}");
-            fields[0] = &spec;
-            if let Some(fstype) = fields.get_mut(2) {
-                *fstype = filesystem;
-            }
-            fields.join("\t")
-        })
-        .collect();
-    if !found_root {
-        bail!("'{}' has no entry for /", running.display());
-    }
-    target_root::write_durable(dest, (lines.join("\n") + "\n").as_bytes(), None)
-        .with_context(|| format!("writing '{}'", dest.display()))
 }
 
 /// A filesystem mounted for the stage, unmounted when dropped.

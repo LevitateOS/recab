@@ -36,6 +36,8 @@ pub const TRIAL_TIMEOUT_SECS: u64 = 900;
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
+    /// The schema of this record.
+    pub schema_version: u32,
     pub init: InitSystem,
     /// How startup ended.
     pub startup: Startup,
@@ -55,7 +57,7 @@ impl Health {
         failed.sort();
         failed.dedup();
         let finished = matches!(startup, Startup::Running | Startup::Failed);
-        Self { init, startup, finished, state, failed }
+        Self { schema_version: 1, init, startup, finished, state, failed }
     }
 
     /// How startup ended, in words (a trial's record and message), for a

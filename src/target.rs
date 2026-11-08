@@ -21,6 +21,11 @@ pub fn state_file() -> String {
     format!("{STATE_MOUNT}/{STATE_DIR}/{STATE_FILE}")
 }
 
+/// recab's audit log on an installed system, as an absolute path.
+pub fn audit_file() -> String {
+    format!("{STATE_MOUNT}/{STATE_DIR}/{AUDIT_FILE}")
+}
+
 /// Which system the run looks at.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {

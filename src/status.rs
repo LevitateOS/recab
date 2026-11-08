@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::state::{committed, known_good, rollback_target, Slot, TrialRecord};
+use crate::state::{committed, known_good, plan, rollback_target, BootChange, PersistentState, Request, Selection, Slot, TrialRecord};
 use crate::entry::{entry_name, layout_name, ENTRIES_DIR};
 use crate::trial_options;
 use crate::System;
@@ -30,10 +30,63 @@ pub struct SlotView {
     pub trial: bool,
 }
 
+/// The schema of [`Status`].
+pub const STATUS_SCHEMA_VERSION: u32 = 2;
+
+/// A change a person or front end can ask recab for.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// `recab set-next <inactive>`.
+    SetNext,
+    Commit,
+    Rollback,
+    /// `recab stage`.
+    Stage,
+}
+
+/// What recab would make of an action now.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Ready,
+    /// The system already is where it leads.
+    NoChange,
+    Refused,
+}
+
+/// The boot selection and slots an action leaves.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct After {
+    pub default_slot: Option<Slot>,
+    pub next_boot: Option<Slot>,
+    pub trial_pending: bool,
+    pub known_good_slot: Option<Slot>,
+    pub rollback_slot: Option<Slot>,
+}
+
+/// One action as recab's state machine plans it from the current state.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActionView {
+    pub action: Action,
+    /// The slot it acts on.
+    pub slot: Slot,
+    pub verdict: Verdict,
+    /// Why it is refused (recab's message), when it is.
+    pub reason: Option<String>,
+    /// What it leaves, when it is ready.
+    pub after: Option<After>,
+}
+
 /// Current A/B view exported by `recab status --json`.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
+    pub schema_version: u32,
     pub active_slot: Slot,
     pub inactive_slot: Slot,
     /// A one-shot trial boot is set in the firmware and not yet taken.
@@ -47,11 +100,45 @@ pub struct Status {
     pub committed: bool,
     /// The slot `recab rollback` would select, if any.
     pub rollback_slot: Option<Slot>,
+    /// The slot `set-next` scheduled and no boot has judged yet.
+    pub scheduled_trial: Option<Slot>,
     /// How the last judged trial boot ended.
     pub last_trial: Option<TrialRecord>,
     pub entry_prefix: String,
     /// Each slot's entry, kernel directory and partition.
     pub slots: Vec<SlotView>,
+    /// What recab would make of each action now.
+    pub actions: Vec<ActionView>,
+}
+
+/// What `request` would do from `sel` and `state`, as recab plans it.
+fn action_view(action: Action, request: Request, slot: Slot, sel: &Selection, state: &PersistentState) -> ActionView {
+    let (verdict, reason, after) = match plan(request, sel, state) {
+        Err(err) => (Verdict::Refused, Some(format!("{err:#}")), None),
+        Ok(None) => (Verdict::NoChange, None, None),
+        Ok(Some(transition)) => {
+            let mut next_sel = *sel;
+            match transition.boot {
+                Some(BootChange::OneShot(slot)) => next_sel.oneshot = Some(slot),
+                Some(BootChange::Default(slot)) => {
+                    next_sel.oneshot = None;
+                    next_sel.default = Some(slot);
+                    next_sel.foreign_default = false;
+                }
+                None => {}
+            }
+            let next = &transition.next;
+            let after = After {
+                default_slot: next_sel.default,
+                next_boot: next_sel.next_boot(),
+                trial_pending: next_sel.oneshot.is_some(),
+                known_good_slot: known_good(next, &next_sel),
+                rollback_slot: rollback_target(next, &next_sel),
+            };
+            (Verdict::Ready, None, Some(after))
+        }
+    };
+    ActionView { action, slot, verdict, reason, after }
 }
 
 /// Query current A/B state from the boot configuration and recab's state, of
@@ -79,7 +166,18 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
         });
     }
     let (sel, state) = (&sys.boot.selection, &sys.state);
+    let inactive = sel.active.other();
+    let rollback_to = rollback_target(state, sel).unwrap_or(inactive);
+    let actions = vec![
+        action_view(Action::SetNext, Request::SetNext(inactive), inactive, sel, state),
+        action_view(Action::Commit, Request::Commit, sel.active, sel, state),
+        action_view(Action::Rollback, Request::Rollback, rollback_to, sel, state),
+        action_view(Action::Stage, Request::Stage, inactive, sel, state),
+    ];
     Ok(Status {
+        schema_version: STATUS_SCHEMA_VERSION,
+        scheduled_trial: state.pending_trial_slot,
+        actions,
         active_slot: sel.active,
         inactive_slot: sel.active.other(),
         trial_pending: sel.oneshot.is_some(),
