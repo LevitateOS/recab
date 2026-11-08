@@ -7,6 +7,8 @@
 //! bootable.
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -224,7 +226,11 @@ pub(crate) fn write_slot(
     )
     .context("extracting the rootfs image into the slot")?;
     // The new image's list: an image can add or drop what it carries.
-    carry_configuration(running_root, &mount_point, &carried::read(&mount_point)?)?;
+    let list = carried::read(&mount_point)?;
+    // What the image ships in the directories it carries, before the carry
+    // changes them: the next update tells the machine's changes from it.
+    write_baseline(&mount_point, &list)?;
+    carry_configuration(running_root, &mount_point, &list)?;
     write_fstab(
         &running_root.join("etc/fstab"),
         &mount_point.join("etc/fstab"),
@@ -255,16 +261,26 @@ fn canonical(path: &Path) -> Result<Option<PathBuf>> {
 /// Carry the machine state the new image lists from the running root into
 /// the new one. A source that cannot be read fails the stage.
 fn carry_configuration(from: &Path, to: &Path, list: &[Carry]) -> Result<()> {
+    // A running slot staged before baselines existed has none: its
+    // directories are carried whole, once.
+    let baseline = read_baseline(from)?;
     for entry in list {
         let rel = entry.path();
         let source = from.join(rel);
         match entry {
             Carry::File(_) | Carry::Dir(_) => {
-                let Some(meta) = metadata(&source)? else { continue };
-                if matches!(entry, Carry::Dir(_)) && !meta.is_dir() {
+                let meta = metadata(&source)?;
+                if matches!(entry, Carry::Dir(_)) && meta.as_ref().is_some_and(|m| !m.is_dir()) {
                     bail!("'{}' is listed as a directory to carry but is not one", source.display());
                 }
-                copy_tree(&source, &to.join(rel))?;
+                // A directory the running slot's baseline covers carries
+                // only the machine's changes to it.
+                if matches!(entry, Carry::Dir(_)) && baseline.get(rel).is_some_and(|s| s == "d") {
+                    copy_changed(from, to, rel, &baseline)?;
+                    remove_whiteouts(from, to, rel, &baseline)?;
+                } else if meta.is_some() {
+                    copy_tree(&source, &to.join(rel))?;
+                }
             }
             Carry::Prefix(_) => {
                 let (dir, prefix) = rel.rsplit_once('/').unwrap_or(("", rel));
@@ -276,6 +292,116 @@ fn carry_configuration(from: &Path, to: &Path, list: &[Carry]) -> Result<()> {
             }
             Carry::Accounts(_) => merge_accounts(&source, &to.join(rel))?,
         }
+    }
+    Ok(())
+}
+
+/// Where `stage` records what the image shipped in the carried directories,
+/// relative to the slot's root. One line per entry, tab separated: `d<TAB>path`
+/// for a directory, `l<TAB>path<TAB>target` for a symlink and
+/// `f<TAB>path<TAB>sha256` for a file.
+const BASELINE: &str = "usr/lib/recab/baseline";
+
+/// What an entry is, as the baseline records it: `d`, `l<TAB>target` or
+/// `f<TAB>sha256`.
+fn signature(path: &Path) -> Result<String> {
+    let meta = fs::symlink_metadata(path).with_context(|| format!("reading '{}'", path.display()))?;
+    Ok(if meta.is_dir() {
+        "d".to_string()
+    } else if meta.file_type().is_symlink() {
+        format!("l\t{}", fs::read_link(path)?.display())
+    } else {
+        let content = fs::read(path).with_context(|| format!("reading '{}'", path.display()))?;
+        format!("f\t{:x}", Sha256::digest(content))
+    })
+}
+
+/// Every entry under `root/rel` (itself included) as (path, signature).
+fn walk(root: &Path, rel: &str, out: &mut Vec<(String, String)>) -> Result<()> {
+    let path = root.join(rel);
+    let sig = signature(&path)?;
+    let is_dir = sig == "d";
+    out.push((rel.to_string(), sig));
+    if is_dir {
+        let mut names = target_root::dir_names(&path)?;
+        names.sort();
+        for name in names {
+            walk(root, &format!("{rel}/{}", name.to_string_lossy()), out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Record the tree of every carried directory under `root`, as the image
+/// shipped it.
+fn write_baseline(root: &Path, list: &[Carry]) -> Result<()> {
+    let mut entries = Vec::new();
+    for entry in list {
+        if let Carry::Dir(rel) = entry {
+            if metadata(&root.join(rel))?.is_some_and(|m| m.is_dir()) {
+                walk(root, rel, &mut entries)?;
+            }
+        }
+    }
+    let text: String = entries
+        .iter()
+        .map(|(path, sig)| match sig.split_once('\t') {
+            Some((kind, value)) => format!("{kind}\t{path}\t{value}\n"),
+            None => format!("{sig}\t{path}\n"),
+        })
+        .collect();
+    write_durable(&root.join(BASELINE), text.as_bytes())
+}
+
+/// The baseline of the slot under `root` as path -> signature; empty when it
+/// has none.
+fn read_baseline(root: &Path) -> Result<BTreeMap<String, String>> {
+    let path = root.join(BASELINE);
+    let Some(text) = target_root::read_optional(&path)? else { return Ok(BTreeMap::new()) };
+    text.lines()
+        .map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some("d"), Some(path), None) => Ok((path.to_string(), "d".to_string())),
+                (Some(kind @ ("l" | "f")), Some(path), Some(value)) => {
+                    Ok((path.to_string(), format!("{kind}\t{value}")))
+                }
+                _ => bail!("'{}': '{line}' is not a baseline entry", path.display()),
+            }
+        })
+        .collect()
+}
+
+/// Copy the machine's entries of `rel` that the baseline lacks or records
+/// differently over the new image's; the rest stays as the image ships it.
+fn copy_changed(from: &Path, to: &Path, rel: &str, baseline: &BTreeMap<String, String>) -> Result<()> {
+    for name in target_root::dir_names(&from.join(rel))? {
+        let child = format!("{rel}/{}", name.to_string_lossy());
+        let sig = signature(&from.join(&child))?;
+        if sig == "d" && baseline.get(&child).is_some_and(|s| s == "d") {
+            copy_changed(from, to, &child, baseline)?;
+        } else if baseline.get(&child) != Some(&sig) {
+            copy_tree(&from.join(&child), &to.join(&child))?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete from the new slot what the baseline has under `rel` and the
+/// machine removed.
+fn remove_whiteouts(from: &Path, to: &Path, rel: &str, baseline: &BTreeMap<String, String>) -> Result<()> {
+    let prefix = format!("{rel}/");
+    for path in baseline.keys().filter(|p| p.starts_with(&prefix)) {
+        if metadata(&from.join(path))?.is_some() {
+            continue;
+        }
+        let gone = to.join(path);
+        match metadata(&gone)? {
+            Some(m) if m.is_dir() => fs::remove_dir_all(&gone),
+            Some(_) => fs::remove_file(&gone),
+            None => Ok(()),
+        }
+        .with_context(|| format!("removing '{}'", gone.display()))?;
     }
     Ok(())
 }
