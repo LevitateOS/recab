@@ -7,46 +7,15 @@
 //! systemd and OpenRC are supported.
 
 use anyhow::{Context, Result};
-use distro_profile::{InitSystem, Profile};
+use distro_profile::InitSystem;
 use serde::Serialize;
-use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::target::Target;
 use crate::state::Startup;
-use crate::error::{classified, refuse, ErrorClass};
-
-/// The profile of the running system, from its os-release.
-pub(crate) fn running_profile(config: &Config) -> Result<Profile> {
-    let path = &config.os_release;
-    let text = fs::read_to_string(path).map_err(|error| {
-        classified(
-            ErrorClass::BackendUnavailable,
-            format!("cannot read '{}': {error}", path.display()),
-        )
-    })?;
-    Profile::from_os_release(&text).map_err(|error| {
-        classified(
-            ErrorClass::BackendUnavailable,
-            format!("{}: {error}", path.display()),
-        )
-    })
-}
-
-/// The profile of the system installed under `root`, from its os-release.
-pub(crate) fn installed_profile(root: &Path) -> Result<Profile> {
-    let text = target_root::os_release(root)?.ok_or_else(|| {
-        refuse(format!("'{}' has no os-release", root.display()),
-        )
-    })?;
-    Profile::from_os_release(&text).map_err(|error| {
-        refuse(format!("{}'s os-release: {error}", root.display()),
-        )
-    })
-}
 
 /// The kernel option that turns a crashing PID 1 into a reboot, for an init
 /// that has one; OpenRC's init dying panics the kernel, which `panic=` already
@@ -85,10 +54,10 @@ const TIMED_OUT: &str = "timed out";
 const POLL: Duration = Duration::from_millis(250);
 
 /// Wait until startup finished, at most `timeout`, and name what failed.
-pub(crate) fn wait_finished(config: &Config, init: InitSystem, timeout: Duration) -> Result<Health> {
+pub(crate) fn wait_finished(target: &Target, init: InitSystem, timeout: Duration) -> Result<Health> {
     let (finished, state, mut failed, startup) = match init {
-        InitSystem::Systemd => systemd_startup(&config.systemctl, timeout)?,
-        InitSystem::Openrc => openrc_startup(config, timeout)?,
+        InitSystem::Systemd => systemd_startup(&target.programs.systemctl, timeout)?,
+        InitSystem::Openrc => openrc_startup(target, timeout)?,
     };
     failed.sort();
     failed.dedup();
@@ -153,15 +122,15 @@ fn systemd_failed_units(systemctl: &str) -> Result<Vec<String>> {
 /// single-user runlevel. OpenRC's state directory holds the runlevel being
 /// entered (`softlevel`) and one entry per service in each state
 /// (`starting/`, `failed/`).
-fn openrc_startup(config: &Config, timeout: Duration) -> Result<Waited> {
-    let dir = &config.openrc_dir;
+fn openrc_startup(target: &Target, timeout: Duration) -> Result<Waited> {
+    let dir = &target.openrc_dir;
     let deadline = Instant::now() + timeout;
     loop {
         let level = target_root::read_optional(&dir.join("softlevel"))?.unwrap_or_default();
         let level = level.trim().to_string();
         match level.as_str() {
-            "default" if target_root::dir_names(&dir.join("starting"))?.is_empty() && !openrc_running()? => {
-                let failed = openrc_failed(config)?;
+            "default" if target_root::dir_names(&dir.join("starting"))?.is_empty() && !openrc_running(target)? => {
+                let failed = openrc_failed(target)?;
                 let startup = if failed.is_empty() {
                     Startup::Running
                 } else {
@@ -170,15 +139,15 @@ fn openrc_startup(config: &Config, timeout: Duration) -> Result<Waited> {
                 return Ok((true, level, failed, startup));
             }
             "single" => {
-                return Ok((false, level, openrc_failed(config)?, Startup::Failed("single-user runlevel".to_string())))
+                return Ok((false, level, openrc_failed(target)?, Startup::Failed("single-user runlevel".to_string())))
             }
             "shutdown" | "reboot" => {
-                return Ok((false, level.clone(), openrc_failed(config)?, Startup::Inconclusive(level)))
+                return Ok((false, level.clone(), openrc_failed(target)?, Startup::Inconclusive(level)))
             }
             _ => {}
         }
         if Instant::now() >= deadline {
-            return Ok((false, TIMED_OUT.to_string(), openrc_failed(config)?, Startup::TimedOut));
+            return Ok((false, TIMED_OUT.to_string(), openrc_failed(target)?, Startup::TimedOut));
         }
         std::thread::sleep(POLL);
     }
@@ -199,13 +168,13 @@ const BOOT_RUNLEVELS: [&str; 3] = ["sysinit", "boot", "default"];
 /// started nor inactive, those OpenRC still marks failed, and daemons `rc-status`
 /// reports crashed. OpenRC empties `failed/` when the runlevel's `openrc` exits, which
 /// is when startup counts as finished, so the runlevels are what tells.
-fn openrc_failed(config: &Config) -> Result<Vec<String>> {
-    let dir = &config.openrc_dir;
+fn openrc_failed(target: &Target) -> Result<Vec<String>> {
+    let dir = &target.openrc_dir;
     let mut up = service_names(&dir.join("started"))?;
     up.extend(service_names(&dir.join("inactive"))?);
     let mut failed: Vec<String> = service_names(&dir.join("failed"))?;
     for level in BOOT_RUNLEVELS {
-        for name in service_names(&config.runlevels_dir.join(level))? {
+        for name in service_names(&target.runlevels_dir.join(level))? {
             if !up.contains(&name) && !failed.contains(&name) {
                 failed.push(name);
             }
@@ -213,17 +182,17 @@ fn openrc_failed(config: &Config) -> Result<Vec<String>> {
     }
     // rc-status exits non-zero when it lists a crashed daemon: its output is
     // the answer; a missing rc-status is an error.
-    let out = Command::new(&config.rc_status)
+    let out = Command::new(&target.programs.rc_status)
         .arg("--crashed")
         .output()
-        .with_context(|| format!("running '{} --crashed'", config.rc_status))?;
+        .with_context(|| format!("running '{} --crashed'", target.programs.rc_status))?;
     let crashed = String::from_utf8_lossy(&out.stdout);
     // It exits non-zero when it lists a crashed daemon; non-zero with nothing
     // listed is rc-status itself failing.
     if !out.status.success() && crashed.trim().is_empty() {
         anyhow::bail!(
             "'{} --crashed' failed ({}): {}",
-            config.rc_status,
+            target.programs.rc_status,
             target_root::status_text(out.status),
             String::from_utf8_lossy(&out.stderr).trim()
         );
@@ -233,13 +202,13 @@ fn openrc_failed(config: &Config) -> Result<Vec<String>> {
 }
 
 /// An `openrc` process (running a runlevel) exists.
-fn openrc_running() -> Result<bool> {
-    for name in target_root::dir_names(Path::new("/proc"))? {
+fn openrc_running(target: &Target) -> Result<bool> {
+    for name in target_root::dir_names(&target.proc_dir)? {
         if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
         // A process that exited since the listing has no comm any more.
-        let comm = target_root::read_optional(&Path::new("/proc").join(&name).join("comm"));
+        let comm = target_root::read_optional(&target.proc_dir.join(&name).join("comm"));
         match comm {
             Ok(Some(comm)) if comm.trim() == "openrc" => return Ok(true),
             Ok(_) => {}
@@ -250,22 +219,18 @@ fn openrc_running() -> Result<bool> {
     Ok(false)
 }
 
-/// Ask for a clean reboot without waiting for it.
-pub(crate) fn reboot(init: InitSystem, config: &Config) -> Result<()> {
-    let (program, args): (String, Vec<&str>) = match (&config.reboot, init) {
-        (Some(program), _) => (program.clone(), vec![]),
-        (None, InitSystem::Systemd) => (config.systemctl.clone(), vec!["--no-block", "reboot"]),
-        (None, InitSystem::Openrc) => {
-            // openrc-init is shut down with openrc-shutdown; busybox init
-            // (with an inittab) with reboot.
-            let pid1 = fs::read_to_string("/proc/1/comm").context("reading /proc/1/comm")?;
-            if pid1.trim() == "openrc-init" {
-                ("openrc-shutdown".to_string(), vec!["-r", "now"])
-            } else {
-                ("reboot".to_string(), vec![])
-            }
+/// Ask for a clean reboot without waiting for it: systemd's, or busybox
+/// init's (AcornOS boots busybox init from an inittab that runs OpenRC).
+pub(crate) fn reboot(init: InitSystem, target: &Target) -> Result<()> {
+    let programs = &target.programs;
+    let mut command = match init {
+        InitSystem::Systemd => {
+            let mut command = Command::new(&programs.systemctl);
+            command.args(["--no-block", "reboot"]);
+            command
         }
+        InitSystem::Openrc => Command::new(&programs.reboot),
     };
-    target_root::run(Command::new(&program).args(&args))?;
+    target_root::run(&mut command)?;
     Ok(())
 }

@@ -11,9 +11,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, RunningRoot};
+use crate::target::{partuuid, Firmware, Kind, Target};
 use crate::error::{classified, or_class, refuse, ErrorClass};
-use distro_profile::os_release_value;
 use crate::state::{BootChange, Selection};
 use crate::init_system::crash_option;
 use crate::state::Slot;
@@ -64,19 +63,14 @@ const EFI_VARIABLE_ATTRIBUTES: u32 = 0x7;
 /// `FS_IMMUTABLE_FL`, which efivarfs sets on variables.
 const FS_IMMUTABLE_FL: libc::c_int = 0x10;
 
-/// Where the backend reads and writes (from the run's [`Config`]).
+/// `EFIVARFS_MAGIC`, the filesystem type of real firmware variables.
+const EFIVARFS_MAGIC: i64 = 0xde5e81e4;
+
+/// The ESP and boot selection of the system the run looks at.
 pub(crate) struct SystemdBoot {
-    boot_root: PathBuf,
+    target: Target,
     loader_conf: PathBuf,
     entries_dir: PathBuf,
-    os_release: PathBuf,
-    running_root: RunningRoot,
-    sys_firmware_efi: PathBuf,
-    efivars: PathBuf,
-    /// `efivars` is efivarfs; else a scratch tree of plain files.
-    efivarfs: bool,
-    /// The slot entries' name prefix, when not inferred.
-    entry_prefix: Option<String>,
 }
 
 /// The boot configuration as one recab run sees it.
@@ -102,18 +96,22 @@ pub(crate) enum ApplyError {
 }
 
 impl SystemdBoot {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(target: &Target) -> Self {
         Self {
-            boot_root: config.boot_root.clone(),
-            loader_conf: config.boot_root.join(LOADER_CONF),
-            entries_dir: config.boot_root.join(ENTRIES_DIR),
-            os_release: config.os_release.clone(),
-            running_root: config.running_root.clone(),
-            sys_firmware_efi: config.sys_firmware_efi.clone(),
-            efivars: config.efivars.clone(),
-            efivarfs: config.efivarfs,
-            entry_prefix: config.entry_prefix.clone(),
+            loader_conf: target.esp.join(LOADER_CONF),
+            entries_dir: target.esp.join(ENTRIES_DIR),
+            target: target.clone(),
         }
+    }
+
+    /// This machine's firmware variables, when the run may change them.
+    fn firmware(&self) -> Result<&Firmware> {
+        self.target.firmware.as_ref().ok_or_else(|| {
+            classified(
+                ErrorClass::BackendUnavailable,
+                "the firmware variables of a system installed under a root are not this machine's",
+            )
+        })
     }
 
     pub fn read(&self) -> Result<Boot> {
@@ -121,7 +119,7 @@ impl SystemdBoot {
         // then loader.conf's `default`, skipping entries it cannot boot.
         let efivar_default = self.loader_efivar("LoaderEntryDefault")?;
         let conf_default = target_root::read_optional(&self.loader_conf)?.as_deref().and_then(loader_default);
-        let prefix = self.entry_prefix()?;
+        let prefix = self.target.entry_prefix()?;
         let active = self.active_slot(&prefix)?;
         let bootable_slot = |entry: Option<&str>| -> Result<Option<Slot>> {
             let Some(slot) = entry
@@ -188,7 +186,7 @@ impl SystemdBoot {
                 ErrorClass::BackendUnavailable,format!(
                     "systemd-boot's {variable} names '{value}', a stale value that would boot slot {slot} or another entry instead of slot {keep}, and {fix} failed: {err:#}.\n\
 Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) and retry.",
-                    self.efivars.display()
+                    self.target.firmware.as_ref().map_or(Path::new("efivars"), |f| f.efivars.as_path()).display()
                 ),
             )
         };
@@ -212,9 +210,10 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
     /// Changing the boot selection needs a UEFI system with efivarfs, where
     /// the variables systemd-boot obeys are written.
     pub fn ensure_can_change(&self) -> Result<()> {
+        let firmware = self.firmware()?;
         for (dir, missing) in [
-            (&self.sys_firmware_efi, "this host does not appear to be booted in UEFI mode"),
-            (&self.efivars, "mount efivarfs or boot under UEFI"),
+            (&firmware.efi_dir, "this host does not appear to be booted in UEFI mode"),
+            (&firmware.efivars, "mount efivarfs or boot under UEFI"),
         ] {
             if !dir.is_dir() {
                 return Err(classified(
@@ -301,7 +300,7 @@ Write a system into slot {slot} with 'recab stage' first."
             return Ok(Some(entry.to_string()));
         };
         for file in entry_boot_files(&content) {
-            if !target_root::exists(&self.boot_root.join(file.trim_start_matches('/')))? {
+            if !target_root::exists(&self.target.esp.join(file.trim_start_matches('/')))? {
                 return Ok(Some(file));
             }
         }
@@ -358,7 +357,7 @@ Write a system into slot {slot} with 'recab stage' first."
     /// The slot's kernel directory on the ESP, which
     /// [`remove_slot_boot_files`](Self::remove_slot_boot_files) removes.
     pub fn slot_boot_files_dir(&self, boot: &Boot, slot: Slot) -> PathBuf {
-        self.boot_root.join(slot_boot_dir(&boot.prefix, slot))
+        self.target.esp.join(slot_boot_dir(&boot.prefix, slot))
     }
 
     /// Remove the slot's kernel directory, so its entry cannot boot until
@@ -368,7 +367,7 @@ Write a system into slot {slot} with 'recab stage' first."
         if dir.exists() {
             fs::remove_dir_all(&dir)
                 .with_context(|| format!("removing slot {slot}'s kernel '{}'", dir.display()))?;
-            target_root::sync_dir(&self.boot_root)?;
+            target_root::sync_dir(&self.target.esp)?;
         }
         Ok(())
     }
@@ -387,7 +386,7 @@ Write a system into slot {slot} with 'recab stage' first."
         let entry = self.entry_for(boot, slot)?;
         let content = self.entry_content(&entry)?;
         let dir_name = slot_boot_dir(&boot.prefix, slot);
-        let dir = self.boot_root.join(&dir_name);
+        let dir = self.target.esp.join(&dir_name);
         fs::create_dir_all(&dir).with_context(|| format!("creating '{}'", dir.display()))?;
         target_root::copy_durable(kernel, &dir.join(KERNEL_FILE))?;
         if let Some(initrd) = initrd {
@@ -434,7 +433,7 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
 
     /// The running system exposes UEFI variables.
     pub fn efivars_available(&self) -> bool {
-        self.sys_firmware_efi.is_dir() && self.efivars.is_dir()
+        self.target.firmware.as_ref().is_some_and(|f| f.efi_dir.is_dir() && f.efivars.is_dir())
     }
 
     /// Set (or, with `None`, remove) a systemd-boot EFI variable holding an
@@ -447,9 +446,11 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
     }
 
     fn write_loader_efivar(&self, name: &str, value: Option<&str>) -> Result<()> {
-        let path = self.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
+        let efivars = &self.firmware()?.efivars;
+        let path = efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
         let context = || format!("writing the EFI variable '{}'", path.display());
-        if path.exists() {
+        let efivarfs = is_efivarfs(efivars).with_context(context)?;
+        if efivarfs && path.exists() {
             clear_immutable(&path).with_context(context)?;
         }
         let Some(value) = value else {
@@ -462,7 +463,7 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
         for unit in value.encode_utf16().chain([0]) {
             bytes.extend(unit.to_le_bytes());
         }
-        if !self.efivarfs {
+        if !efivarfs {
             return fs::write(&path, &bytes).with_context(context);
         }
         use std::io::Write;
@@ -483,7 +484,9 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
 
     /// A systemd-boot EFI variable holding an entry name, if set.
     fn loader_efivar(&self, name: &str) -> Result<Option<String>> {
-        let path = self.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
+        // An installed system's firmware is unknown: no variable is set.
+        let Some(firmware) = &self.target.firmware else { return Ok(None) };
+        let path = firmware.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
         let Some(bytes) = target_root::read_optional_bytes(&path)
             .with_context(|| format!("reading the EFI variable '{}'", path.display()))?
         else {
@@ -508,25 +511,21 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
     /// last `root=`, or the PARTUUID of the partition mounted at an install
     /// target. `None` when the command line names no root.
     fn running_root_selector(&self) -> Result<Option<RootSelector>> {
-        match &self.running_root {
-            RunningRoot::Cmdline(path) => {
-                let cmdline = fs::read_to_string(path).map_err(|err| {
-                    refuse(format!("unable to determine active slot: cannot read '{}': {err}", path.display()),
-                    )
+        match self.target.kind {
+            Kind::Running => {
+                let path = self.target.cmdline_path();
+                let cmdline = fs::read_to_string(&path).map_err(|err| {
+                    refuse(format!("unable to determine active slot: cannot read '{}': {err}", path.display()))
                 })?;
                 Ok(root_selector_from_cmdline(&cmdline))
             }
-            RunningRoot::Mounted(root) => {
-                let table = target_root::mount_table()?;
+            Kind::Installed => {
+                let root = &self.target.root;
+                let table = self.target.mount_table()?;
                 let mount = table.iter().rev().find(|m| m.mount_point == *root).ok_or_else(|| {
-                    refuse(format!("'{}' is not a mount point; mount the installed system's root there", root.display()),
-                    )
+                    refuse(format!("'{}' is not a mount point; mount the installed system's root there", root.display()))
                 })?;
-                let partuuid = target_root::partuuid(Path::new(&mount.source))?.ok_or_else(|| {
-                    refuse(format!("'{}' (mounted at '{}') has no PARTUUID", mount.source, root.display()),
-                    )
-                })?;
-                Ok(Some(RootSelector::PartUuid(partuuid)))
+                Ok(Some(RootSelector::PartUuid(partuuid(Path::new(&mount.source))?)))
             }
         }
     }
@@ -590,31 +589,8 @@ Expected matching root=... options in '{}' and '{}'.",
     pub fn bootable(&self, boot: &Boot, slot: Slot) -> Result<bool> {
         Ok(self.missing_boot_file(&entry_name(&boot.prefix, slot))?.is_none())
     }
-
-    /// The entries' prefix: configured (`RECAB_ENTRY_PREFIX`), else the
-    /// system's os-release `ID`, lower-cased: the rule `recab init` names
-    /// them by.
-    fn entry_prefix(&self) -> Result<String> {
-        if let Some(prefix) = &self.entry_prefix {
-            return Ok(prefix.clone());
-        }
-        target_root::read_optional(&self.os_release)?
-            .and_then(|text| os_release_value(&text, "ID"))
-            .map(|id| os_prefix(&id))
-            .ok_or_else(|| {
-                refuse(format!(
-                        "'{}' has no ID, which names the boot entries; set RECAB_ENTRY_PREFIX",
-                        self.os_release.display()
-                    ),
-                )
-            })
-    }
 }
 
-/// The entry prefix of an os-release `ID`.
-pub(crate) fn os_prefix(id: &str) -> String {
-    id.to_ascii_lowercase()
-}
 
 /// An entry's directory name: `<prefix>-a` for an A/B slot, `<prefix>` for
 /// the one root of a mutable install.
@@ -909,7 +885,20 @@ pub(crate) fn has_trial_options(content: &str) -> bool {
     entry_options(content).iter().any(|o| is_trial_option(o))
 }
 
-/// Clear `FS_IMMUTABLE_FL`; filesystems without file flags have nothing to clear.
+/// Whether `dir` is efivarfs (else a directory of plain files, as in a
+/// scratch tree).
+fn is_efivarfs(dir: &Path) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: statfs writes one statfs struct this function owns.
+    if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(stat.f_type as i64 == EFIVARFS_MAGIC)
+}
+
+/// Clear `FS_IMMUTABLE_FL`, which efivarfs sets on every variable.
 fn clear_immutable(path: &Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let file = fs::File::open(path)?;
@@ -917,11 +906,7 @@ fn clear_immutable(path: &Path) -> std::io::Result<()> {
     // SAFETY: FS_IOC_GETFLAGS/SETFLAGS read and write one int on an open fd.
     unsafe {
         if libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) != 0 {
-            let err = std::io::Error::last_os_error();
-            return match err.raw_os_error() {
-                Some(libc::ENOTTY | libc::EINVAL | libc::EOPNOTSUPP) => Ok(()),
-                _ => Err(err),
-            };
+            return Err(std::io::Error::last_os_error());
         }
         if flags & FS_IMMUTABLE_FL != 0 {
             flags &= !FS_IMMUTABLE_FL;

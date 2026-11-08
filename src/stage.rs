@@ -13,12 +13,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::Config;
+use crate::target::{partuuid, Target};
 use crate::carried::{self, Carry};
 use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::state::Slot;
 use crate::error::refuse;
-use distro_profile::{Flavour, Profile};
+use distro_profile::{Flavour, InitSystem};
 use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
 use recpart::types::Role;
 use target_root::ErofsImage;
@@ -54,15 +54,15 @@ fn slot_role(slot: Slot) -> Role {
 /// one, the installed initramfs, at the live protocol's paths. A block device
 /// is mounted read-only under the stage directory, and stays mounted while
 /// the returned guard lives; a directory is taken as the mounted medium.
-pub(crate) fn open_media(config: &Config, media: &Path) -> Result<(Option<Mounted>, StageRequest)> {
+pub(crate) fn open_media(target: &Target, media: &Path) -> Result<(Option<Mounted>, StageRequest)> {
     use std::os::unix::fs::FileTypeExt;
     let meta = fs::metadata(media).map_err(|err| refuse(format!("release medium '{}': {err}", media.display())))?;
     let (mounted, root) = if meta.is_dir() {
         (None, media.to_path_buf())
     } else if meta.file_type().is_block_device() {
-        let point = config.stage_dir.join("media");
+        let point = target.stage_mount("media");
         fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
-        (Some(Mounted::mount_ro(media, &point)?), point)
+        (Some(Mounted::new(target, &["-o", "ro"], media, &point)?), point)
     } else {
         return Err(refuse(format!(
             "release medium '{}' is neither a block device nor a directory",
@@ -90,18 +90,16 @@ pub(crate) struct Inputs {
 /// stages it anyway. Each flavour is its os-release's `REC_FLAVOUR`; the
 /// image's is read from the image, mounted read-only under the stage
 /// directory.
-pub(crate) fn check_flavour(config: &Config, inputs: &Inputs, change_flavour: bool) -> Result<()> {
+pub(crate) fn check_flavour(target: &Target, inputs: &Inputs, change_flavour: bool) -> Result<()> {
     if change_flavour {
         return Ok(());
     }
-    let running = fs::read_to_string(&config.os_release)
-        .with_context(|| format!("reading '{}'", config.os_release.display()))?;
-    let running = Flavour::from_os_release(&running)
-        .map_err(|err| refuse(format!("the running system's {}: {err}", config.os_release.display())))?;
+    let running = target.flavour()?;
     let image = &inputs.rootfs.path;
-    let point = config.stage_dir.join("image");
+    let point = target.stage_mount("image");
     fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
-    let mounted = Mounted::mount_image_ro(image, inputs.rootfs.rdev.is_some(), &point)?;
+    let options = if inputs.rootfs.rdev.is_some() { "ro" } else { "ro,loop" };
+    let mounted = Mounted::new(target, &["-t", "erofs", "-o", options], image, &point)?;
     let text = target_root::os_release(&point);
     mounted.unmount()?;
     let text = text?.ok_or_else(|| refuse(format!("rootfs image '{}' has no os-release", image.display())))?;
@@ -119,7 +117,7 @@ or pass --change-flavour to change this machine to the {staged} system",
 }
 
 /// The partition a stage will write, checked before anything is changed.
-pub(crate) struct Target {
+pub(crate) struct SlotPartition {
     device: PathBuf,
     /// Its PARTUUID, which the new system's fstab names its root by.
     partuuid: String,
@@ -181,14 +179,15 @@ copy it elsewhere first (for example to /var/tmp) and pass that path",
 /// large enough for the rootfs image. The rootfs partition, if it is one,
 /// must not be mounted either.
 pub(crate) fn check_target(
+    target: &Target,
     backend: &SystemdBoot,
     boot: &Boot,
     slot: Slot,
     inputs: &Inputs,
-) -> Result<Target> {
+) -> Result<SlotPartition> {
     use std::os::unix::fs::MetadataExt;
     let device = backend.slot_device(boot, slot)?;
-    let table = target_root::mount_table()?;
+    let table = target.mount_table()?;
     if let Some(point) = target_root::mounted_at(&table, &device)? {
         return Err(refuse(format!(
             "slot partition '{}' is mounted at '{}'; unmount it before staging",
@@ -207,8 +206,10 @@ pub(crate) fn check_target(
         let point = match target_root::mounted_at(&table, &rootfs.path)? {
             Some(point) => Some(point),
             None => {
-                let root_dev = fs::metadata("/").context("reading '/'")?.dev();
-                (Some(root_dev) == rootfs.rdev).then(|| PathBuf::from("/"))
+                let root_dev = fs::metadata(&target.root)
+                    .with_context(|| format!("reading '{}'", target.root.display()))?
+                    .dev();
+                (Some(root_dev) == rootfs.rdev).then(|| target.root.clone())
             }
         };
         if let Some(point) = point {
@@ -228,29 +229,23 @@ pub(crate) fn check_target(
             device.display()
         )));
     }
-    let partuuid = target_root::partuuid(&device)?.ok_or_else(|| {
-        refuse(format!(
-            "'{}' has no PARTUUID (stage needs a GPT partition)",
-            device.display()
-        ))
-    })?;
-    Ok(Target { device, partuuid })
+    let partuuid = partuuid(&device)?;
+    Ok(SlotPartition { device, partuuid })
 }
 
 /// Write the slot. Its kernel goes first, so the slot cannot be booted
 /// until the kernel and entry are installed at the end.
 pub(crate) fn write_slot(
-    config: &Config,
+    target: &Target,
     backend: &SystemdBoot,
     boot: &Boot,
     slot: Slot,
     request: &StageRequest,
-    target: &Target,
-    profile: &Profile,
+    partition: &SlotPartition,
+    init: InitSystem,
 ) -> Result<()> {
-    let init = profile.init;
-    let device = &target.device;
-    let running_root = Path::new("/");
+    let device = &partition.device;
+    let running_root = target.root.as_path();
 
     backend.remove_slot_boot_files(boot, slot)?;
 
@@ -262,12 +257,12 @@ pub(crate) fn write_slot(
             .arg(device),
     )?;
 
-    let mount_point = config.stage_dir.join(format!("stage-{}", slot.entry_suffix()));
+    let mount_point = target.stage_mount(&format!("slot-{}", slot.to_string().to_ascii_lowercase()));
     fs::create_dir_all(&mount_point)
         .with_context(|| format!("creating '{}'", mount_point.display()))?;
-    let mounted = Mounted::mount(device, &mount_point)?;
+    let mounted = Mounted::new(target, &[], device, &mount_point)?;
     target_root::run(
-        Command::new(&config.recstrap)
+        Command::new(&target.programs.recstrap)
             .args(["--quiet", "--rootfs"])
             .arg(&request.rootfs)
             .arg(&mount_point),
@@ -282,7 +277,7 @@ pub(crate) fn write_slot(
     write_fstab(
         &running_root.join("etc/fstab"),
         &mount_point.join("etc/fstab"),
-        &target.partuuid,
+        &partition.partuuid,
         role.filesystem().as_str(),
     )?;
     sync_filesystem(&mount_point)?;
@@ -562,44 +557,20 @@ fn write_fstab(running: &Path, dest: &Path, partuuid: &str, filesystem: &str) ->
 /// A filesystem mounted for the stage, unmounted when dropped.
 pub(crate) struct Mounted {
     point: PathBuf,
+    umount: String,
     active: bool,
 }
 
 impl Mounted {
-    fn mount(device: &Path, point: &Path) -> Result<Self> {
-        target_root::run(Command::new("mount").arg(device).arg(point))?;
-        Ok(Self {
-            point: point.to_path_buf(),
-            active: true,
-        })
-    }
-
-    /// An EROFS image, read-only: a partition holding it, or an image file
-    /// through a loop device.
-    fn mount_image_ro(image: &Path, block_device: bool, point: &Path) -> Result<Self> {
-        target_root::run(
-            Command::new("mount")
-                .args(["-t", "erofs", "-o", if block_device { "ro" } else { "ro,loop" }])
-                .arg(image)
-                .arg(point),
-        )?;
-        Ok(Self {
-            point: point.to_path_buf(),
-            active: true,
-        })
-    }
-
-    fn mount_ro(device: &Path, point: &Path) -> Result<Self> {
-        target_root::run(Command::new("mount").args(["-o", "ro"]).arg(device).arg(point))?;
-        Ok(Self {
-            point: point.to_path_buf(),
-            active: true,
-        })
+    /// `source` mounted at `point` with `mount`'s `options`.
+    fn new(target: &Target, options: &[&str], source: &Path, point: &Path) -> Result<Self> {
+        target_root::run(Command::new(&target.programs.mount).args(options).arg(source).arg(point))?;
+        Ok(Self { point: point.to_path_buf(), umount: target.programs.umount.clone(), active: true })
     }
 
     fn unmount(mut self) -> Result<()> {
         self.active = false;
-        target_root::run(Command::new("umount").arg(&self.point))?;
+        target_root::run(Command::new(&self.umount).arg(&self.point))?;
         Ok(())
     }
 }
@@ -607,7 +578,7 @@ impl Mounted {
 impl Drop for Mounted {
     fn drop(&mut self) {
         if self.active {
-            if let Err(err) = target_root::run(Command::new("umount").arg(&self.point)) {
+            if let Err(err) = target_root::run(Command::new(&self.umount).arg(&self.point)) {
                 eprintln!("recab: warning: {err:#}");
             }
         }

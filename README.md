@@ -270,24 +270,21 @@ They are defined in [`src/error.rs`](src/error.rs).
 
 ## Environment Overrides
 
-Read once per command (`src/config.rs`), to point recab at a scratch tree.
-With `RECAB_EFIVARS_PATH` set, the EFI variables there are plain files.
+Read once per command (`src/target.rs`), to point recab at a scratch tree.
+Whether the variables directory is efivarfs is read from the filesystem: a
+plain directory holds the variables as plain files.
 
+- `RECAB_ROOT` (default `/`): the running system's root, which `stage` carries the machine's state from
+- `RECAB_OS_RELEASE_PATH` (default: the root's `etc/os-release`, else `usr/lib/os-release`; its `ID` names the entries and its `REC_INIT` picks the init system)
 - `RECAB_BOOT_ROOT` (default `/boot`)
-- `RECAB_STATE_PATH` (default `/var/lib/recab/state.json`)
-- `RECAB_AUDIT_PATH` (default `/var/lib/recab/audit.log`)
+- `RECAB_STATE_DIR` (default `/var/lib/recab`: `state.json` and `audit.log`)
 - `RECAB_LOCK_PATH` (default `/run/lock/recab.lock`)
-- `RECAB_OS_RELEASE_PATH` (default `/etc/os-release`; its `ID` names the entries and its `REC_*` distro profile picks the init system and privilege tool)
-- `RECAB_PROC_CMDLINE_PATH` (default `/proc/cmdline`)
+- `RECAB_PROC_PATH` (default `/proc`: the kernel command line, the mount table, OpenRC's processes)
 - `RECAB_SYS_FIRMWARE_EFI_PATH` (default `/sys/firmware/efi`)
 - `RECAB_EFIVARS_PATH` (default `/sys/firmware/efi/efivars`)
-- `RECAB_SYSTEMCTL_BIN` (default `systemctl`, used by `trial` on systemd)
-- `RECAB_OPENRC_DIR` (default `/run/openrc`, used by `trial` on OpenRC)
-- `RECAB_RC_STATUS_BIN` (default `rc-status`, used by `trial` on OpenRC)
-- `RECAB_RUNLEVELS_DIR` (default `/etc/runlevels`, used by `trial` on OpenRC: every service of the sysinit, boot and default runlevels must be started or inactive)
-- `RECAB_REBOOT_BIN` (default: `systemctl reboot`, or OpenRC's `openrc-shutdown -r now` / `reboot`)
-- `RECAB_RECSTRAP_BIN` (default `recstrap`, used by `stage`)
-- `RECAB_ENTRY_PREFIX` (override inferred `<prefix>-a.conf` / `<prefix>-b.conf`)
+- `RECAB_STAGE_DIR` (default `/run/recab`, where `stage` mounts the medium, the image and the slot)
+- `RECAB_OPENRC_DIR` (default `/run/openrc`) and `RECAB_RUNLEVELS_DIR` (default the root's `etc/runlevels`), read on OpenRC
+- `RECAB_SYSTEMCTL_BIN` (default `systemctl`), `RECAB_RC_STATUS_BIN` (default `rc-status`), `RECAB_REBOOT_BIN` (default `reboot`, busybox init's, used on OpenRC), `RECAB_RECSTRAP_BIN` (default `recstrap`)
 
 ## Non-Goals
 

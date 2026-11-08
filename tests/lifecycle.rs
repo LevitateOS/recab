@@ -81,8 +81,9 @@ esac
     /// Simulate a boot into `slot`: the running root changes, systemd-boot
     /// records the entry it booted and consumes the one-shot entry.
     fn boot_into(&self, slot: &str) {
+        fs::create_dir_all(self.path("proc")).unwrap();
         fs::write(
-            self.path("cmdline"),
+            self.path("proc/cmdline"),
             format!("quiet root=/dev/fake-{slot} ro\n"),
         )
         .unwrap();
@@ -128,11 +129,10 @@ esac
             Command::new(env!("CARGO_BIN_EXE_recab"))
         };
         cmd.env("RECAB_BOOT_ROOT", self.path("boot"))
-            .env("RECAB_STATE_PATH", self.path("state/state.json"))
-            .env("RECAB_AUDIT_PATH", self.path("state/audit.log"))
+            .env("RECAB_STATE_DIR", self.path("state"))
             .env("RECAB_LOCK_PATH", self.path("state/recab.lock"))
             .env("RECAB_OS_RELEASE_PATH", self.path("os-release"))
-            .env("RECAB_PROC_CMDLINE_PATH", self.path("cmdline"))
+            .env("RECAB_PROC_PATH", self.path("proc"))
             .env("RECAB_SYS_FIRMWARE_EFI_PATH", self.path("efi"))
             .env("RECAB_EFIVARS_PATH", self.path("efi/efivars"))
             .env("RECAB_SYSTEMCTL_BIN", self.path("systemctl"))
@@ -621,6 +621,8 @@ fn install_unit_writes_and_enables_the_trial_service() {
         "install-unit",
         "--root",
         tree.path("target").to_str().unwrap(),
+        "--package",
+        "systemd",
     ]);
     let unit = tree.read("target/usr/lib/systemd/system/recab-trial.service");
     let exec = format!("ExecStart={} trial --timeout {}", "/usr/bin/recab", recab::TRIAL_TIMEOUT_SECS);
@@ -661,6 +663,18 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
         "#!/bin/sh\ncase \"$*\" in *part-a) echo AAAA-1 ;; *part-b) echo BBBB-2 ;; esac\n",
     );
     tree.set_efivar("LoaderEntryDefault", Some("lev-b.conf"));
+    // The installed system as recsetup mounts it: slot A at the root, the
+    // ESP at boot/, the state partition at var/.
+    fs::create_dir_all(target.join("var")).unwrap();
+    fs::create_dir_all(tree.path("proc/self")).unwrap();
+    fs::write(
+        tree.path("proc/self/mountinfo"),
+        format!(
+            "40 1 8:2 / {t} rw - ext4 /dev/part-a rw\n41 40 8:1 / {t}/boot rw - vfat /dev/part-esp rw\n42 40 8:4 / {t}/var rw - ext4 /dev/part-state rw\n",
+            t = target.display()
+        ),
+    )
+    .unwrap();
 
     let out = tree
         .command(true)
@@ -846,7 +860,7 @@ fn install_unit_writes_and_enables_the_openrc_service() {
     fs::write(target.join("etc/os-release"), format!("ID=lev\n{OPENRC_PROFILE}")).unwrap();
     let out = tree
         .command(true)
-        .args(["install-unit", "--root", target.to_str().unwrap()])
+        .args(["install-unit", "--root", target.to_str().unwrap(), "--package", "openrc"])
         .output()
         .unwrap();
     assert!(

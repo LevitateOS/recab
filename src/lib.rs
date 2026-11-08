@@ -13,7 +13,6 @@
 //! selection); `store` keeps recab's state and audit log.
 
 mod carried;
-mod config;
 #[cfg(feature = "contracts")]
 pub mod contract;
 mod error;
@@ -25,12 +24,13 @@ mod state;
 mod status;
 mod store;
 mod systemd_boot;
+mod target;
 
 use anyhow::Result;
 use std::path::Path;
 use std::time::Duration;
 
-pub use config::state_file;
+pub use target::state_file;
 pub use init::{InitLayout, InitRequest};
 pub use stage::{StageRequest, StageSource};
 pub use distro_profile::InitSystem;
@@ -41,7 +41,7 @@ pub use state::{Slot, TrialRecord};
 pub use status::{status, SlotView, Status};
 pub use systemd_boot::{entry_name, layout_name, ENTRIES_DIR};
 
-use config::Config;
+use target::Target;
 use error::{classified, or_class};
 use state::{
     judge_trial, known_good, plan, plan_stage, BootChange, Operation, PersistentState, Request, Startup,
@@ -59,15 +59,17 @@ pub enum TrialOutcome {
     Committed(Slot),
 }
 
-/// One recab command's view: its configuration, the boot selection and
+/// One recab command's view: the system it looks at, the boot selection and
 /// recab's state, read once, under the run lock when the command may change
 /// anything.
 struct System {
-    config: Config,
+    target: Target,
     backend: SystemdBoot,
     store: Store,
     boot: Boot,
     state: PersistentState,
+    /// recab had written state (else `state` is the default).
+    state_found: bool,
     _lock: Option<Lock>,
 }
 
@@ -75,23 +77,22 @@ impl System {
     /// Read-only view (`status`) of this system, or of the system installed
     /// under `root`; works without root.
     fn read(root: Option<&Path>) -> Result<Self> {
-        let config = Config::running()?;
-        let config = match root {
-            Some(root) => config.install_target(root),
-            None => config,
+        let target = match root {
+            Some(root) => Target::installed(root)?,
+            None => Target::running()?,
         };
-        Self::open(config, None)
+        Self::open(target, None)
     }
 
     /// View for `operation`, which changes the system: refused unless root,
     /// and holding the run lock until dropped.
     fn locked(operation: &str) -> Result<Self> {
-        Self::open(Config::running()?, Some(operation))
+        Self::open(Target::running()?, Some(operation))
     }
 
-    fn open(config: Config, operation: Option<&str>) -> Result<Self> {
-        let backend = SystemdBoot::new(&config);
-        let store = Store::new(&config);
+    fn open(target: Target, operation: Option<&str>) -> Result<Self> {
+        let backend = SystemdBoot::new(&target);
+        let store = Store::new(&target);
         let lock = match operation {
             Some(operation) => {
                 require_root(operation)?;
@@ -102,8 +103,10 @@ impl System {
         // An ESP or state the run cannot read is "the slots or state could
         // not be read" (exit 21), whatever the I/O error.
         let boot = backend.read().map_err(|err| or_class(err.context("reading the boot selection"), ErrorClass::StateOrDetection))?;
-        let state = store.load()?;
-        Ok(Self { config, backend, store, boot, state, _lock: lock })
+        let loaded = store.load()?;
+        let state_found = loaded.is_some();
+        let state = loaded.unwrap_or_default();
+        Ok(Self { target, backend, store, boot, state, state_found, _lock: lock })
     }
 }
 
@@ -113,7 +116,9 @@ impl System {
 /// systemd-boot's firmware variables pointing at the installed entry.
 pub fn init(request: &InitRequest) -> Result<()> {
     require_root("init")?;
-    init::run(Config::running()?.install_target(&request.root), request)
+    let target = Target::installed(&request.root)?;
+    let _lock = Store::new(&target).lock()?;
+    init::run(target, request)
 }
 
 /// Write a prebuilt system into the inactive slot: format it, extract the
@@ -127,7 +132,7 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     let (_media, request) = match source {
         StageSource::Files(request) => (None, request.clone()),
         StageSource::Media(media) => {
-            let (mounted, request) = stage::open_media(&sys.config, media)?;
+            let (mounted, request) = stage::open_media(&sys.target, media)?;
             (mounted, request)
         }
     };
@@ -135,7 +140,7 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     let transition = plan_stage(&sys.boot.selection, &sys.state)?;
     let active = sys.boot.selection.active;
     let slot = active.other();
-    let profile = init_system::running_profile(&sys.config)?;
+    let init = sys.target.init()?;
     // A firmware variable systemd-boot skips today, because it names this
     // slot without a kernel, would take effect once the slot is written:
     // stage must be able to read and reset them.
@@ -144,15 +149,15 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     // The plan made sure the running slot is the known-good one and the
     // default (if any); this changes nothing systemd-boot boots now.
     sys.backend.reset_stale_selection(&sys.boot, active, slot)?;
-    let target = stage::check_target(&sys.backend, &sys.boot, slot, &inputs)?;
-    stage::check_flavour(&sys.config, &inputs, change_flavour)?;
+    let partition = stage::check_target(&sys.target, &sys.backend, &sys.boot, slot, &inputs)?;
+    stage::check_flavour(&sys.target, &inputs, change_flavour)?;
     // Recorded before the slot is touched: from here its old system is gone,
     // so nothing may roll back to it, even if the write fails.
     let next = stamped(&transition)?;
     sys.store.save(&next, "stage")?;
     sys.store
         .audit(transition.operation, sys.boot.selection.active, &sys.state, &next);
-    stage::write_slot(&sys.config, &sys.backend, &sys.boot, slot, request, &target, &profile)
+    stage::write_slot(&sys.target, &sys.backend, &sys.boot, slot, request, &partition, init)
 }
 
 /// Configure a one-shot trial boot of the inactive `slot`.
@@ -176,15 +181,15 @@ pub fn rollback() -> Result<()> {
 /// boot, and the machine rebooted into it. The verdict is [`judge_trial`]'s,
 /// and everything after it happens under the one lock.
 pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
-    let config = Config::running()?;
-    let init = init_system::running_profile(&config)?.init;
+    let target = Target::running()?;
+    let init = target.init()?;
     // Every image runs the trial service: with no recab state and no one-shot
     // boot in the firmware, this is no trial (a live or mutable system).
-    let firmware = SystemdBoot::new(&config);
-    if !Store::new(&config).exists()? && firmware.firmware_trial()? != Some(true) {
+    let firmware = SystemdBoot::new(&target);
+    if !Store::new(&target).exists()? && firmware.firmware_trial()? != Some(true) {
         return Ok(TrialOutcome::NotATrial);
     }
-    let health = init_system::wait_finished(&config, init, timeout)?;
+    let health = init_system::wait_finished(&target, init, timeout)?;
     let (startup, failed) = (health.startup, health.failed);
     let problem = match &startup {
         Startup::Running | Startup::Inconclusive(_) => String::new(),
@@ -200,12 +205,12 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
 
     // The ESP or /var may be what broke; the firmware still knows whether
     // this boot was a one-shot trial, and its default is the fallback.
-    let sys = System::open(config.clone(), Some("trial"));
+    let sys = System::open(target.clone(), Some("trial"));
     let view = match &sys {
         Ok(sys) => Some(TrialView {
             sel: &sys.boot.selection,
             state: &sys.state,
-            state_exists: sys.store.exists()?,
+            state_exists: sys.state_found,
         }),
         Err(_) => None,
     };
@@ -215,7 +220,7 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
         (TrialVerdict::Unreadable, Err(err)) => return Err(err),
         (TrialVerdict::RebootUnread, Err(err)) => {
             require_root("trial")?;
-            init_system::reboot(init, &config)?;
+            init_system::reboot(init, &target)?;
             return Err(fail(format!(
                 "this one-shot trial boot {problem}{failed}, and the slots could not be read ({err:#}); rebooting into the default entry"
             )));
@@ -259,7 +264,7 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
         // Planned from the state just written, under the same lock.
         change(System { state: next, ..sys }, Request::Rollback, |_| {})?;
     }
-    init_system::reboot(init, &config)?;
+    init_system::reboot(init, &target)?;
     Err(fail(format!(
         "the trial boot of slot {active} {detail}; not committing it. Rebooting into slot {fallback}."
     )))
@@ -268,19 +273,14 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
 /// How startup of the running system ended, waiting at most `timeout` for
 /// it to finish. Only reads; needs no A/B layout or state.
 pub fn health(timeout: Duration) -> Result<Health> {
-    let config = Config::running()?;
-    let init = init_system::running_profile(&config)?.init;
-    init_system::wait_finished(&config, init, timeout)
+    let target = Target::running()?;
+    let init = target.init()?;
+    init_system::wait_finished(&target, init, timeout)
 }
 
-/// Write recab's package contents into the tree `root` (what Recipe
-/// packages): the trial service for `init` (else the init system of `root`'s
-/// os-release), enabled, and the carried-state list.
-pub fn install_unit(root: &Path, package: Option<InitSystem>) -> Result<()> {
-    let init = match package {
-        Some(init) => init,
-        None => init_system::installed_profile(root)?.init,
-    };
+/// Write recab's package contents for `init` into the tree `root` (what
+/// Recipe packages): the trial service, enabled, and the carried-state list.
+pub fn install_unit(root: &Path, init: InitSystem) -> Result<()> {
     package::write(root, init)
 }
 
@@ -327,7 +327,7 @@ fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentSt
 
     let mut next = stamped(&transition)?;
     annotate(&mut next);
-    let init = init_system::running_profile(&sys.config)?.init;
+    let init = sys.target.init()?;
     match sys.backend.apply(&sys.boot, transition.boot, init) {
         Ok(()) => {}
         Err(ApplyError::Untouched(cause)) => {

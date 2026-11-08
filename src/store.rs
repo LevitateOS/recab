@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::config::Config;
+use crate::target::Target;
 use crate::error::refuse;
 use crate::state::{Operation, PersistentState, Slot};
 
@@ -37,11 +37,11 @@ struct AuditEvent<'a> {
 }
 
 impl Store {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(target: &Target) -> Self {
         Self {
-            state_path: config.state_path.clone(),
-            audit_path: config.audit_path.clone(),
-            lock_path: config.lock_path.clone(),
+            state_path: target.state_path(),
+            audit_path: target.audit_path(),
+            lock_path: target.lock.clone(),
         }
     }
 
@@ -71,19 +71,20 @@ impl Store {
         Ok(target_root::exists(&self.state_path)?)
     }
 
-    pub fn load(&self) -> Result<PersistentState> {
+    /// recab's state, `None` when it has written none here.
+    pub fn load(&self) -> Result<Option<PersistentState>> {
         let path = &self.state_path;
         let fail = |message: String| {
             refuse(format!("failed loading recab state '{}': {message}", path.display()),
             )
         };
         let Some(content) = target_root::read_optional(path).map_err(|err| fail(err.to_string()))? else {
-            return Ok(PersistentState::default());
+            return Ok(None);
         };
         let state: PersistentState =
             serde_json::from_str(&content).map_err(|err| fail(err.to_string()))?;
         state.check_schema().map_err(fail)?;
-        Ok(state)
+        Ok(Some(state))
     }
 
     pub fn save(&self, state: &PersistentState, during: &str) -> Result<()> {

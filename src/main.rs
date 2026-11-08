@@ -118,10 +118,9 @@ enum Command {
         /// Root of the tree (a package tree, or a system).
         #[arg(long, default_value = "/")]
         root: PathBuf,
-        /// The init system to write the service for; without it, the one the
-        /// root's os-release names.
+        /// The init system to write the service for.
         #[arg(long, value_name = "INIT", value_parser = str::parse::<recab::InitSystem>)]
-        package: Option<recab::InitSystem>,
+        package: recab::InitSystem,
     },
 }
 

@@ -10,20 +10,18 @@
 //! root, with the same options.
 
 use anyhow::{Context, Result};
-use distro_profile::os_release_value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::config::Config;
-use crate::state::{Operation, PersistentState};
+use crate::error::refuse;
+use crate::state::{Operation, PersistentState, Slot};
 use crate::store::Store;
 use crate::systemd_boot::{
-    install_loader, layout_entry_name, layout_name, loader_with_default, new_entry, os_prefix, SystemdBoot,
-    ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
+    install_loader, layout_entry_name, layout_name, loader_with_default, new_entry, SystemdBoot, ENTRIES_DIR,
+    INITRD_FILE, KERNEL_FILE, LOADER_CONF,
 };
-use crate::state::Slot;
-use crate::error::refuse;
-use std::path::PathBuf;
+use crate::target::{partuuid, Target};
+use recpart::policy::STATE_MOUNT;
 
 /// The root partitions `init` writes entries for.
 #[derive(Debug, Clone)]
@@ -47,15 +45,14 @@ pub struct InitRequest {
     pub options: String,
 }
 
-/// Set up the system under `request.root`; `config` is that system's
-/// ([`Config::install_target`]).
-pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
-    let root = &request.root;
-    let esp = config.boot_root.clone();
-    let (id, name) = os_identity(root)?;
-    let prefix = os_prefix(&id);
+/// Set up the system `target` (installed under `request.root`).
+pub(crate) fn run(target: Target, request: &InitRequest) -> Result<()> {
+    let esp = target.esp.clone();
+    let prefix = target.entry_prefix()?;
+    let name = target.os_name()?;
 
-    // The entries, each with its slot (`None`: the mutable root) and title.
+    // The entries, each with its slot (`None`: the mutable root) and title;
+    // the first is the installed system's.
     let entries: Vec<(Option<Slot>, String, String)> = match &request.layout {
         InitLayout::Ab { slot_a, slot_b } => {
             let (a, b) = (partuuid(slot_a)?, partuuid(slot_b)?);
@@ -69,9 +66,10 @@ pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
         }
         InitLayout::Mutable { root_device } => vec![(None, name.clone(), partuuid(root_device)?)],
     };
+    check_mounts(&target, &request.layout, &entries[0].2)?;
     let installed = entries[0].0;
 
-    install_loader(root, &esp)?;
+    install_loader(&target.root, &esp)?;
 
     // The installed system's kernel; slot B's directory stays empty, so its
     // entry cannot boot until `recab stage` fills it.
@@ -102,12 +100,12 @@ pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
             last_operation: Some(Operation::Init(Slot::A).label()),
             ..PersistentState::default()
         };
-        Store::new(&config).save(&state, "init")?;
+        Store::new(&target).save(&state, "init")?;
     }
 
     // A previous install may have left systemd-boot variables naming another
-    // entry; they win over loader.conf. Point them at the installed one.
-    let backend = SystemdBoot::new(&config);
+    // entry; they win over loader.conf. Point this machine's at the installed one.
+    let backend = SystemdBoot::new(&Target::running()?);
     if backend.efivars_available() {
         backend
             .set_loader_efivar("LoaderEntryDefault", Some(&default_entry))
@@ -123,19 +121,30 @@ until they are, they may select another entry. 'recab stage' resets them before 
     Ok(())
 }
 
-/// The target's os-release `ID` (the entry prefix) and `NAME` (entry titles).
-fn os_identity(root: &Path) -> Result<(String, String)> {
-    let content = target_root::os_release(root)?
-        .with_context(|| format!("'{}' has no os-release", root.display()))?;
-    let id = os_release_value(&content, "ID")
-        .with_context(|| format!("'{}'s os-release has no ID", root.display()))?;
-    let name = os_release_value(&content, "NAME").unwrap_or_else(|| id.clone());
-    Ok((id, name))
-}
-
-fn partuuid(device: &Path) -> Result<String> {
-    target_root::partuuid(device)?.ok_or_else(|| {
-        refuse(format!("'{}' has no PARTUUID; the root partitions must be GPT partitions", device.display()),
-        )
-    })
+/// The layout `init` writes must match what is mounted: the installed root
+/// (slot A, or the mutable root) at the target's root, its ESP at `boot/`,
+/// and for A/B the state partition at `var/`.
+fn check_mounts(target: &Target, layout: &InitLayout, installed_partuuid: &str) -> Result<()> {
+    let table = target.mount_table()?;
+    let mounted = |point: &Path| table.iter().rev().find(|m| m.mount_point == point);
+    let root = mounted(&target.root)
+        .ok_or_else(|| refuse(format!("'{}' is not a mount point; mount the installed root there", target.root.display())))?;
+    if partuuid(Path::new(&root.source))? != installed_partuuid {
+        let which = if matches!(layout, InitLayout::Ab { .. }) { "--slot-a" } else { "--root-device" };
+        return Err(refuse(format!(
+            "{which} is not the partition mounted at '{}' ({})",
+            target.root.display(),
+            root.source
+        )));
+    }
+    let mut needed = vec![target.esp.clone()];
+    if matches!(layout, InitLayout::Ab { .. }) {
+        needed.push(target.root.join(STATE_MOUNT.trim_start_matches('/')));
+    }
+    for point in needed {
+        if mounted(&point).is_none() {
+            return Err(refuse(format!("'{}' is not a mount point; mount the installed system's partition there", point.display())));
+        }
+    }
+    Ok(())
 }
