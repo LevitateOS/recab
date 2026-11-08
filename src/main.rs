@@ -83,6 +83,10 @@ enum Command {
         /// Root of the system to install into (for example an install target).
         #[arg(long, default_value = "/")]
         root: PathBuf,
+        /// Only write this init system's service file into the root (a package
+        /// tree, which has no os-release) and enable nothing.
+        #[arg(long, value_name = "INIT", value_parser = str::parse::<recab::InitSystem>)]
+        package: Option<recab::InitSystem>,
     },
 }
 
@@ -138,7 +142,7 @@ fn run() -> anyhow::Result<()> {
                 println!("recab: committed slot {slot} after a healthy trial boot");
             }
         }
-        Command::InstallUnit { root } => recab::install_unit(&root)?,
+        Command::InstallUnit { root, package } => recab::install_unit(&root, package)?,
     }
     Ok(())
 }

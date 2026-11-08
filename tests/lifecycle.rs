@@ -50,7 +50,7 @@ impl Tree {
                 r#"#!/bin/sh
 case "$*" in
   "is-system-running --wait") cat '{root}/system-state' ;;
-  list-units*) cat '{root}/failed-units' 2>/dev/null ;;
+  list-units*) cat '{root}/failed-units' 2>/dev/null || true ;;
   "--no-block reboot") echo reboot >> '{root}/reboot.log' ;;
 esac
 "#,
@@ -106,15 +106,15 @@ esac
         }
     }
 
-    /// Make writing the EFI variable `name` fail: a directory stands where
-    /// the variable file would be written.
+    /// Make writing the EFI variable `name` fail while it reads as unset: a
+    /// symlink into a missing directory stands where the variable would be.
     fn block_efivar(&self, name: &str, blocked: bool) {
         let path = self.path(&format!("efi/efivars/{name}-{GUID}"));
+        if path.symlink_metadata().is_ok() {
+            fs::remove_file(&path).unwrap();
+        }
         if blocked {
-            let _ = fs::remove_file(&path);
-            fs::create_dir_all(path.join("blocker")).unwrap();
-        } else {
-            let _ = fs::remove_dir_all(&path);
+            std::os::unix::fs::symlink(self.path("efi/missing/variable"), &path).unwrap();
         }
     }
 

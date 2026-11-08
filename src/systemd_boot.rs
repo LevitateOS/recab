@@ -11,7 +11,9 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::error::{tagged_err, ErrorClass};
+use distro_profile::os_release_value;
 use crate::state::{BootChange, Selection};
 use crate::store::{copy_durable, read_optional, sync_dir, write_durable};
 use crate::Slot;
@@ -30,16 +32,13 @@ const ALL_TRIAL_OPTIONS: &[&str] = &["rd.emergency=reboot", "systemd.crash_actio
 
 /// EFI variable attributes: non-volatile, boot-service and runtime access.
 const EFI_VARIABLE_ATTRIBUTES: u32 = 0x7;
-/// `statfs` magic of efivarfs.
-const EFIVARFS_MAGIC: i64 = 0xde5e81e4;
 /// `FS_IMMUTABLE_FL`, which efivarfs sets on variables.
 const FS_IMMUTABLE_FL: libc::c_int = 0x10;
 
 const KERNEL_FILE: &str = "vmlinuz";
 const INITRD_FILE: &str = "initramfs.img";
 
-/// Where the backend reads and writes. Every path can be redirected with its
-/// `RECAB_*` variable, which is how recab runs against a scratch tree.
+/// Where the backend reads and writes (from the run's [`Config`]).
 pub(crate) struct SystemdBoot {
     boot_root: PathBuf,
     loader_conf: PathBuf,
@@ -48,6 +47,8 @@ pub(crate) struct SystemdBoot {
     proc_cmdline: PathBuf,
     sys_firmware_efi: PathBuf,
     efivars: PathBuf,
+    /// `efivars` is efivarfs; else a scratch tree of plain files.
+    efivarfs: bool,
     /// The slot entries' name prefix, when not inferred.
     entry_prefix: Option<String>,
 }
@@ -75,63 +76,45 @@ pub(crate) enum ApplyError {
 }
 
 impl SystemdBoot {
-    /// The backend for a system whose ESP is mounted at `boot_root` (an
-    /// install target); everything else is the running system's.
-    pub fn at_boot_root(boot_root: &Path) -> Result<Self> {
-        let mut backend = Self::from_env()?;
-        backend.loader_conf = boot_root.join("loader/loader.conf");
-        backend.entries_dir = boot_root.join("loader/entries");
-        backend.boot_root = boot_root.to_path_buf();
-        Ok(backend)
-    }
-
-    pub fn from_env() -> Result<Self> {
-        let path = |var: &str, default: &str| {
-            PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
-        };
-        let boot_root = path("RECAB_BOOT_ROOT", "/boot");
-        let entry_prefix = match std::env::var("RECAB_ENTRY_PREFIX") {
-            Ok(prefix) if prefix.trim().is_empty() => {
-                return Err(tagged_err(
-                    ErrorClass::StateOrDetection,
-                    "RECAB_ENTRY_PREFIX is set but empty",
-                ))
-            }
-            Ok(prefix) => Some(prefix),
-            Err(_) => None,
-        };
-        Ok(Self {
-            loader_conf: boot_root.join("loader/loader.conf"),
-            entries_dir: boot_root.join("loader/entries"),
-            boot_root,
-            os_release: path("RECAB_OS_RELEASE_PATH", "/etc/os-release"),
-            proc_cmdline: path("RECAB_PROC_CMDLINE_PATH", "/proc/cmdline"),
-            sys_firmware_efi: path("RECAB_SYS_FIRMWARE_EFI_PATH", "/sys/firmware/efi"),
-            efivars: path("RECAB_EFIVARS_PATH", "/sys/firmware/efi/efivars"),
-            entry_prefix,
-        })
+    pub fn new(config: &Config) -> Self {
+        Self {
+            boot_root: config.boot_root.clone(),
+            loader_conf: config.boot_root.join("loader/loader.conf"),
+            entries_dir: config.boot_root.join("loader/entries"),
+            os_release: config.os_release.clone(),
+            proc_cmdline: config.proc_cmdline.clone(),
+            sys_firmware_efi: config.sys_firmware_efi.clone(),
+            efivars: config.efivars.clone(),
+            efivarfs: config.efivarfs,
+            entry_prefix: config.entry_prefix.clone(),
+        }
     }
 
     pub fn read(&self) -> Result<Boot> {
         // systemd-boot tries the LoaderEntryDefault firmware variable,
         // then loader.conf's `default`, skipping entries it cannot boot.
-        let efivar_default = self.loader_efivar("LoaderEntryDefault");
+        let efivar_default = self.loader_efivar("LoaderEntryDefault")?;
         let conf_default = read_optional(&self.loader_conf)?.as_deref().and_then(loader_default);
         let prefix = self.entry_prefix(efivar_default.as_deref().or(conf_default.as_deref()))?;
         let active = self.active_slot(&prefix)?;
-        let bootable_slot = |entry: Option<&str>| {
-            entry
+        let bootable_slot = |entry: Option<&str>| -> Result<Option<Slot>> {
+            let Some(slot) = entry
                 .and_then(parse_entry_name)
                 .filter(|(entry_prefix, _)| *entry_prefix == prefix)
                 .map(|(_, slot)| slot)
-                .filter(|slot| self.missing_boot_file(&entry_name(&prefix, *slot)).is_none())
+            else {
+                return Ok(None);
+            };
+            Ok(self.missing_boot_file(&entry_name(&prefix, slot))?.is_none().then_some(slot))
         };
-        let default = bootable_slot(efivar_default.as_deref())
-            .or_else(|| bootable_slot(conf_default.as_deref()));
+        let default = match bootable_slot(efivar_default.as_deref())? {
+            Some(slot) => Some(slot),
+            None => bootable_slot(conf_default.as_deref())?,
+        };
         // systemd-boot removes the variable when it boots the entry, so it is
         // the record of whether a trial is still to come.
-        let efivar_oneshot = self.loader_efivar("LoaderEntryOneShot");
-        let oneshot = bootable_slot(efivar_oneshot.as_deref());
+        let efivar_oneshot = self.loader_efivar("LoaderEntryOneShot")?;
+        let oneshot = bootable_slot(efivar_oneshot.as_deref())?;
         Ok(Boot {
             prefix,
             selection: Selection { active, default, oneshot },
@@ -144,13 +127,20 @@ impl SystemdBoot {
     /// entry systemd-boot booted is not the default. It needs neither the
     /// ESP nor /var mounted, so it still answers when a trial's startup broke.
     /// `None` when the variables do not name two slot entries of one prefix.
-    pub fn firmware_trial(&self) -> Option<bool> {
-        let (sel_prefix, selected) = parse_entry_name(&self.loader_efivar("LoaderEntrySelected")?)?;
-        let default = self.loader_efivar("LoaderEntryDefault").or_else(|| {
-            read_optional(&self.loader_conf).ok().flatten().as_deref().and_then(loader_default)
-        })?;
-        let (def_prefix, default) = parse_entry_name(&default)?;
-        (sel_prefix == def_prefix).then_some(selected != default)
+    pub fn firmware_trial(&self) -> Result<Option<bool>> {
+        let Some((sel_prefix, selected)) =
+            self.loader_efivar("LoaderEntrySelected")?.as_deref().and_then(parse_entry_name)
+        else {
+            return Ok(None);
+        };
+        let default = match self.loader_efivar("LoaderEntryDefault")? {
+            Some(default) => Some(default),
+            None => read_optional(&self.loader_conf)?.as_deref().and_then(loader_default),
+        };
+        let Some((def_prefix, default)) = default.as_deref().and_then(parse_entry_name) else {
+            return Ok(None);
+        };
+        Ok((sel_prefix == def_prefix).then_some(selected != default))
     }
 
     /// Point firmware variables that disagree with the effective selection
@@ -229,7 +219,7 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
             BootChange::Default(slot) => {
                 let entry = self.entry_for(boot, slot).map_err(ApplyError::Untouched)?;
                 let mut cleared_oneshot = false;
-                if self.loader_efivar("LoaderEntryOneShot").is_some() {
+                if self.loader_efivar("LoaderEntryOneShot").map_err(ApplyError::Untouched)?.is_some() {
                     self.set_loader_efivar("LoaderEntryOneShot", None).map_err(ApplyError::Untouched)?;
                     cleared_oneshot = true;
                 }
@@ -269,7 +259,7 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
     /// would skip it and boot another entry.
     pub fn ensure_bootable(&self, boot: &Boot, slot: Slot) -> Result<()> {
         let entry = self.entry_for(boot, slot)?;
-        if let Some(missing) = self.missing_boot_file(&entry) {
+        if let Some(missing) = self.missing_boot_file(&entry)? {
             return Err(tagged_err(
                 ErrorClass::StateOrDetection,
                 format!(
@@ -282,14 +272,17 @@ Write a system into slot {slot} with 'recab stage' first."
     }
 
     /// The first file the entry loads that the ESP lacks; the entry itself
-    /// when it is missing or unreadable.
-    fn missing_boot_file(&self, entry: &str) -> Option<String> {
-        let Ok(content) = self.entry_content(entry) else {
-            return Some(entry.to_string());
+    /// when it is missing.
+    fn missing_boot_file(&self, entry: &str) -> Result<Option<String>> {
+        let Some(content) = read_optional(&self.entries_dir.join(entry))? else {
+            return Ok(Some(entry.to_string()));
         };
-        entry_boot_files(&content)
-            .into_iter()
-            .find(|file| !self.boot_root.join(file.trim_start_matches('/')).is_file())
+        for file in entry_boot_files(&content) {
+            if !target_root::exists(&self.boot_root.join(file.trim_start_matches('/')))? {
+                return Ok(Some(file));
+            }
+        }
+        Ok(None)
     }
 
     /// Make `trial_options` the entry's only trial options (none: a default).
@@ -322,10 +315,15 @@ Write a system into slot {slot} with 'recab stage' first."
             )));
         }
         let device = selector
-            .device()
+            .device()?
             .ok_or_else(|| state_err(format!("entry '{entry}' names root '{selector}', which is not present")))?;
-        let cmdline = fs::read_to_string(&self.proc_cmdline).unwrap_or_default();
-        if let Some(running) = root_selector_from_cmdline(&cmdline).and_then(|s| s.device()) {
+        let cmdline = fs::read_to_string(&self.proc_cmdline)
+            .with_context(|| format!("reading '{}'", self.proc_cmdline.display()))?;
+        let running = match root_selector_from_cmdline(&cmdline) {
+            Some(selector) => selector.device()?,
+            None => None,
+        };
+        if let Some(running) = running {
             if running == device {
                 return Err(state_err(format!(
                     "entry '{entry}' names the running root '{}'; refusing to overwrite it",
@@ -439,8 +437,7 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
         for unit in value.encode_utf16().chain([0]) {
             bytes.extend(unit.to_le_bytes());
         }
-        if !on_efivarfs(&self.efivars) {
-            // A plain directory (a scratch tree): replace the file.
+        if !self.efivarfs {
             return fs::write(&path, &bytes).with_context(context);
         }
         use std::io::Write;
@@ -460,18 +457,26 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
     }
 
     /// A systemd-boot EFI variable holding an entry name, if set.
-    fn loader_efivar(&self, name: &str) -> Option<String> {
-        let bytes = fs::read(self.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"))).ok()?;
+    fn loader_efivar(&self, name: &str) -> Result<Option<String>> {
+        let path = self.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(anyhow!(err).context(format!("reading the EFI variable '{}'", path.display()))),
+        };
+        let unreadable = || anyhow!("the EFI variable '{}' is not a UTF-16 string", path.display());
         // 4 bytes of attributes, then a NUL-terminated UTF-16LE string.
         let units: Vec<u16> = bytes
-            .get(4..)?
+            .get(4..)
+            .ok_or_else(unreadable)?
             .as_chunks::<2>()
             .0
             .iter()
             .map(|pair| u16::from_le_bytes(*pair))
             .take_while(|unit| *unit != 0)
             .collect();
-        String::from_utf16(&units).ok().filter(|value| !value.is_empty())
+        let value = String::from_utf16(&units).map_err(|_| unreadable())?;
+        Ok((!value.is_empty()).then_some(value))
     }
 
     /// The active slot: the slot entry whose root= names the running root.
@@ -515,14 +520,14 @@ Expected matching root=... options in '{}' and '{}'.",
         let mut matched: Option<Slot> = None;
         for slot in [Slot::A, Slot::B] {
             let entry = entry_name(prefix, slot);
-            if !self.entries_dir.join(&entry).is_file() {
+            if !target_root::exists(&self.entries_dir.join(&entry))? {
                 continue;
             }
             let Some(entry_root) = root_selector_from_entry_content(&self.entry_content(&entry)?)
             else {
                 continue;
             };
-            if !entry_root.names_same_root(target) {
+            if !entry_root.names_same_root(target)? {
                 continue;
             }
             match matched {
@@ -557,17 +562,18 @@ Expected matching root=... options in '{}' and '{}'.",
                 .iter()
                 .all(|slot| self.entries_dir.join(entry_name(prefix, *slot)).is_file())
         };
-        if let Some(id) = os_release_id(&self.os_release)? {
+        let id = read_optional(&self.os_release)?
+            .and_then(|text| os_release_value(&text, "ID"))
+            .map(|id| id.to_ascii_lowercase());
+        if let Some(id) = id {
             if has_pair(&id) {
                 return Ok(id);
             }
         }
         let mut slots_by_prefix: BTreeMap<String, BTreeSet<Slot>> = BTreeMap::new();
-        if let Ok(entries) = fs::read_dir(&self.entries_dir) {
-            for entry in entries.flatten() {
-                if let Some((prefix, slot)) = parse_entry_name(&entry.file_name().to_string_lossy()) {
-                    slots_by_prefix.entry(prefix).or_default().insert(slot);
-                }
+        for name in target_root::dir_names(&self.entries_dir)? {
+            if let Some((prefix, slot)) = parse_entry_name(&name.to_string_lossy()) {
+                slots_by_prefix.entry(prefix).or_default().insert(slot);
             }
         }
         let mut paired = slots_by_prefix.into_iter().filter(|(_, slots)| slots.len() == 2);
@@ -611,17 +617,6 @@ fn parse_entry_name(entry: &str) -> Option<(String, Slot)> {
             .filter(|prefix| !prefix.is_empty())
             .map(|prefix| (prefix.to_string(), slot))
     })
-}
-
-fn os_release_id(path: &Path) -> Result<Option<String>> {
-    let Some(content) = read_optional(path)? else {
-        return Ok(None);
-    };
-    Ok(content
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("ID="))
-        .map(|value| value.trim_matches('"').trim().to_ascii_lowercase())
-        .find(|value| !value.is_empty()))
 }
 
 /// loader.conf's default entry: systemd-boot uses the last `default` line
@@ -756,20 +751,24 @@ impl RootSelector {
 
     /// The block device this selector names on the running system, through
     /// the kernel's /dev/disk links.
-    fn device(&self) -> Option<PathBuf> {
+    fn device(&self) -> Result<Option<PathBuf>> {
         let link = match self {
             Self::PartUuid(v) => PathBuf::from(format!("/dev/disk/by-partuuid/{v}")),
             Self::Uuid(v) => PathBuf::from(format!("/dev/disk/by-uuid/{v}")),
             Self::Label(v) => PathBuf::from(format!("/dev/disk/by-label/{v}")),
             Self::DevicePath(v) => PathBuf::from(v),
         };
-        fs::canonicalize(link).ok()
+        match fs::canonicalize(&link) {
+            Ok(device) => Ok(Some(device)),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(anyhow!(err).context(format!("resolving '{}'", link.display()))),
+        }
     }
 
     /// Same selector, or two selectors naming the same device (a cmdline
     /// UUID= and an entry PARTUUID= for one partition).
-    fn names_same_root(&self, other: &Self) -> bool {
-        self == other || matches!((self.device(), other.device()), (Some(a), Some(b)) if a == b)
+    fn names_same_root(&self, other: &Self) -> Result<bool> {
+        Ok(self == other || matches!((self.device()?, other.device()?), (Some(a), Some(b)) if a == b))
     }
 }
 
@@ -802,16 +801,6 @@ fn root_selector_from_entry_content(content: &str) -> Option<RootSelector> {
         .filter(|rest| rest.starts_with(char::is_whitespace))
         .collect();
     root_selector_from_cmdline(&options.join(" "))
-}
-
-fn on_efivarfs(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: a zeroed statfs is a valid out-parameter; `path` is NUL-terminated.
-    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-    unsafe { libc::statfs(path.as_ptr(), &mut stat) == 0 && stat.f_type as i64 == EFIVARFS_MAGIC }
 }
 
 /// Clear `FS_IMMUTABLE_FL`; filesystems without file flags have nothing to clear.

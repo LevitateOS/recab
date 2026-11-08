@@ -94,8 +94,6 @@ pub(crate) fn rollback_target(state: &PersistentState, sel: &Selection) -> Optio
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Request {
-    /// Write the inactive slot.
-    Stage,
     SetNext(Slot),
     Commit,
     Rollback,
@@ -104,6 +102,8 @@ pub(crate) enum Request {
 /// A state transition; its names are used in the state file and audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Operation {
+    /// `recab init` set up the slots with this one holding the system.
+    Init(Slot),
     Stage(Slot),
     SetNext(Slot),
     Commit(Slot),
@@ -115,6 +115,7 @@ pub(crate) enum Operation {
 impl Operation {
     pub fn name(self) -> &'static str {
         match self {
+            Operation::Init(_) => "init",
             Operation::Stage(_) => "stage",
             Operation::SetNext(_) => "set-next",
             Operation::Commit(_) => "commit",
@@ -126,6 +127,7 @@ impl Operation {
     /// `last_operation` in the state file.
     pub fn label(self) -> String {
         match self {
+            Operation::Init(slot) => format!("init-{slot}"),
             Operation::Stage(slot) => format!("stage-{slot}"),
             Operation::SetNext(slot) => format!("set-next-{slot}"),
             Operation::Commit(slot) => format!("commit-{slot}"),
@@ -156,6 +158,41 @@ fn refuse(message: String) -> anyhow::Error {
     tagged_err(ErrorClass::StateOrDetection, message)
 }
 
+/// The transition `stage` makes: it writes the inactive slot, or the reason
+/// it is refused.
+pub(crate) fn plan_stage(sel: &Selection, state: &PersistentState) -> Result<Transition> {
+    let active = sel.active;
+    let mut next = state.clone();
+    let slot = active.other();
+    if !committed(state, sel) {
+        return Err(refuse(format!(
+            "slot {active} is running uncommitted, so slot {slot} is the fallback; staging over it would leave no known-good system.\n\
+Run 'recab commit' to keep slot {active}, or reboot into slot {slot}."
+        )));
+    }
+    if sel.next_boot() == Some(slot) {
+        return Err(refuse(format!(
+            "the next boot is slot {slot}; run 'recab rollback' (or 'recab commit') so it is slot {active} before staging slot {slot}"
+        )));
+    }
+    // After a one-shot boot of the running slot, the freshly written
+    // slot would boot as the default, untried.
+    if sel.default == Some(slot) {
+        return Err(refuse(format!(
+            "the default is slot {slot}; run 'recab commit' so it is slot {active} before staging slot {slot}"
+        )));
+    }
+    next.known_good_slot = Some(active);
+    if next.pending_trial_slot == Some(slot) {
+        next.pending_trial_slot = None;
+    }
+    // Its system is about to be replaced: nothing to roll back to.
+    if next.previous_good_slot == Some(slot) {
+        next.previous_good_slot = None;
+    }
+    Ok(Transition { operation: Operation::Stage(slot), next, boot: BootChange::None })
+}
+
 /// The transition `request` makes from `state` and `sel`, `None` when the
 /// system already is where the request leads, or the reason it is refused.
 pub(crate) fn plan(
@@ -166,36 +203,6 @@ pub(crate) fn plan(
     let active = sel.active;
     let mut next = state.clone();
     let transition = match request {
-        Request::Stage => {
-            let slot = active.other();
-            if !committed(state, sel) {
-                return Err(refuse(format!(
-                    "slot {active} is running uncommitted, so slot {slot} is the fallback; staging over it would leave no known-good system.\n\
-Run 'recab commit' to keep slot {active}, or reboot into slot {slot}."
-                )));
-            }
-            if sel.next_boot() == Some(slot) {
-                return Err(refuse(format!(
-                    "the next boot is slot {slot}; run 'recab rollback' (or 'recab commit') so it is slot {active} before staging slot {slot}"
-                )));
-            }
-            // After a one-shot boot of the running slot, the freshly written
-            // slot would boot as the default, untried.
-            if sel.default == Some(slot) {
-                return Err(refuse(format!(
-                    "the default is slot {slot}; run 'recab commit' so it is slot {active} before staging slot {slot}"
-                )));
-            }
-            next.known_good_slot = Some(active);
-            if next.pending_trial_slot == Some(slot) {
-                next.pending_trial_slot = None;
-            }
-            // Its system is about to be replaced: nothing to roll back to.
-            if next.previous_good_slot == Some(slot) {
-                next.previous_good_slot = None;
-            }
-            Transition { operation: Operation::Stage(slot), next, boot: BootChange::None }
-        }
         Request::SetNext(slot) if slot == active => {
             return Err(refuse(format!(
                 "slot {slot} is the running slot; set-next stages the inactive slot ({}). To cancel a pending trial, run 'recab rollback'.",
@@ -265,24 +272,61 @@ pub(crate) enum Startup {
 }
 
 /// What a trial boot's outcome calls for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrialVerdict {
     /// Not a trial recab scheduled, or no verdict: do nothing.
     Ignore,
     Commit,
-    /// Do not commit; return to the default.
+    /// Do not commit; return to the known-good slot.
     Fail,
+    /// The slots could not be read, but the firmware says this failed boot
+    /// is a one-shot trial: reboot into the firmware's default.
+    RebootUnread,
+    /// The slots could not be read, and nothing says this boot is a trial.
+    Unreadable,
 }
 
-/// Judge a boot from how startup ended. Only the boot of the slot `set-next`
-/// scheduled is a trial; a slot picked from the boot menu, or a trial an
-/// operator already rolled back, is left alone.
-pub(crate) fn judge_trial(startup: &Startup, sel: &Selection, state: &PersistentState) -> TrialVerdict {
-    let is_trial = state.pending_trial_slot == Some(sel.active) && !committed(state, sel);
-    match startup {
-        _ if !is_trial => TrialVerdict::Ignore,
-        Startup::Running => TrialVerdict::Commit,
-        Startup::Failed(_) | Startup::TimedOut => TrialVerdict::Fail,
-        Startup::Inconclusive(_) => TrialVerdict::Ignore,
+/// What recab could read of the slots when it judges a trial.
+pub(crate) struct TrialView<'a> {
+    pub sel: &'a Selection,
+    pub state: &'a PersistentState,
+    /// recab's state file exists (it lives on /var, which may be what broke).
+    pub state_exists: bool,
+}
+
+/// Judge a boot from how startup ended, what recab read of the slots (`None`
+/// when the ESP or /var could not be read) and, asked only when the slots
+/// do not settle it, whether the firmware booted a one-shot entry. Only the
+/// boot of the slot `set-next` scheduled is a trial; a slot picked from the
+/// boot menu, or a trial an operator already rolled back, is left alone.
+pub(crate) fn judge_trial(
+    startup: &Startup,
+    view: Option<TrialView>,
+    firmware_trial: impl FnOnce() -> Result<Option<bool>>,
+) -> Result<TrialVerdict> {
+    if let Startup::Inconclusive(_) = startup {
+        return Ok(TrialVerdict::Ignore);
     }
+    let failed = *startup != Startup::Running;
+    let Some(view) = view else {
+        return Ok(if failed && firmware_trial()? == Some(true) {
+            TrialVerdict::RebootUnread
+        } else {
+            TrialVerdict::Unreadable
+        });
+    };
+    let is_trial = view.state.pending_trial_slot == Some(view.sel.active) && !committed(view.state, view.sel);
+    Ok(match startup {
+        // No state on /var but a one-shot boot that failed: /var itself may
+        // be what failed to mount.
+        _ if !is_trial => {
+            if failed && !view.state_exists && firmware_trial()? == Some(true) {
+                TrialVerdict::Fail
+            } else {
+                TrialVerdict::Ignore
+            }
+        }
+        Startup::Running => TrialVerdict::Commit,
+        _ => TrialVerdict::Fail,
+    })
 }

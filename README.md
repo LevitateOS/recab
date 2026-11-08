@@ -18,7 +18,7 @@ installers and scenario harnesses. Requirements: [REQUIREMENTS.md](REQUIREMENTS.
 - `recab commit`
 - `recab rollback`
 - `recab trial [--timeout <secs>]` (run by the trial service on every boot)
-- `recab install-unit [--root <dir>]`
+- `recab install-unit [--root <dir>] [--package <systemd|openrc>]`
 
 An update:
 
@@ -120,7 +120,10 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
 - `install-unit` writes the trial service for the init system under `<root>`
   and enables it: `recab-trial.service` in `sysinit.target`, or
   `/etc/init.d/recab-trial` in the boot runlevel (it runs `recab trial` in the
-  background, logging to the kernel log). Recipe packages this service in the system image; `init` and `stage` only enable it. `install-unit` remains an explicit repair command.
+  background, logging to the kernel log). With `--package <init>` it only
+  writes that init system's service file into a package tree, which is how the
+  install-tools recipe packages it in the system image; `init` and `stage` only
+  enable the packaged service.
 
 ### Trial options
 
@@ -264,6 +267,9 @@ a `[RECAB_ERR_*]` tag and exits with its class's code:
 They are defined in [`src/error.rs`](src/error.rs).
 
 ## Environment Overrides
+
+Read once per command (`src/config.rs`), to point recab at a scratch tree.
+With `RECAB_EFIVARS_PATH` set, the EFI variables there are plain files.
 
 - `RECAB_BOOT_ROOT` (default `/boot`)
 - `RECAB_STATE_PATH` (default `/var/lib/recab/state.json`)

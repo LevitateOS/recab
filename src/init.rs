@@ -6,17 +6,20 @@
 //! record of which partition is which slot.
 
 use anyhow::{bail, Context, Result};
+use distro_profile::os_release_value;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
+use crate::config::Config;
 use crate::init_system::{self, InitSystemExt};
-use crate::state::PersistentState;
+use crate::state::{Operation, PersistentState};
 use crate::store::{copy_durable, read_optional, write_durable, Store};
 use crate::systemd_boot::{loader_with_default, SystemdBoot, PANIC_OPTION};
 use crate::{tagged_err, ErrorClass, InitRequest, Slot};
 
-pub(crate) fn run(request: &InitRequest) -> Result<()> {
+/// Set up the system under `request.root`; `config` is that system's
+/// ([`Config::install_target`]).
+pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
     let root = &request.root;
     let boot_root = root.join("boot");
     // `bootctl install` creates loader/; installers that copy systemd-boot's
@@ -89,15 +92,15 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
 
     let state = PersistentState {
         known_good_slot: Some(Slot::A),
-        last_operation: Some("init-A".to_string()),
+        last_operation: Some(Operation::Init(Slot::A).label()),
         ..PersistentState::default()
     };
-    Store::under(root).save(&state, "init")?;
+    Store::new(&config).save(&state, "init")?;
     init.enable_trial_service(root)?;
 
     // A previous install may have left systemd-boot variables naming the
     // other slot; they win over loader.conf. Point them at slot A.
-    let backend = SystemdBoot::at_boot_root(&boot_root)?;
+    let backend = SystemdBoot::new(&config);
     if backend.efivars_available() {
         backend
             .set_loader_efivar("LoaderEntryDefault", Some(&default_entry))
@@ -115,39 +118,22 @@ until they are, they may select another entry. 'recab stage' resets them before 
 
 /// The target's os-release `ID` (the entry prefix) and `NAME` (entry titles).
 fn os_identity(root: &Path) -> Result<(String, String)> {
-    let content = ["etc/os-release", "usr/lib/os-release"]
-        .iter()
-        .find_map(|rel| fs::read_to_string(root.join(rel)).ok())
+    let content = target_root::os_release(root)?
         .with_context(|| format!("'{}' has no os-release", root.display()))?;
-    let field = |key: &str| {
-        content
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix(key))
-            .map(|value| value.trim_matches('"').trim().to_string())
-            .find(|value| !value.is_empty())
-    };
-    let id = field("ID=").with_context(|| format!("'{}'s os-release has no ID", root.display()))?;
-    let name = field("NAME=").unwrap_or_else(|| id.clone());
+    let id = os_release_value(&content, "ID")
+        .with_context(|| format!("'{}'s os-release has no ID", root.display()))?;
+    let name = os_release_value(&content, "NAME").unwrap_or_else(|| id.clone());
     Ok((id.to_ascii_lowercase(), name))
 }
 
 fn partuuid(device: &Path) -> Result<String> {
-    let out = Command::new("blkid")
-        .args(["-s", "PARTUUID", "-o", "value"])
-        .arg(device)
-        .output()
-        .context("running 'blkid'")?;
-    let value = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .to_ascii_lowercase();
-    if !out.status.success() || value.is_empty() {
-        return Err(tagged_err(
+    target_root::partuuid(device)?.ok_or_else(|| {
+        tagged_err(
             ErrorClass::StateOrDetection,
             format!(
                 "'{}' has no PARTUUID; A/B slots must be GPT partitions",
                 device.display()
             ),
-        ));
-    }
-    Ok(value)
+        )
+    })
 }

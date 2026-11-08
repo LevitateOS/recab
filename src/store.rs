@@ -1,11 +1,12 @@
-//! recab's state file and audit log, and durable file replacement.
+//! recab's state file, audit log and run lock.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::error::{tagged_err, ErrorClass};
 use crate::state::{Operation, PersistentState, STATE_SCHEMA_VERSION};
 use crate::Slot;
@@ -32,23 +33,11 @@ struct AuditEvent<'a> {
 }
 
 impl Store {
-    pub fn from_env() -> Self {
-        let path = |var: &str, default: &str| {
-            PathBuf::from(std::env::var(var).unwrap_or_else(|_| default.to_string()))
-        };
+    pub fn new(config: &Config) -> Self {
         Self {
-            state_path: path("RECAB_STATE_PATH", "/var/lib/recab/state.json"),
-            audit_path: path("RECAB_AUDIT_PATH", "/var/lib/recab/audit.log"),
-            lock_path: path("RECAB_LOCK_PATH", "/run/lock/recab.lock"),
-        }
-    }
-
-    /// The store of a system mounted at `root` (for `recab init`).
-    pub fn under(root: &Path) -> Self {
-        Self {
-            state_path: root.join("var/lib/recab/state.json"),
-            audit_path: root.join("var/lib/recab/audit.log"),
-            lock_path: root.join("run/lock/recab.lock"),
+            state_path: config.state_path.clone(),
+            audit_path: config.audit_path.clone(),
+            lock_path: config.lock_path.clone(),
         }
     }
 
@@ -74,8 +63,8 @@ impl Store {
     }
 
     /// recab has written state here.
-    pub fn exists(&self) -> bool {
-        self.state_path.is_file()
+    pub fn exists(&self) -> Result<bool> {
+        Ok(target_root::exists(&self.state_path)?)
     }
 
     pub fn load(&self) -> Result<PersistentState> {
@@ -120,15 +109,15 @@ impl Store {
         before: &PersistentState,
         after: &PersistentState,
     ) {
-        let event = AuditEvent {
-            schema: STATE_SCHEMA_VERSION,
-            timestamp_unix: after.last_transition_unix.unwrap_or_default(),
-            operation: operation.name(),
-            active_slot,
-            before,
-            after,
-        };
         let result = (|| -> Result<()> {
+            let event = AuditEvent {
+                schema: STATE_SCHEMA_VERSION,
+                timestamp_unix: crate::now()?,
+                operation: operation.name(),
+                active_slot,
+                before,
+                after,
+            };
             if let Some(parent) = self.audit_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -153,74 +142,18 @@ impl Store {
 }
 
 pub(crate) fn read_optional(path: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(anyhow!(err).context(format!("reading '{}'", path.display()))),
-    }
+    Ok(target_root::read_optional(path)?)
 }
 
-/// Replace `path` so that after a crash or power loss it holds either the
-/// old or the new content: write a sibling temp file, flush it to disk,
-/// rename it over `path`, and flush the directory so the rename persists.
-/// (On FAT, as on the ESP, the rename itself is not guaranteed atomic.)
+/// Durably replace `path` (see [`target_root::write_durable`]).
 pub(crate) fn write_durable(path: &Path, content: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("'{}' has no parent directory", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("creating parent directory '{}'", parent.display()))?;
-    let tmp = temp_sibling(path);
-    let written = (|| -> std::io::Result<()> {
-        let mut file = File::create(&tmp)?;
-        file.write_all(content)?;
-        file.sync_all()
-    })();
-    if let Err(err) = written {
-        let _ = fs::remove_file(&tmp);
-        return Err(anyhow!(err).context(format!("writing temp file '{}'", tmp.display())));
-    }
-    commit_temp(&tmp, path)
+    Ok(target_root::write_durable(path, content, None)?)
 }
 
-/// Copy `source` over `dest` the same way as [`write_durable`].
 pub(crate) fn copy_durable(source: &Path, dest: &Path) -> Result<()> {
-    let tmp = temp_sibling(dest);
-    let copied = fs::copy(source, &tmp).and_then(|_| File::open(&tmp)?.sync_all());
-    if let Err(err) = copied {
-        let _ = fs::remove_file(&tmp);
-        return Err(anyhow!(err).context(format!(
-            "copying '{}' to '{}'",
-            source.display(),
-            tmp.display()
-        )));
-    }
-    commit_temp(&tmp, dest)
+    Ok(target_root::copy_durable(source, dest)?)
 }
 
-fn temp_sibling(path: &Path) -> PathBuf {
-    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    path.with_file_name(format!(".{name}.recab-tmp-{}", std::process::id()))
-}
-
-fn commit_temp(tmp: &Path, path: &Path) -> Result<()> {
-    if let Err(err) = fs::rename(tmp, path) {
-        let _ = fs::remove_file(tmp);
-        return Err(anyhow!(err).context(format!(
-            "renaming '{}' to '{}'",
-            tmp.display(),
-            path.display()
-        )));
-    }
-    sync_dir(path.parent().unwrap_or(Path::new(".")))
-}
-
-/// Flush a directory's entries. Filesystems that cannot fsync a directory
-/// (EINVAL) persist renames on their own schedule; that is all they offer.
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    match File::open(dir).and_then(|d| d.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(err) if err.raw_os_error() == Some(libc::EINVAL) => Ok(()),
-        Err(err) => Err(anyhow!(err).context(format!("syncing directory '{}'", dir.display()))),
-    }
+    Ok(target_root::sync_dir(dir)?)
 }

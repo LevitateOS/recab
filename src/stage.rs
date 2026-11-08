@@ -8,14 +8,17 @@
 
 use anyhow::{bail, Context, Result};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::config::Config;
 use crate::init_system::{self, InitSystemExt};
-use distro_profile::Profile;
 use crate::store::write_durable;
 use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::{tagged_err, ErrorClass, Slot, StageRequest};
+use distro_profile::Profile;
+use target_root::ErofsImage;
 
 /// Machine configuration every new system keeps from the running one:
 /// identity, locale and time. Everything else under /etc comes from the new
@@ -43,26 +46,17 @@ const SSH_HOST_KEY_PREFIX: &str = "ssh_host_";
 /// The filesystem stage makes on a slot.
 const SLOT_FILESYSTEM: &str = "ext4";
 
-/// Where an EROFS image's superblock starts, and its magic number there.
-const EROFS_SUPERBLOCK_OFFSET: u64 = 1024;
-const EROFS_SUPER_MAGIC: u32 = 0xE0F5_E1E2;
-/// Block sizes (as a bit shift) an EROFS superblock can declare.
-const EROFS_BLOCK_SIZE_BITS: std::ops::RangeInclusive<u8> = 9..=16;
-
-/// The inputs a stage reads, checked before anything is changed.
+/// The inputs a stage reads, checked before anything is changed: the
+/// rootfs image, canonical.
 pub(crate) struct Inputs {
-    /// The rootfs image, canonical.
-    rootfs: PathBuf,
-    /// Its size: the file's length, or the image size a partition's EROFS
-    /// superblock declares.
-    rootfs_bytes: u64,
-    /// The device number, when the rootfs is a block device.
-    rootfs_rdev: Option<u64>,
+    rootfs: ErofsImage,
 }
 
 /// The partition a stage will write, checked before anything is changed.
 pub(crate) struct Target {
     device: PathBuf,
+    /// Its PARTUUID, which the new system's fstab names its root by.
+    partuuid: String,
 }
 
 fn refuse(message: String) -> anyhow::Error {
@@ -78,25 +72,16 @@ pub(crate) fn check_inputs(
     slot: Slot,
     request: &StageRequest,
 ) -> Result<Inputs> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
     let rootfs = &request.rootfs;
     // The rootfs may be an image file or a partition holding the image.
-    let meta = fs::metadata(rootfs)
-        .ok()
-        .filter(|m| m.is_file() || m.file_type().is_block_device())
-        .ok_or_else(|| {
+    let image = target_root::erofs_image(rootfs)
+        .map_err(|err| refuse(format!("rootfs image: {err}")))?
+        .map_err(|why| {
             refuse(format!(
-                "rootfs image '{}' is not a file or block device",
+                "rootfs '{}' is not an EROFS image ({why}); pass the system's .erofs image, or the partition holding it",
                 rootfs.display()
             ))
         })?;
-    let Some(declared_bytes) = erofs_image_bytes(rootfs)? else {
-        return Err(refuse(format!(
-            "rootfs '{}' is not an EROFS image (no EROFS superblock at byte {EROFS_SUPERBLOCK_OFFSET}); \
-pass the system's .erofs image, or the partition holding it",
-            rootfs.display()
-        )));
-    };
     for (what, path) in [
         ("kernel", Some(&request.kernel)),
         ("initrd", request.initrd.as_ref()),
@@ -109,14 +94,14 @@ pass the system's .erofs image, or the partition holding it",
     }
     // Stage removes this directory before it installs the kernel and initrd.
     let slot_dir = backend.slot_boot_files_dir(boot, slot);
-    if let Ok(slot_dir) = fs::canonicalize(&slot_dir) {
+    if let Some(slot_dir) = canonical(&slot_dir)? {
         for (what, path) in [
             ("rootfs", Some(rootfs)),
             ("kernel", Some(&request.kernel)),
             ("initrd", request.initrd.as_ref()),
         ] {
             let Some(path) = path else { continue };
-            if fs::canonicalize(path).is_ok_and(|p| p.starts_with(&slot_dir)) {
+            if canonical(path)?.is_some_and(|p| p.starts_with(&slot_dir)) {
                 return Err(refuse(format!(
                     "{what} '{}' is inside slot {slot}'s kernel directory '{}', which stage removes before installing the new kernel; \
 copy it elsewhere first (for example to /var/tmp) and pass that path",
@@ -126,13 +111,7 @@ copy it elsewhere first (for example to /var/tmp) and pass that path",
             }
         }
     }
-    let block_device = meta.file_type().is_block_device();
-    Ok(Inputs {
-        rootfs: fs::canonicalize(rootfs)
-            .with_context(|| format!("resolving '{}'", rootfs.display()))?,
-        rootfs_bytes: if block_device { declared_bytes } else { meta.len() },
-        rootfs_rdev: block_device.then(|| meta.rdev()),
-    })
+    Ok(Inputs { rootfs: image })
 }
 
 /// Check the slot's partition without changing anything: named by
@@ -147,56 +126,59 @@ pub(crate) fn check_target(
 ) -> Result<Target> {
     use std::os::unix::fs::MetadataExt;
     let device = backend.slot_device(boot, slot)?;
-    if let Some(point) = mounted_at(&device)? {
+    let table = target_root::mount_table()?;
+    if let Some(point) = target_root::mounted_at(&table, &device)? {
         return Err(refuse(format!(
-            "slot partition '{}' is mounted at '{point}'; unmount it before staging",
-            device.display()
+            "slot partition '{}' is mounted at '{}'; unmount it before staging",
+            device.display(),
+            point.display()
         )));
     }
-    let device_rdev = fs::metadata(&device).ok().map(|m| m.rdev());
-    if inputs.rootfs == device || (inputs.rootfs_rdev.is_some() && inputs.rootfs_rdev == device_rdev) {
+    let rootfs = &inputs.rootfs;
+    if rootfs.path == device || rootfs.rdev.is_some() && rootfs.rdev == Some(target_root::block_rdev(&device)?) {
         return Err(refuse(format!(
             "rootfs '{}' is slot {slot}'s partition, which stage formats; pass the EROFS image file or the partition holding it",
-            inputs.rootfs.display()
+            rootfs.path.display()
         )));
     }
-    if inputs.rootfs_rdev.is_some() {
-        let point = mounted_at(&inputs.rootfs)?.or_else(|| {
-            let root_dev = fs::metadata("/").ok().map(|m| m.dev());
-            (root_dev == inputs.rootfs_rdev).then(|| "/".to_string())
-        });
+    if rootfs.rdev.is_some() {
+        let point = match target_root::mounted_at(&table, &rootfs.path)? {
+            Some(point) => Some(point),
+            None => {
+                let root_dev = fs::metadata("/").context("reading '/'")?.dev();
+                (Some(root_dev) == rootfs.rdev).then(|| PathBuf::from("/"))
+            }
+        };
         if let Some(point) = point {
             return Err(refuse(format!(
-                "rootfs partition '{}' is mounted at '{point}'; unmount it, or pass the EROFS image file",
-                inputs.rootfs.display()
+                "rootfs partition '{}' is mounted at '{}'; unmount it, or pass the EROFS image file",
+                rootfs.path.display(),
+                point.display()
             )));
         }
     }
-    let slot_bytes = block_device_bytes(&device)?;
-    if inputs.rootfs_bytes > slot_bytes {
+    let slot_bytes = target_root::block_device_bytes(&device)?;
+    if rootfs.bytes > slot_bytes {
         return Err(refuse(format!(
             "rootfs image '{}' ({} bytes) does not fit in slot {slot}'s partition '{}' ({slot_bytes} bytes)",
-            inputs.rootfs.display(),
-            inputs.rootfs_bytes,
+            rootfs.path.display(),
+            rootfs.bytes,
             device.display()
         )));
     }
-    let partuuid = output(
-        "blkid",
-        &["-s", "PARTUUID", "-o", "value", path_str(&device)?],
-    )?;
-    if partuuid.is_empty() {
-        return Err(refuse(format!(
+    let partuuid = target_root::partuuid(&device)?.ok_or_else(|| {
+        refuse(format!(
             "'{}' has no PARTUUID (stage needs a GPT partition)",
             device.display()
-        )));
-    }
-    Ok(Target { device })
+        ))
+    })?;
+    Ok(Target { device, partuuid })
 }
 
 /// Write the slot. Its kernel goes first, so the slot cannot be booted
 /// until the kernel and entry are installed at the end.
 pub(crate) fn write_slot(
+    config: &Config,
     backend: &SystemdBoot,
     boot: &Boot,
     slot: Slot,
@@ -210,43 +192,33 @@ pub(crate) fn write_slot(
 
     backend.remove_slot_boot_files(boot, slot)?;
 
-    let label = output("blkid", &["-s", "LABEL", "-o", "value", path_str(device)?])
-        .ok()
-        .filter(|label| !label.is_empty())
-        .unwrap_or_else(|| format!("ROOT_{slot}"));
-    run(
-        &format!("mkfs.{SLOT_FILESYSTEM}"),
-        &["-F", "-q", "-L", &label, path_str(device)?],
+    let label = target_root::blkid_tag(device, "LABEL")?.unwrap_or_else(|| format!("ROOT_{slot}"));
+    target_root::run(
+        Command::new(format!("mkfs.{SLOT_FILESYSTEM}"))
+            .args(["-F", "-q", "-L", &label])
+            .arg(device),
     )?;
 
-    let mount_point = PathBuf::from(format!("/run/recab/stage-{}", slot.entry_suffix()));
+    let mount_point = config.stage_dir.join(format!("stage-{}", slot.entry_suffix()));
     fs::create_dir_all(&mount_point)
         .with_context(|| format!("creating '{}'", mount_point.display()))?;
     let mounted = Mounted::mount(device, &mount_point)?;
-    let recstrap = std::env::var("RECAB_RECSTRAP_BIN").unwrap_or_else(|_| "recstrap".to_string());
-    run(
-        &recstrap,
-        &[
-            "--quiet",
-            "--rootfs",
-            path_str(&request.rootfs)?,
-            path_str(&mount_point)?,
-        ],
+    target_root::run(
+        Command::new(&config.recstrap)
+            .args(["--quiet", "--rootfs"])
+            .arg(&request.rootfs)
+            .arg(&mount_point),
     )
     .context("extracting the rootfs image into the slot")?;
     carry_configuration(running_root, &mount_point, profile)?;
-    if init.trial_service_enabled(running_root) {
+    if init.trial_service_enabled(running_root)? {
         init.enable_trial_service(&mount_point)
             .context("enabling the new system's packaged trial service")?;
     }
-    let partuuid = output(
-        "blkid",
-        &["-s", "PARTUUID", "-o", "value", path_str(device)?],
-    )?;
     write_fstab(
         &running_root.join("etc/fstab"),
         &mount_point.join("etc/fstab"),
-        &partuuid,
+        &target.partuuid,
     )?;
     sync_filesystem(&mount_point)?;
     mounted.unmount()?;
@@ -260,69 +232,13 @@ pub(crate) fn write_slot(
     )
 }
 
-/// The image size an EROFS superblock at the start of `path` declares
-/// (block count times block size), or `None` when there is none.
-fn erofs_image_bytes(path: &Path) -> Result<Option<u64>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let context = || format!("reading rootfs '{}'", path.display());
-    let mut file = fs::File::open(path).with_context(context)?;
-    file.seek(SeekFrom::Start(EROFS_SUPERBLOCK_OFFSET)).with_context(context)?;
-    // magic (u32), checksum (u32), feature_compat (u32), blkszbits (u8),
-    // sb_extslots (u8), root nid (u16), inos (u64), build time (u64, u32),
-    // blocks (u32): all little-endian.
-    let mut superblock = [0u8; 40];
-    match file.read_exact(&mut superblock) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err).with_context(context),
+/// The canonical form of `path`; `None` when it does not exist.
+fn canonical(path: &Path) -> Result<Option<PathBuf>> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("resolving '{}'", path.display())),
     }
-    let u32_at = |at: usize| u32::from_le_bytes(superblock[at..at + 4].try_into().unwrap());
-    let block_bits = superblock[12];
-    if u32_at(0) != EROFS_SUPER_MAGIC || !EROFS_BLOCK_SIZE_BITS.contains(&block_bits) {
-        return Ok(None);
-    }
-    Ok(Some(u64::from(u32_at(36)) << block_bits))
-}
-
-/// A block device's size: from sysfs, else by seeking to its end.
-fn block_device_bytes(device: &Path) -> Result<u64> {
-    use std::io::{Seek, SeekFrom};
-    let sectors = device
-        .file_name()
-        .and_then(|name| fs::read_to_string(Path::new("/sys/class/block").join(name).join("size")).ok())
-        .and_then(|size| size.trim().parse::<u64>().ok());
-    if let Some(sectors) = sectors {
-        return Ok(sectors * 512);
-    }
-    let context = || format!("reading the size of '{}'", device.display());
-    fs::File::open(device)
-        .with_context(context)?
-        .seek(SeekFrom::End(0))
-        .with_context(context)
-}
-
-/// Where the block device `device` (canonical) is mounted, if anywhere.
-fn mounted_at(device: &Path) -> Result<Option<String>> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let rdev = fs::metadata(device)
-        .ok()
-        .filter(|m| m.file_type().is_block_device())
-        .map(|m| m.rdev());
-    let mounts = fs::read_to_string("/proc/self/mounts").context("reading /proc/self/mounts")?;
-    Ok(mounts.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        let (source, point) = (fields.next()?, fields.next()?);
-        if !source.starts_with('/') {
-            return None;
-        }
-        let same = fs::canonicalize(source).is_ok_and(|p| p == device)
-            || rdev.is_some_and(|rdev| {
-                fs::metadata(source)
-                    .is_ok_and(|m| m.file_type().is_block_device() && m.rdev() == rdev)
-            });
-        // /proc/self/mounts escapes spaces as \040.
-        same.then(|| point.replace("\\040", " "))
-    }))
 }
 
 /// Copy the machine configuration from the running root into the new one.
@@ -330,7 +246,7 @@ fn carry_configuration(from: &Path, to: &Path, profile: &Profile) -> Result<()> 
     let carried = init_system::carried(profile);
     for rel in CARRIED_FILES.iter().chain(&carried.files) {
         let source = from.join(rel);
-        if source.symlink_metadata().is_ok() {
+        if target_root::exists(&source)? {
             copy_tree(&source, &to.join(rel))?;
         }
     }
@@ -343,15 +259,9 @@ fn carry_configuration(from: &Path, to: &Path, profile: &Profile) -> Result<()> 
             copy_tree(&source, &to.join(rel))?;
         }
     }
-    if let Ok(entries) = fs::read_dir(from.join(SSH_DIR)) {
-        for entry in entries.flatten() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(SSH_HOST_KEY_PREFIX)
-            {
-                copy_tree(&entry.path(), &to.join(SSH_DIR).join(entry.file_name()))?;
-            }
+    for name in target_root::dir_names(&from.join(SSH_DIR))? {
+        if name.to_string_lossy().starts_with(SSH_HOST_KEY_PREFIX) {
+            copy_tree(&from.join(SSH_DIR).join(&name), &to.join(SSH_DIR).join(&name))?;
         }
     }
     Ok(())
@@ -367,7 +277,11 @@ fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
     let meta =
         fs::symlink_metadata(source).with_context(|| format!("reading '{}'", source.display()))?;
     let context = || format!("copying '{}' to '{}'", source.display(), dest.display());
-    let existing = fs::symlink_metadata(dest).ok();
+    let existing = match fs::symlink_metadata(dest) {
+        Ok(meta) => Some(meta),
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(context),
+    };
     if meta.is_dir() {
         if existing.as_ref().is_some_and(|e| !e.is_dir()) {
             fs::remove_file(dest).with_context(context)?;
@@ -419,44 +333,24 @@ fn sync_filesystem(path: &Path) -> Result<()> {
 /// their place, then the running system's other lines. Keeps the image
 /// file's owner and mode (shadow files are not world-readable).
 fn merge_accounts(running: &Path, image: &Path) -> Result<()> {
-    let Ok(running_content) = fs::read_to_string(running) else {
+    let Some(running_content) = target_root::read_optional(running)? else {
         return Ok(());
     };
-    let Ok(image_content) = fs::read_to_string(image) else {
+    let Some(image_content) = target_root::read_optional(image)? else {
         return copy_tree(running, image);
     };
-    let name = |line: &str| line.split(':').next().unwrap_or("").to_string();
-    let running_lines: Vec<&str> = running_content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    let mut used = std::collections::HashSet::new();
-    let mut merged: Vec<String> = Vec::new();
-    for line in image_content.lines().filter(|l| !l.trim().is_empty()) {
-        let key = name(line);
-        match running_lines.iter().find(|r| name(r) == key) {
-            Some(own) => {
-                used.insert(key);
-                merged.push(own.to_string());
-            }
-            None => merged.push(line.to_string()),
-        }
-    }
-    merged.extend(
-        running_lines
-            .iter()
-            .filter(|line| !used.contains(&name(line)))
-            .map(|line| line.to_string()),
-    );
-    write_preserving_mode(image, (merged.join("\n") + "\n").as_bytes())
+    write_preserving_mode(
+        image,
+        target_root::merge_accounts(&image_content, &running_content).as_bytes(),
+    )
 }
 
 /// Replace `path`'s content durably, keeping its owner and permissions.
 fn write_preserving_mode(path: &Path, content: &[u8]) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path).with_context(|| format!("reading '{}'", path.display()))?;
-    write_durable(path, content).with_context(|| format!("writing '{}'", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+    target_root::write_durable(path, content, Some(meta.mode() & 0o7777))
+        .with_context(|| format!("writing '{}'", path.display()))?;
     std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()))
         .with_context(|| format!("restoring the owner of '{}'", path.display()))
 }
@@ -497,7 +391,7 @@ struct Mounted {
 
 impl Mounted {
     fn mount(device: &Path, point: &Path) -> Result<Self> {
-        run("mount", &[path_str(device)?, path_str(point)?])?;
+        target_root::run(Command::new("mount").arg(device).arg(point))?;
         Ok(Self {
             point: point.to_path_buf(),
             active: true,
@@ -506,50 +400,17 @@ impl Mounted {
 
     fn unmount(mut self) -> Result<()> {
         self.active = false;
-        run("umount", &[path_str(&self.point)?])
+        target_root::run(Command::new("umount").arg(&self.point))?;
+        Ok(())
     }
 }
 
 impl Drop for Mounted {
     fn drop(&mut self) {
         if self.active {
-            if let Err(err) = run("umount", &[&self.point.to_string_lossy()]) {
+            if let Err(err) = target_root::run(Command::new("umount").arg(&self.point)) {
                 eprintln!("recab: warning: {err:#}");
             }
         }
     }
-}
-
-fn path_str(path: &Path) -> Result<&str> {
-    path.to_str()
-        .with_context(|| format!("path '{}' is not UTF-8", path.display()))
-}
-
-fn run(program: &str, args: &[&str]) -> Result<()> {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("running '{program}'"))?;
-    if !out.status.success() {
-        bail!(
-            "{program} {args:?} failed (exit {}): {}",
-            out.status.code().unwrap_or(1),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn output(program: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("running '{program}'"))?;
-    if !out.status.success() {
-        bail!(
-            "{program} {args:?} failed (exit {})",
-            out.status.code().unwrap_or(1)
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
