@@ -17,12 +17,9 @@ pub fn export() -> Result<Contract> {
     c.types_from::<Status>().types_from::<Health>().types_from::<ErrorPayload>();
     c.constant("SLOTS", "The slots, as every recab command and document spells them.", &Slot::ALL)?;
     c.constant("ERROR_SCHEMA_VERSION", "The schema of the error a failed `--json` command prints.", &crate::error::ERROR_SCHEMA_VERSION)?;
-    let classes: BTreeMap<String, serde_json::Value> = ErrorClass::ALL
+    let classes: BTreeMap<&str, serde_json::Value> = ErrorClass::ALL
         .iter()
-        .map(|class| {
-            let name = serde_json::to_value(class).unwrap().as_str().unwrap().to_string();
-            (name, serde_json::json!({ "code": class.code(), "tag": class.tag() }))
-        })
+        .map(|class| (class.name(), serde_json::json!({ "code": class.code(), "tag": class.tag() })))
         .collect();
     c.constant("ERROR_CLASSES", "Each error class's exit status and the tag its text message starts with.", &classes)?;
     c.constant("STATE_FILE", "Where recab keeps its state on an installed system.", &crate::state_file())?;

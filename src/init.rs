@@ -9,7 +9,7 @@
 //! record of which partition is which slot. Mutable: one entry for the one
 //! root, with the same options.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use distro_profile::os_release_value;
 use std::fs;
 use std::path::Path;
@@ -22,7 +22,7 @@ use crate::systemd_boot::{
     ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
 };
 use crate::state::Slot;
-use crate::{tagged_err, ErrorClass};
+use crate::error::refuse;
 use std::path::PathBuf;
 
 /// The root partitions `init` writes entries for.
@@ -60,7 +60,7 @@ pub(crate) fn run(config: Config, request: &InitRequest) -> Result<()> {
         InitLayout::Ab { slot_a, slot_b } => {
             let (a, b) = (partuuid(slot_a)?, partuuid(slot_b)?);
             if a == b {
-                bail!("slot A and slot B are the same partition");
+                return Err(refuse("slot A and slot B are the same partition"));
             }
             vec![
                 (Some(Slot::A), format!("{name} (Slot A)"), a),
@@ -135,9 +135,7 @@ fn os_identity(root: &Path) -> Result<(String, String)> {
 
 fn partuuid(device: &Path) -> Result<String> {
     target_root::partuuid(device)?.ok_or_else(|| {
-        tagged_err(
-            ErrorClass::StateOrDetection,
-            format!("'{}' has no PARTUUID; the root partitions must be GPT partitions", device.display()),
+        refuse(format!("'{}' has no PARTUUID; the root partitions must be GPT partitions", device.display()),
         )
     })
 }

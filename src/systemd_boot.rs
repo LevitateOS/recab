@@ -12,7 +12,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, RunningRoot};
-use crate::error::{tagged_err, ErrorClass};
+use crate::error::{classified, or_class, refuse, ErrorClass};
 use distro_profile::os_release_value;
 use crate::state::{BootChange, Selection};
 use crate::init_system::crash_option;
@@ -184,9 +184,8 @@ impl SystemdBoot {
                 .is_some_and(|(prefix, named)| prefix == boot.prefix && named == slot)
         };
         let refuse = |variable: &str, value: &str, fix: String, err: anyhow::Error| {
-            tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
+            classified(
+                ErrorClass::BackendUnavailable,format!(
                     "systemd-boot's {variable} names '{value}', a stale value that would boot slot {slot} or another entry instead of slot {keep}, and {fix} failed: {err:#}.\n\
 Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) and retry.",
                     self.efivars.display()
@@ -218,7 +217,7 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
             (&self.efivars, "mount efivarfs or boot under UEFI"),
         ] {
             if !dir.is_dir() {
-                return Err(tagged_err(
+                return Err(classified(
                     ErrorClass::BackendUnavailable,
                     format!(
                         "changing the boot selection needs '{}', which is missing: {missing}",
@@ -286,9 +285,7 @@ Slot {slot} was not changed. Make '{}' writable (efivarfs mounted read-write) an
     pub fn ensure_bootable(&self, boot: &Boot, slot: Slot) -> Result<()> {
         let entry = self.entry_for(boot, slot)?;
         if let Some(missing) = self.missing_boot_file(&entry)? {
-            return Err(tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
+            return Err(refuse(format!(
                     "slot {slot} is not bootable: its entry '{entry}' names '{missing}', which is not on the boot partition.\n\
 Write a system into slot {slot} with 'recab stage' first."
                 ),
@@ -331,26 +328,25 @@ Write a system into slot {slot} with 'recab stage' first."
     /// returned for the other slot.
     pub fn slot_device(&self, boot: &Boot, slot: Slot) -> Result<PathBuf> {
         let entry = self.entry_for(boot, slot)?;
-        let state_err = |message: String| tagged_err(ErrorClass::StateOrDetection, message);
         let selector = root_selector_from_entry_content(&self.entry_content(&entry)?)
-            .ok_or_else(|| state_err(format!("entry '{entry}' has no root= option naming its partition")))?;
+            .ok_or_else(|| refuse(format!("entry '{entry}' has no root= option naming its partition")))?;
         // Formatting gives the filesystem a new UUID and label stays only by
         // care; the partition's PARTUUID is what survives it.
         if !matches!(selector, RootSelector::PartUuid(_)) {
-            return Err(state_err(format!(
+            return Err(refuse(format!(
                 "entry '{entry}' names its root as '{selector}'; stage needs root=PARTUUID=, which formatting does not change"
             )));
         }
         let device = selector
             .device()?
-            .ok_or_else(|| state_err(format!("entry '{entry}' names root '{selector}', which is not present")))?;
+            .ok_or_else(|| refuse(format!("entry '{entry}' names root '{selector}', which is not present")))?;
         let running = match self.running_root_selector()? {
             Some(selector) => selector.device()?,
             None => None,
         };
         if let Some(running) = running {
             if running == device {
-                return Err(state_err(format!(
+                return Err(refuse(format!(
                     "entry '{entry}' names the running root '{}'; refusing to overwrite it",
                     device.display()
                 )));
@@ -420,9 +416,7 @@ Write a system into slot {slot} with 'recab stage' first."
         let entry = entry_name(&boot.prefix, slot);
         let path = self.entries_dir.join(&entry);
         if !path.is_file() {
-            return Err(tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
+            return Err(refuse(format!(
                     "required systemd-boot entry missing: '{}'.\n\
 Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf).",
                     path.display(),
@@ -448,6 +442,11 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
     /// that flag is cleared first, and a variable is replaced by writing
     /// attributes and value in one write.
     pub(crate) fn set_loader_efivar(&self, name: &str, value: Option<&str>) -> Result<()> {
+        self.write_loader_efivar(name, value)
+            .map_err(|err| or_class(err, ErrorClass::BackendUnavailable))
+    }
+
+    fn write_loader_efivar(&self, name: &str, value: Option<&str>) -> Result<()> {
         let path = self.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
         let context = || format!("writing the EFI variable '{}'", path.display());
         if path.exists() {
@@ -485,10 +484,10 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
     /// A systemd-boot EFI variable holding an entry name, if set.
     fn loader_efivar(&self, name: &str) -> Result<Option<String>> {
         let path = self.efivars.join(format!("{name}-{LOADER_VENDOR_GUID}"));
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(anyhow!(err).context(format!("reading the EFI variable '{}'", path.display()))),
+        let Some(bytes) = target_root::read_optional_bytes(&path)
+            .with_context(|| format!("reading the EFI variable '{}'", path.display()))?
+        else {
+            return Ok(None);
         };
         let unreadable = || anyhow!("the EFI variable '{}' is not a UTF-16 string", path.display());
         // 4 bytes of attributes, then a NUL-terminated UTF-16LE string.
@@ -512,9 +511,7 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
         match &self.running_root {
             RunningRoot::Cmdline(path) => {
                 let cmdline = fs::read_to_string(path).map_err(|err| {
-                    tagged_err(
-                        ErrorClass::StateOrDetection,
-                        format!("unable to determine active slot: cannot read '{}': {err}", path.display()),
+                    refuse(format!("unable to determine active slot: cannot read '{}': {err}", path.display()),
                     )
                 })?;
                 Ok(root_selector_from_cmdline(&cmdline))
@@ -522,15 +519,11 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
             RunningRoot::Mounted(root) => {
                 let table = target_root::mount_table()?;
                 let mount = table.iter().rev().find(|m| m.mount_point == *root).ok_or_else(|| {
-                    tagged_err(
-                        ErrorClass::StateOrDetection,
-                        format!("'{}' is not a mount point; mount the installed system's root there", root.display()),
+                    refuse(format!("'{}' is not a mount point; mount the installed system's root there", root.display()),
                     )
                 })?;
                 let partuuid = target_root::partuuid(Path::new(&mount.source))?.ok_or_else(|| {
-                    tagged_err(
-                        ErrorClass::StateOrDetection,
-                        format!("'{}' (mounted at '{}') has no PARTUUID", mount.source, root.display()),
+                    refuse(format!("'{}' (mounted at '{}') has no PARTUUID", mount.source, root.display()),
                     )
                 })?;
                 Ok(Some(RootSelector::PartUuid(partuuid)))
@@ -544,15 +537,11 @@ Expected slot entries under '{}' (for example: <prefix>-a.conf / <prefix>-b.conf
         // record of which partition is which slot. The loader default is what
         // boots next, not what booted, so it is never used as the answer.
         let Some(root_selector) = self.running_root_selector()? else {
-            return Err(tagged_err(
-                ErrorClass::StateOrDetection,
-                "unable to determine active slot: the kernel command line has no root=",
+            return Err(refuse("unable to determine active slot: the kernel command line has no root=",
             ));
         };
         self.slot_from_entry_roots(prefix, &root_selector)?.ok_or_else(|| {
-            tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
+            refuse(format!(
                     "unable to map active root selector '{root_selector}' to A/B entries under '{}' (prefix '{prefix}').\n\
 Expected matching root=... options in '{}' and '{}'.",
                     self.entries_dir.display(),
@@ -579,9 +568,7 @@ Expected matching root=... options in '{}' and '{}'.",
             }
             match matched {
                 Some(existing) => {
-                    return Err(tagged_err(
-                        ErrorClass::StateOrDetection,
-                        format!(
+                    return Err(refuse(format!(
                             "ambiguous root selector '{target}' matches both '{}' and '{entry}' under '{}'",
                             entry_name(prefix, existing),
                             self.entries_dir.display()
@@ -615,9 +602,7 @@ Expected matching root=... options in '{}' and '{}'.",
             .and_then(|text| os_release_value(&text, "ID"))
             .map(|id| os_prefix(&id))
             .ok_or_else(|| {
-                tagged_err(
-                    ErrorClass::StateOrDetection,
-                    format!(
+                refuse(format!(
                         "'{}' has no ID, which names the boot entries; set RECAB_ENTRY_PREFIX",
                         self.os_release.display()
                     ),
@@ -687,11 +672,11 @@ pub(crate) fn install_loader(root: &Path, esp: &Path) -> Result<()> {
     }
     let (name, fallback) = match found.as_slice() {
         [one] => one.clone(),
-        [] => anyhow::bail!(
+        [] => return Err(refuse(format!(
             "'{}' has no systemd-boot EFI binary; extract a complete system first",
             source_dir.display()
-        ),
-        _ => anyhow::bail!("'{}' has systemd-boot for more than one architecture", source_dir.display()),
+        ))),
+        _ => return Err(refuse(format!("'{}' has systemd-boot for more than one architecture", source_dir.display()))),
     };
     let source = source_dir.join(&name);
     for dest in [esp.join("EFI/systemd").join(&name), esp.join("EFI/BOOT").join(fallback)] {
@@ -863,15 +848,11 @@ impl RootSelector {
             Self::Uuid(v) => ("UUID", v),
             Self::Label(v) => ("LABEL", v),
             Self::DevicePath(v) => {
-                return match fs::canonicalize(v) {
-                    Ok(device) => Ok(Some(device)),
-                    Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-                    Err(err) => Err(anyhow!(err).context(format!("resolving '{v}'"))),
-                }
+                return Ok(target_root::canonical(Path::new(v)).with_context(|| format!("resolving '{v}'"))?)
             }
         };
         match target_root::device_with_tag(tag, value)? {
-            Some(device) => Ok(Some(fs::canonicalize(&device).with_context(|| format!("resolving '{}'", device.display()))?)),
+            Some(device) => Ok(target_root::canonical(&device).with_context(|| format!("resolving '{}'", device.display()))?),
             None => Ok(None),
         }
     }

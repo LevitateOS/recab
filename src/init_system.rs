@@ -17,19 +17,19 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::state::Startup;
-use crate::{tagged_err, ErrorClass};
+use crate::error::{classified, refuse, ErrorClass};
 
 /// The profile of the running system, from its os-release.
 pub(crate) fn running_profile(config: &Config) -> Result<Profile> {
     let path = &config.os_release;
     let text = fs::read_to_string(path).map_err(|error| {
-        tagged_err(
+        classified(
             ErrorClass::BackendUnavailable,
             format!("cannot read '{}': {error}", path.display()),
         )
     })?;
     Profile::from_os_release(&text).map_err(|error| {
-        tagged_err(
+        classified(
             ErrorClass::BackendUnavailable,
             format!("{}: {error}", path.display()),
         )
@@ -39,15 +39,11 @@ pub(crate) fn running_profile(config: &Config) -> Result<Profile> {
 /// The profile of the system installed under `root`, from its os-release.
 pub(crate) fn installed_profile(root: &Path) -> Result<Profile> {
     let text = target_root::os_release(root)?.ok_or_else(|| {
-        tagged_err(
-            ErrorClass::StateOrDetection,
-            format!("'{}' has no os-release", root.display()),
+        refuse(format!("'{}' has no os-release", root.display()),
         )
     })?;
     Profile::from_os_release(&text).map_err(|error| {
-        tagged_err(
-            ErrorClass::StateOrDetection,
-            format!("{}'s os-release: {error}", root.display()),
+        refuse(format!("{}'s os-release: {error}", root.display()),
         )
     })
 }
@@ -219,10 +215,20 @@ fn openrc_failed(config: &Config) -> Result<Vec<String>> {
     // the answer; a missing rc-status is an error.
     let out = Command::new(&config.rc_status)
         .arg("--crashed")
-        .stderr(Stdio::null())
         .output()
         .with_context(|| format!("running '{} --crashed'", config.rc_status))?;
-    failed.extend(String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::to_string));
+    let crashed = String::from_utf8_lossy(&out.stdout);
+    // It exits non-zero when it lists a crashed daemon; non-zero with nothing
+    // listed is rc-status itself failing.
+    if !out.status.success() && crashed.trim().is_empty() {
+        anyhow::bail!(
+            "'{} --crashed' failed ({}): {}",
+            config.rc_status,
+            target_root::status_text(out.status),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    failed.extend(crashed.split_whitespace().map(str::to_string));
     Ok(failed)
 }
 

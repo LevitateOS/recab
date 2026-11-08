@@ -9,7 +9,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::error::{tagged_err, ErrorClass};
+use crate::error::refuse;
 use recpart::policy::{ESP_MOUNT, STATE_MOUNT};
 
 /// recab's directory under the state partition's mount point.
@@ -67,7 +67,7 @@ impl Config {
         let program = |name: &str, default: &str| var(name).unwrap_or_else(|| default.to_string());
         let entry_prefix = match var("RECAB_ENTRY_PREFIX") {
             Some(prefix) if prefix.trim().is_empty() => {
-                return Err(tagged_err(ErrorClass::StateOrDetection, "RECAB_ENTRY_PREFIX is set but empty"))
+                return Err(refuse("RECAB_ENTRY_PREFIX is set but empty"))
             }
             prefix => prefix,
         };

@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::config::Config;
-use crate::error::{tagged_err, ErrorClass};
+use crate::error::refuse;
 use crate::state::{Operation, PersistentState, Slot};
 
 /// The audit log record's schema (one JSON object per line). Each record
@@ -74,9 +74,7 @@ impl Store {
     pub fn load(&self) -> Result<PersistentState> {
         let path = &self.state_path;
         let fail = |message: String| {
-            tagged_err(
-                ErrorClass::StateOrDetection,
-                format!("failed loading recab state '{}': {message}", path.display()),
+            refuse(format!("failed loading recab state '{}': {message}", path.display()),
             )
         };
         let Some(content) = target_root::read_optional(path).map_err(|err| fail(err.to_string()))? else {
@@ -91,9 +89,7 @@ impl Store {
     pub fn save(&self, state: &PersistentState, during: &str) -> Result<()> {
         let payload = serde_json::to_vec_pretty(state).context("serializing recab state")?;
         target_root::write_durable(&self.state_path, &payload, None).map_err(|err| {
-            tagged_err(
-                ErrorClass::StateOrDetection,
-                format!(
+            refuse(format!(
                     "failed writing recab state during {during} to '{}': {err:#}",
                     self.state_path.display()
                 ),

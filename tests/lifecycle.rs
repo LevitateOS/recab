@@ -349,7 +349,7 @@ fn a_failed_firmware_write_leaves_the_state_alone() {
     let loader = tree.read("boot/loader/loader.conf");
     let state = tree.read("state/state.json");
     tree.block_efivar("LoaderEntryDefault", true);
-    tree.fails(&["commit"], 1, "unchanged");
+    tree.fails(&["commit"], 20, "unchanged");
     assert_eq!(tree.read("boot/loader/loader.conf"), loader);
     assert_eq!(tree.read("state/state.json"), state);
 

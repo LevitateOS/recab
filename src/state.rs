@@ -5,7 +5,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{tagged_err, ErrorClass};
+use crate::error::refuse;
 
 /// System slot identifier (A/B). Its one spelling (`A`, `B`) is used by the
 /// CLI, the JSON and the state file.
@@ -226,10 +226,6 @@ pub(crate) struct Transition {
     pub operation: Operation,
     pub next: PersistentState,
     pub boot: BootChange,
-}
-
-fn refuse(message: String) -> anyhow::Error {
-    tagged_err(ErrorClass::StateOrDetection, message)
 }
 
 /// The transition `stage` makes: it writes the inactive slot, or the reason

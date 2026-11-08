@@ -34,7 +34,7 @@ pub use config::state_file;
 pub use init::{InitLayout, InitRequest};
 pub use stage::{StageRequest, StageSource};
 pub use distro_profile::InitSystem;
-pub use error::{stable_exit_code, ErrorClass, ErrorPayload};
+pub use error::{error_text, stable_exit_code, ErrorClass, ErrorPayload};
 pub use init_system::Health;
 pub use package::{trial_service_link, TRIAL_TIMEOUT_SECS};
 pub use state::{Slot, TrialRecord};
@@ -42,7 +42,7 @@ pub use status::{status, SlotView, Status};
 pub use systemd_boot::{entry_name, layout_name, ENTRIES_DIR};
 
 use config::Config;
-use error::tagged_err;
+use error::{classified, or_class};
 use state::{
     judge_trial, known_good, plan, plan_stage, BootChange, Operation, PersistentState, Request, Startup,
     Transition, TrialVerdict, TrialView,
@@ -99,7 +99,9 @@ impl System {
             }
             None => None,
         };
-        let boot = backend.read()?;
+        // An ESP or state the run cannot read is "the slots or state could
+        // not be read" (exit 21), whatever the I/O error.
+        let boot = backend.read().map_err(|err| or_class(err.context("reading the boot selection"), ErrorClass::StateOrDetection))?;
         let state = store.load()?;
         Ok(Self { config, backend, store, boot, state, _lock: lock })
     }
@@ -194,7 +196,7 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     } else {
         format!(" (failed: {})", failed.join(", "))
     };
-    let fail = |message: String| tagged_err(ErrorClass::TrialFailed, message);
+    let fail = |message: String| classified(ErrorClass::TrialFailed, message);
 
     // The ESP or /var may be what broke; the firmware still knows whether
     // this boot was a one-shot trial, and its default is the fallback.
@@ -284,7 +286,7 @@ pub fn install_unit(root: &Path, package: Option<InitSystem>) -> Result<()> {
 
 fn require_root(operation: &str) -> Result<()> {
     if !target_root::is_root() {
-        return Err(tagged_err(
+        return Err(classified(
             ErrorClass::Permission,
             format!("{operation} must run as root"),
         ));
@@ -332,13 +334,13 @@ fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentSt
             return Err(cause.context(format!("{name} aborted; the boot selection is unchanged")));
         }
         Err(ApplyError::FirmwareChanged(cause)) => {
-            return Err(tagged_err(
+            return Err(classified(
                 ErrorClass::PartialUpdate,
                 format!("{name} changed the boot selection only in part, and recab's state was not updated: {cause:#}"),
             ));
         }
         Err(ApplyError::RestoreFailed { cause, restore }) => {
-            return Err(tagged_err(
+            return Err(classified(
                 ErrorClass::PartialUpdate,
                 format!(
                     "{name} failed and loader.conf could not be put back; recab's state was not updated.\n\
@@ -348,7 +350,7 @@ primary error: {cause:#}\nrestore error: {restore:#}"
         }
     }
     sys.store.save(&next, name).map_err(|err| {
-        tagged_err(
+        classified(
             ErrorClass::PartialUpdate,
             format!("{name} changed the boot selection, but recab's state was not saved: {err:#}"),
         )

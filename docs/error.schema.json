@@ -40,13 +40,24 @@
     "ErrorClass": {
       "oneOf": [
         {
+          "description": "Needs root.",
           "type": "string",
-          "enum": [
-            "permission",
-            "backend_unavailable",
-            "state_or_detection",
-            "partial_update"
-          ]
+          "const": "permission"
+        },
+        {
+          "description": "No UEFI or efivars, efivars not writable, or the running os-release\nhas no distro profile.",
+          "type": "string",
+          "const": "backend_unavailable"
+        },
+        {
+          "description": "Refused, or the slots or state could not be read.",
+          "type": "string",
+          "const": "state_or_detection"
+        },
+        {
+          "description": "Something changed and something did not; the message says what.",
+          "type": "string",
+          "const": "partial_update"
         },
         {
           "description": "A trial boot was not healthy and was not committed.",

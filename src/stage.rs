@@ -10,7 +10,6 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -18,7 +17,7 @@ use crate::config::Config;
 use crate::carried::{self, Carry};
 use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::state::Slot;
-use crate::{tagged_err, ErrorClass};
+use crate::error::refuse;
 use distro_profile::{Flavour, Profile};
 use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
 use recpart::types::Role;
@@ -126,10 +125,6 @@ pub(crate) struct Target {
     partuuid: String,
 }
 
-fn refuse(message: String) -> anyhow::Error {
-    tagged_err(ErrorClass::StateOrDetection, message)
-}
-
 /// Check the inputs without changing anything: an EROFS rootfs image (a
 /// file or a partition), a kernel and initrd, and none of them inside the
 /// slot's kernel directory, which stage removes first.
@@ -154,21 +149,21 @@ pub(crate) fn check_inputs(
         ("initrd", request.initrd.as_ref()),
     ] {
         if let Some(path) = path {
-            if !path.is_file() {
+            if !target_root::metadata(path)?.is_some_and(|meta| meta.is_file()) {
                 return Err(refuse(format!("{what} '{}' is not a file", path.display())));
             }
         }
     }
     // Stage removes this directory before it installs the kernel and initrd.
     let slot_dir = backend.slot_boot_files_dir(boot, slot);
-    if let Some(slot_dir) = canonical(&slot_dir)? {
+    if let Some(slot_dir) = target_root::canonical(&slot_dir)? {
         for (what, path) in [
             ("rootfs", Some(rootfs)),
             ("kernel", Some(&request.kernel)),
             ("initrd", request.initrd.as_ref()),
         ] {
             let Some(path) = path else { continue };
-            if canonical(path)?.is_some_and(|p| p.starts_with(&slot_dir)) {
+            if target_root::canonical(path)?.is_some_and(|p| p.starts_with(&slot_dir)) {
                 return Err(refuse(format!(
                     "{what} '{}' is inside slot {slot}'s kernel directory '{}', which stage removes before installing the new kernel; \
 copy it elsewhere first (for example to /var/tmp) and pass that path",
@@ -302,14 +297,6 @@ pub(crate) fn write_slot(
     )
 }
 
-/// The canonical form of `path`; `None` when it does not exist.
-fn canonical(path: &Path) -> Result<Option<PathBuf>> {
-    match fs::canonicalize(path) {
-        Ok(path) => Ok(Some(path)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("resolving '{}'", path.display())),
-    }
-}
 
 /// Carry the machine state the new image lists from the running root into
 /// the new one. A source that cannot be read fails the stage.
@@ -322,7 +309,7 @@ fn carry_configuration(from: &Path, to: &Path, list: &[Carry]) -> Result<()> {
         let source = from.join(rel);
         match entry {
             Carry::File(_) | Carry::Dir(_) => {
-                let meta = metadata(&source)?;
+                let meta = target_root::metadata(&source)?;
                 if matches!(entry, Carry::Dir(_)) && meta.as_ref().is_some_and(|m| !m.is_dir()) {
                     bail!("'{}' is listed as a directory to carry but is not one", source.display());
                 }
@@ -391,7 +378,7 @@ fn write_baseline(root: &Path, list: &[Carry]) -> Result<()> {
     let mut entries = Vec::new();
     for entry in list {
         if let Carry::Dir(rel) = entry {
-            if metadata(&root.join(rel))?.is_some_and(|m| m.is_dir()) {
+            if target_root::metadata(&root.join(rel))?.is_some_and(|m| m.is_dir()) {
                 walk(root, rel, &mut entries)?;
             }
         }
@@ -445,11 +432,11 @@ fn copy_changed(from: &Path, to: &Path, rel: &str, baseline: &BTreeMap<String, S
 fn remove_whiteouts(from: &Path, to: &Path, rel: &str, baseline: &BTreeMap<String, String>) -> Result<()> {
     let prefix = format!("{rel}/");
     for path in baseline.keys().filter(|p| p.starts_with(&prefix)) {
-        if metadata(&from.join(path))?.is_some() {
+        if target_root::metadata(&from.join(path))?.is_some() {
             continue;
         }
         let gone = to.join(path);
-        match metadata(&gone)? {
+        match target_root::metadata(&gone)? {
             Some(m) if m.is_dir() => fs::remove_dir_all(&gone),
             Some(_) => fs::remove_file(&gone),
             None => Ok(()),
@@ -459,14 +446,6 @@ fn remove_whiteouts(from: &Path, to: &Path, rel: &str, baseline: &BTreeMap<Strin
     Ok(())
 }
 
-/// `path`'s own metadata; `None` when it does not exist.
-fn metadata(path: &Path) -> Result<Option<fs::Metadata>> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) => Ok(Some(meta)),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err).with_context(|| format!("reading '{}'", path.display())),
-    }
-}
 
 /// Copy `source` to `dest` keeping symlinks, permissions and owners. A
 /// directory's entries are copied into `dest`, replacing same-named ones
@@ -478,11 +457,7 @@ fn copy_tree(source: &Path, dest: &Path) -> Result<()> {
     let meta =
         fs::symlink_metadata(source).with_context(|| format!("reading '{}'", source.display()))?;
     let context = || format!("copying '{}' to '{}'", source.display(), dest.display());
-    let existing = match fs::symlink_metadata(dest) {
-        Ok(meta) => Some(meta),
-        Err(err) if err.kind() == ErrorKind::NotFound => None,
-        Err(err) => return Err(err).with_context(context),
-    };
+    let existing = target_root::metadata(dest).with_context(context)?;
     if meta.is_dir() {
         if existing.as_ref().is_some_and(|e| !e.is_dir()) {
             fs::remove_file(dest).with_context(context)?;

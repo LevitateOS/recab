@@ -13,6 +13,10 @@ use recpart::types::InstallMode;
 #[command(about = "A/B slot + boot-selection manager")]
 #[command(version)]
 struct Cli {
+    /// Machine-readable output: `status` and `health` print JSON, and any
+    /// command that fails prints its error as one JSON object on stderr.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Command,
 }
@@ -21,9 +25,6 @@ struct Cli {
 enum Command {
     /// Show detected A/B status
     Status {
-        /// Emit machine-readable status JSON.
-        #[arg(long)]
-        json: bool,
         /// Read the system installed under this root (its root partition
         /// mounted here, the ESP and state partition below it) instead of the
         /// running one.
@@ -105,9 +106,6 @@ enum Command {
     /// Wait for startup to finish and report how it ended: the verdict a
     /// trial judges by (read-only; needs no A/B layout).
     Health {
-        /// Print the verdict as one JSON object.
-        #[arg(long)]
-        json: bool,
         /// Seconds to wait for startup to finish.
         #[arg(long, default_value_t = recab::TRIAL_TIMEOUT_SECS)]
         timeout: u64,
@@ -129,14 +127,14 @@ enum Command {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    // A command that prints JSON prints its error as JSON too.
-    let json = matches!(cli.cmd, Command::Status { json: true, .. } | Command::Health { json: true, .. });
+    let json = cli.json;
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            match serde_json::to_string(&recab::ErrorPayload::of(&err)) {
-                Ok(payload) if json => eprintln!("{payload}"),
-                _ => eprintln!("recab: {err:#}"),
+            if json {
+                eprintln!("{}", recab::ErrorPayload::of(&err).to_json());
+            } else {
+                eprintln!("recab: {}", recab::error_text(&err));
             }
             ExitCode::from(stable_exit_code(&err))
         }
@@ -145,9 +143,9 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
-        Command::Status { json, root } => {
+        Command::Status { root } => {
             let st = recab::status(root.as_deref())?;
-            print_status(&st, json)?;
+            print_status(&st, cli.json)?;
         }
         Command::Stage { from_media, rootfs, kernel, initrd, change_flavour } => {
             let source = match (from_media, rootfs, kernel, initrd) {
@@ -174,9 +172,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("recab: committed slot {slot} after a healthy trial boot");
             }
         }
-        Command::Health { json, timeout } => {
+        Command::Health { timeout } => {
             let health = recab::health(Duration::from_secs(timeout))?;
-            if json {
+            if cli.json {
                 println!("{}", serde_json::to_string(&health)?);
             } else {
                 print_health(&health);

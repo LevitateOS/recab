@@ -2,7 +2,9 @@
 //! `usr/lib/recab/carried`, packaged with recab), read from the image `stage`
 //! writes and carried exactly. The format is stated at the top of the list.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
+
+use crate::error::refuse;
 use std::path::Path;
 
 /// The list, relative to an image's root.
@@ -33,9 +35,10 @@ impl Carry {
 /// line that is not an entry, is an error.
 pub fn read(root: &Path) -> Result<Vec<Carry>> {
     let path = root.join(CARRIED_LIST);
-    let text = target_root::read_optional(&path)?
-        .with_context(|| format!("the image declares no carried machine state ('{}' is missing)", path.display()))?;
-    parse(&text).with_context(|| format!("reading '{}'", path.display()))
+    let text = target_root::read_optional(&path)?.ok_or_else(|| {
+        refuse(format!("the image declares no carried machine state ('{}' is missing)", path.display()))
+    })?;
+    parse(&text).map_err(|err| refuse(format!("'{}': {err:#}", path.display())))
 }
 
 fn parse(text: &str) -> Result<Vec<Carry>> {
