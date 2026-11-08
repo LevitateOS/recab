@@ -1,6 +1,6 @@
-# The trial service, packaged by `recab install-unit --package systemd`.
+# The trial service, packaged by `recab install-unit --init systemd`.
 [Unit]
-Description=Commit a healthy A/B trial boot, or reboot into the known-good slot
+Description=@DESCRIPTION@
 DefaultDependencies=no
 Conflicts=shutdown.target
 Before=shutdown.target
@@ -8,7 +8,7 @@ IgnoreOnIsolate=yes
 
 [Service]
 Type=exec
-ExecStart=@RECAB@ trial --timeout @TIMEOUT@
+ExecStart=@RECAB@ trial
 
 [Install]
-WantedBy=sysinit.target
+WantedBy=@WANTED_BY@

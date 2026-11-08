@@ -1,8 +1,8 @@
 //! recab's init adapter: what a trial needs from the running init system,
 //! the one from the system's distro profile (the `REC_*` fields of its
-//! os-release). Three operations: wait until startup finished and name what
-//! failed ([`wait_finished`]), reboot ([`reboot`]), and the kernel option
-//! that reboots on a crashing PID 1 ([`crash_option`]).
+//! os-release). Three operations: wait until startup finished and say how it
+//! ended ([`health`]), reboot ([`reboot`]), and the kernel option that
+//! reboots on a crashing PID 1 ([`crash_option`]).
 //!
 //! systemd and OpenRC are supported.
 
@@ -27,13 +27,20 @@ pub fn crash_option(init: InitSystem) -> Option<&'static str> {
     }
 }
 
-/// How startup of the running system ended (`recab health --json`).
+/// Seconds startup may take before a trial counts as failed: `recab trial`'s
+/// (and so the trial service's) deadline, and `recab health`'s wait.
+pub const TRIAL_TIMEOUT_SECS: u64 = 900;
+
+/// How startup of the running system ended (`recab health --json`): the
+/// verdict a trial judges by.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
     pub init: InitSystem,
-    /// Startup ran to its end (systemd `running` or `degraded`; OpenRC's
-    /// default runlevel entered with nothing starting).
+    /// How startup ended.
+    pub startup: Startup,
+    /// Startup ran to its end, healthy or not (`startup` is `running` or
+    /// `failed`).
     pub finished: bool,
     /// The init's own word: systemd's `is-system-running` answer, OpenRC's
     /// softlevel, or `timed out`.
@@ -41,11 +48,32 @@ pub struct Health {
     /// The units or services that failed (and, on OpenRC, crashed daemons),
     /// sorted, by bare name; listed even when startup did not finish.
     pub failed: Vec<String>,
-    /// What a trial makes of it.
-    #[serde(skip)]
-    #[cfg_attr(feature = "contracts", schemars(skip))]
-    #[cfg_attr(feature = "contracts", ts(skip))]
-    pub(crate) startup: Startup,
+}
+
+impl Health {
+    fn new(init: InitSystem, startup: Startup, state: String, mut failed: Vec<String>) -> Self {
+        failed.sort();
+        failed.dedup();
+        let finished = matches!(startup, Startup::Running | Startup::Failed);
+        Self { init, startup, finished, state, failed }
+    }
+
+    /// How startup ended, in words (a trial's record and message), for a
+    /// wait of at most `timeout`.
+    pub fn describe(&self, timeout: Duration) -> String {
+        let how = match self.startup {
+            Startup::Running => "finished starting".to_string(),
+            Startup::Failed => format!("finished starting in state '{}'", self.state),
+            Startup::Emergency => format!("ended in the init's emergency state '{}'", self.state),
+            Startup::TimedOut => format!("did not finish starting within {}s", timeout.as_secs()),
+            Startup::Inconclusive => format!("ended without a verdict ('{}')", self.state),
+        };
+        if self.failed.is_empty() {
+            how
+        } else {
+            format!("{how} (failed: {})", self.failed.join(", "))
+        }
+    }
 }
 
 /// The word `state` takes when the deadline passed.
@@ -53,26 +81,26 @@ const TIMED_OUT: &str = "timed out";
 /// How often an init's progress is looked at while waiting.
 const POLL: Duration = Duration::from_millis(250);
 
-/// Wait until startup finished, at most `timeout`, and name what failed.
-pub(crate) fn wait_finished(target: &Target, init: InitSystem, timeout: Duration) -> Result<Health> {
-    let (finished, state, mut failed, startup) = match init {
-        InitSystem::Systemd => systemd_startup(&target.programs.systemctl, timeout)?,
-        InitSystem::Openrc => openrc_startup(target, timeout)?,
-    };
-    failed.sort();
-    failed.dedup();
-    Ok(Health { init, finished, state, failed, startup })
+/// Wait until startup of the system `target` runs finished, at most
+/// `timeout`, and name what failed.
+pub(crate) fn health(target: &Target, timeout: Duration) -> Result<Health> {
+    let init = target.init()?;
+    match init {
+        InitSystem::Systemd => systemd_startup(&target.programs.systemctl, timeout),
+        InitSystem::Openrc => openrc_startup(target, timeout),
+    }
 }
 
-type Waited = (bool, String, Vec<String>, Startup);
-
-/// `systemctl is-system-running --wait`: `running`, or failed units
-/// (`degraded`), or the emergency/rescue target (`maintenance`).
-fn systemd_startup(systemctl: &str, timeout: Duration) -> Result<Waited> {
+/// `systemctl is-system-running --wait`: `running`, failed units
+/// (`degraded`), or the emergency/rescue target (`maintenance`); any other
+/// answer (`stopping`, `offline`, ...) is a shutdown or an unreachable
+/// systemd, with no verdict.
+fn systemd_startup(systemctl: &str, timeout: Duration) -> Result<Health> {
+    let init = InitSystem::Systemd;
     let mut child = Command::new(systemctl)
         .args(["is-system-running", "--wait"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("running '{systemctl} is-system-running --wait'"))?;
     let deadline = Instant::now() + timeout;
@@ -80,26 +108,29 @@ fn systemd_startup(systemctl: &str, timeout: Duration) -> Result<Waited> {
         if Instant::now() >= deadline {
             child.kill().context("stopping 'systemctl is-system-running --wait'")?;
             child.wait().context("waiting for 'systemctl is-system-running --wait'")?;
-            return Ok((false, TIMED_OUT.to_string(), systemd_failed_units(systemctl)?, Startup::TimedOut));
+            return Ok(Health::new(init, Startup::TimedOut, TIMED_OUT.to_string(), systemd_failed_units(systemctl)?));
         }
         std::thread::sleep(POLL);
     }
-    let mut state = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout.read_to_string(&mut state)?;
-    }
-    let state = state.trim().to_string();
-    let failed = systemd_failed_units(systemctl)?;
-    // Anything else (`stopping`, `offline`, `unknown`, ...) is a shutdown or
-    // an unreachable systemd: no verdict on the boot.
-    let (finished, startup) = match state.as_str() {
-        "running" => (true, Startup::Running),
-        "degraded" => (true, Startup::Failed(state.clone())),
-        "maintenance" => (false, Startup::Failed(state.clone())),
-        "" => (false, Startup::Inconclusive("no answer".to_string())),
-        other => (false, Startup::Inconclusive(other.to_string())),
+    let read = |stream: Option<&mut dyn Read>| -> Result<String> {
+        let mut text = String::new();
+        if let Some(stream) = stream {
+            stream.read_to_string(&mut text)?;
+        }
+        Ok(text.trim().to_string())
     };
-    Ok((finished, state, failed, startup))
+    let answer = read(child.stdout.as_mut().map(|s| s as &mut dyn Read))?;
+    let complaint = read(child.stderr.as_mut().map(|s| s as &mut dyn Read))?;
+    let failed = systemd_failed_units(systemctl)?;
+    let startup = match answer.as_str() {
+        "running" => Startup::Running,
+        "degraded" => Startup::Failed,
+        "maintenance" => Startup::Emergency,
+        _ => Startup::Inconclusive,
+    };
+    // No answer at all: say what systemctl said instead.
+    let state = if answer.is_empty() { format!("no answer: {complaint}") } else { answer };
+    Ok(Health::new(init, startup, state, failed))
 }
 
 fn systemd_failed_units(systemctl: &str) -> Result<Vec<String>> {
@@ -118,36 +149,32 @@ fn systemd_failed_units(systemctl: &str) -> Result<Vec<String>> {
 
 /// Startup has finished when the default runlevel is entered, no service is
 /// starting, and the `openrc` process that runs the runlevel has exited.
-/// It failed when a service failed to start, or when the system went to the
-/// single-user runlevel. OpenRC's state directory holds the runlevel being
-/// entered (`softlevel`) and one entry per service in each state
-/// (`starting/`, `failed/`).
-fn openrc_startup(target: &Target, timeout: Duration) -> Result<Waited> {
+/// It failed when a service failed to start, and ended in the emergency
+/// state in the single-user runlevel. OpenRC's state directory holds the
+/// runlevel being entered (`softlevel`) and one entry per service in each
+/// state (`starting/`, `failed/`).
+fn openrc_startup(target: &Target, timeout: Duration) -> Result<Health> {
+    let init = InitSystem::Openrc;
     let dir = &target.openrc_dir;
     let deadline = Instant::now() + timeout;
     loop {
         let level = target_root::read_optional(&dir.join("softlevel"))?.unwrap_or_default();
         let level = level.trim().to_string();
-        match level.as_str() {
+        let startup = match level.as_str() {
             "default" if target_root::dir_names(&dir.join("starting"))?.is_empty() && !openrc_running(target)? => {
                 let failed = openrc_failed(target)?;
-                let startup = if failed.is_empty() {
-                    Startup::Running
-                } else {
-                    Startup::Failed("services failed".to_string())
-                };
-                return Ok((true, level, failed, startup));
+                let startup = if failed.is_empty() { Startup::Running } else { Startup::Failed };
+                return Ok(Health::new(init, startup, level, failed));
             }
-            "single" => {
-                return Ok((false, level, openrc_failed(target)?, Startup::Failed("single-user runlevel".to_string())))
-            }
-            "shutdown" | "reboot" => {
-                return Ok((false, level.clone(), openrc_failed(target)?, Startup::Inconclusive(level)))
-            }
-            _ => {}
+            "single" => Some(Startup::Emergency),
+            "shutdown" | "reboot" => Some(Startup::Inconclusive),
+            _ => None,
+        };
+        if let Some(startup) = startup {
+            return Ok(Health::new(init, startup, level, openrc_failed(target)?));
         }
         if Instant::now() >= deadline {
-            return Ok((false, TIMED_OUT.to_string(), openrc_failed(target)?, Startup::TimedOut));
+            return Ok(Health::new(init, Startup::TimedOut, TIMED_OUT.to_string(), openrc_failed(target)?));
         }
         std::thread::sleep(POLL);
     }

@@ -328,18 +328,21 @@ Run 'recab commit' to set a stable fallback default before 'recab set-next {slot
     Ok(Some(transition))
 }
 
-/// How system startup ended, as the init adapter reports it to the trial
-/// judgment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Startup {
-    /// Started with nothing failed.
+/// How system startup ended, as the init adapter reports it.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Startup {
+    /// Startup ran to its end with nothing failed.
     Running,
-    /// Started with something failed, or ended in the init's emergency state.
-    Failed(String),
+    /// Startup ran to its end with something failed.
+    Failed,
+    /// Startup ended in the init's emergency state.
+    Emergency,
     /// Still starting when the deadline passed.
     TimedOut,
     /// No verdict (shutting down, the init unreachable).
-    Inconclusive(String),
+    Inconclusive,
 }
 
 /// What a trial boot's outcome calls for.
@@ -375,7 +378,7 @@ pub(crate) fn judge_trial(
     view: Option<TrialView>,
     firmware_trial: impl FnOnce() -> Result<Option<bool>>,
 ) -> Result<TrialVerdict> {
-    if let Startup::Inconclusive(_) = startup {
+    if *startup == Startup::Inconclusive {
         return Ok(TrialVerdict::Ignore);
     }
     let failed = *startup != Startup::Running;

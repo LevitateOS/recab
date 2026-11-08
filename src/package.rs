@@ -1,8 +1,8 @@
 //! What recab's package carries besides the binary, written by `recab
-//! install-unit --package <init>` into the tree Recipe packages: the trial
-//! service for the image's init system, enabled, and the list of machine state
-//! `stage` carries ([`crate::carried`]). Every image with recab runs the trial
-//! service; with no trial pending it exits at once.
+//! install-unit --init <init>` into the tree Recipe packages: the trial
+//! service for the image's init system, enabled, and the list of machine
+//! state `stage` carries ([`crate::carried`]). Every image with recab runs
+//! the trial service; with no trial pending it exits at once.
 
 use anyhow::{Context, Result};
 use distro_profile::InitSystem;
@@ -11,16 +11,21 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use crate::carried::CARRIED_LIST;
+use crate::error::refuse;
 
-/// Where the package installs recab.
+/// Where the package installs recab, unless the packager says otherwise.
 pub const RECAB_BIN: &str = "/usr/bin/recab";
-/// Seconds the trial waits for startup to finish: the trial service's
-/// deadline and `recab trial`'s default.
-pub const TRIAL_TIMEOUT_SECS: u64 = 900;
 
 const SYSTEMD_UNIT: &str = include_str!("services/recab-trial.service");
 const OPENRC_SERVICE: &str = include_str!("services/recab-trial.openrc");
 const CARRIED: &str = include_str!("services/carried");
+
+/// What both trial services say they are.
+const DESCRIPTION: &str = "Commit a healthy A/B trial boot, or reboot into the known-good slot";
+/// systemd starts the trial service with `sysinit.target`, OpenRC in its
+/// `boot` runlevel: both early, alongside the rest of startup.
+const SYSTEMD_WANTED_BY: &str = "sysinit.target";
+pub(crate) const OPENRC_RUNLEVEL: &str = "boot";
 
 /// The trial service's file, relative to the root.
 fn trial_service_path(init: InitSystem) -> &'static str {
@@ -30,26 +35,45 @@ fn trial_service_path(init: InitSystem) -> &'static str {
     }
 }
 
-/// The link that enables the trial service, relative to the root (systemd's
-/// `sysinit.target`, OpenRC's `boot` runlevel: both start it early, alongside
-/// the rest of startup).
-pub fn trial_service_link(init: InitSystem) -> &'static str {
+/// The link that enables the trial service, relative to the root.
+pub fn trial_service_link(init: InitSystem) -> String {
     match init {
-        InitSystem::Systemd => "etc/systemd/system/sysinit.target.wants/recab-trial.service",
-        InitSystem::Openrc => "etc/runlevels/boot/recab-trial",
+        InitSystem::Systemd => format!("etc/systemd/system/{SYSTEMD_WANTED_BY}.wants/recab-trial.service"),
+        InitSystem::Openrc => format!("etc/runlevels/{OPENRC_RUNLEVEL}/recab-trial"),
     }
 }
 
-/// Write the trial service, its enabling link and the carried-state list into
-/// the package tree `root`.
-pub(crate) fn write(root: &Path, init: InitSystem) -> Result<()> {
+/// `template` with its `@NAME@` placeholders filled; one left unfilled is
+/// an error.
+fn render(template: &str, values: &[(&str, &str)]) -> Result<String> {
+    let mut text = template.to_string();
+    for (name, value) in values {
+        text = text.replace(&format!("@{name}@"), value);
+    }
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find('@') {
+        let after = &rest[start + 1..];
+        let name_len = after.bytes().take_while(|b| b.is_ascii_uppercase() || *b == b'_').count();
+        if name_len > 0 && after[name_len..].starts_with('@') {
+            return Err(refuse(format!("the trial service template has an unfilled @{}@", &after[..name_len])));
+        }
+        rest = after;
+    }
+    Ok(text)
+}
+
+/// Write the trial service for `init` (running the binary at `bin`), its
+/// enabling link and the carried-state list into the package tree `root`.
+pub(crate) fn write(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
     let (template, mode) = match init {
         InitSystem::Systemd => (SYSTEMD_UNIT, 0o644),
         InitSystem::Openrc => (OPENRC_SERVICE, 0o755),
     };
-    let text = template
-        .replace("@RECAB@", RECAB_BIN)
-        .replace("@TIMEOUT@", &TRIAL_TIMEOUT_SECS.to_string());
+    let name = Path::new(bin).file_name().and_then(|n| n.to_str()).unwrap_or("recab");
+    let text = render(
+        template,
+        &[("RECAB", bin), ("NAME", name), ("DESCRIPTION", DESCRIPTION), ("WANTED_BY", SYSTEMD_WANTED_BY)],
+    )?;
     let path = root.join(trial_service_path(init));
     target_root::write_durable(&path, text.as_bytes(), Some(mode))
         .with_context(|| format!("writing '{}'", path.display()))?;

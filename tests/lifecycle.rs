@@ -620,11 +620,11 @@ fn install_unit_writes_and_enables_the_trial_service() {
         "install-unit",
         "--root",
         tree.path("target").to_str().unwrap(),
-        "--package",
+        "--init",
         "systemd",
     ]);
     let unit = tree.read("target/usr/lib/systemd/system/recab-trial.service");
-    let exec = format!("ExecStart={} trial --timeout {}", "/usr/bin/recab", recab::TRIAL_TIMEOUT_SECS);
+    let exec = "ExecStart=/usr/bin/recab trial";
     assert!(unit.contains(&exec), "{unit}");
     let link = tree.path("target").join(recab::trial_service_link(recab::InitSystem::Systemd));
     assert_eq!(
@@ -864,7 +864,7 @@ fn install_unit_writes_and_enables_the_openrc_service() {
     fs::write(target.join("etc/os-release"), format!("ID=lev\n{OPENRC_PROFILE}")).unwrap();
     let out = tree
         .command(true)
-        .args(["install-unit", "--root", target.to_str().unwrap(), "--package", "openrc"])
+        .args(["install-unit", "--root", target.to_str().unwrap(), "--init", "openrc"])
         .output()
         .unwrap();
     assert!(
@@ -874,7 +874,10 @@ fn install_unit_writes_and_enables_the_openrc_service() {
     );
     let service = tree.read("target/etc/init.d/recab-trial");
     assert!(
-        service.starts_with("#!/sbin/openrc-run") && service.contains(&format!("{} trial", "/usr/bin/recab")),
+        service.starts_with("#!/sbin/openrc-run")
+            && service.contains("command=\"/usr/bin/recab\"")
+            && service.contains("command_args=\"trial\"")
+            && !service.contains('@'),
         "{service}"
     );
     let link = tree.path("target").join(recab::trial_service_link(recab::InitSystem::Openrc));

@@ -1,29 +1,18 @@
 #!/sbin/openrc-run
-# The trial service, packaged by `recab install-unit --package openrc`.
-description="Commit a healthy A/B trial boot, or reboot into the known-good slot"
+# The trial service, packaged by `recab install-unit --init openrc`.
+description="@DESCRIPTION@"
+
+# openrc-run runs it in the background and stops it at shutdown (no
+# verdict then); its one line goes to the kernel log, OpenRC having no
+# journal.
+command="@RECAB@"
+command_args="trial"
+command_background=true
 pidfile="/run/recab-trial.pid"
+output_log="/dev/kmsg"
+error_log="/dev/kmsg"
 
 depend() {
+	# sysfs mounts efivarfs, which tells a trial boot from the firmware.
 	after sysfs
-}
-
-start() {
-	ebegin "Starting A/B trial supervision"
-	@RECAB@ trial --timeout @TIMEOUT@ </dev/null >/dev/kmsg 2>&1 &
-	echo $! > "$pidfile"
-	eend $?
-}
-
-# A shutdown during the trial stops it without a verdict, as systemd's
-# Conflicts=shutdown.target does.
-stop() {
-	ebegin "Stopping A/B trial supervision"
-	if [ -f "$pidfile" ]; then
-		pid="$(cat "$pidfile")"
-		if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = recab ]; then
-			kill "$pid"
-		fi
-		rm -f "$pidfile"
-	fi
-	eend 0
 }

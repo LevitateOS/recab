@@ -37,8 +37,9 @@ pub use init::{InitLayout, InitRequest};
 pub use stage::{StageRequest, StageSource};
 pub use distro_profile::InitSystem;
 pub use error::{error_text, stable_exit_code, ErrorClass, ErrorPayload};
-pub use init_system::Health;
-pub use package::{trial_service_link, TRIAL_TIMEOUT_SECS};
+pub use init_system::{Health, TRIAL_TIMEOUT_SECS};
+pub use state::Startup;
+pub use package::{trial_service_link, RECAB_BIN};
 pub use state::{Slot, TrialRecord};
 pub use status::{status, SlotView, Status};
 pub use entry::{entry_name, layout_name, ENTRIES_DIR};
@@ -46,7 +47,7 @@ pub use entry::{entry_name, layout_name, ENTRIES_DIR};
 use target::Target;
 use error::{classified, or_class};
 use state::{
-    judge_trial, known_good, plan, plan_stage, Operation, PersistentState, Request, Startup,
+    judge_trial, known_good, plan, plan_stage, Operation, PersistentState, Request,
     Transition, TrialVerdict, TrialView,
 };
 use store::{now, Lock, Store};
@@ -186,18 +187,9 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     if !Store::new(&target).exists()? && firmware.firmware_trial()? != Some(true) {
         return Ok(TrialOutcome::NotATrial);
     }
-    let health = init_system::wait_finished(&target, init, timeout)?;
-    let (startup, failed) = (health.startup, health.failed);
-    let problem = match &startup {
-        Startup::Running | Startup::Inconclusive(_) => String::new(),
-        Startup::Failed(state) => format!("finished starting in state '{state}'"),
-        Startup::TimedOut => format!("did not finish starting within {}s", timeout.as_secs()),
-    };
-    let failed = if failed.is_empty() {
-        String::new()
-    } else {
-        format!(" (failed: {})", failed.join(", "))
-    };
+    let health = init_system::health(&target, timeout)?;
+    let startup = health.startup;
+    let detail = health.describe(timeout);
     let fail = |message: String| classified(ErrorClass::TrialFailed, message);
 
     // The ESP or /var may be what broke; the firmware still knows whether
@@ -219,7 +211,7 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
             require_root("trial")?;
             init_system::reboot(init, &target)?;
             return Err(fail(format!(
-                "this one-shot trial boot {problem}{failed}, and the slots could not be read ({err:#}); rebooting into the default entry"
+                "this one-shot trial boot {detail}, and the slots could not be read ({err:#}); rebooting into the default entry"
             )));
         }
         (_, Ok(sys)) => sys,
@@ -231,12 +223,11 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
         Ok(TrialRecord { slot: active, committed, detail, unix_time: now()? })
     };
     if verdict == TrialVerdict::Commit {
-        let record = record(true, "startup finished with no failed units".to_string())?;
+        let record = record(true, detail)?;
         change(sys, Request::Commit, |next| next.last_trial = Some(record))?;
         return Ok(TrialOutcome::Committed(active));
     }
 
-    let detail = format!("{problem}{failed}");
     let mut next = sys.state.clone();
     next.pending_trial_slot = None;
     next.last_trial = Some(record(false, detail.clone())?);
@@ -270,15 +261,13 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
 /// How startup of the running system ended, waiting at most `timeout` for
 /// it to finish. Only reads; needs no A/B layout or state.
 pub fn health(timeout: Duration) -> Result<Health> {
-    let target = Target::running()?;
-    let init = target.init()?;
-    init_system::wait_finished(&target, init, timeout)
+    init_system::health(&Target::running()?, timeout)
 }
 
 /// Write recab's package contents for `init` into the tree `root` (what
 /// Recipe packages): the trial service, enabled, and the carried-state list.
-pub fn install_unit(root: &Path, init: InitSystem) -> Result<()> {
-    package::write(root, init)
+pub fn install_unit(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
+    package::write(root, init, bin)
 }
 
 fn require_root(operation: &str) -> Result<()> {

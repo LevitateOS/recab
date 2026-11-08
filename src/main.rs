@@ -120,7 +120,10 @@ enum Command {
         root: PathBuf,
         /// The init system to write the service for.
         #[arg(long, value_name = "INIT", value_parser = str::parse::<recab::InitSystem>)]
-        package: recab::InitSystem,
+        init: recab::InitSystem,
+        /// Where recab is installed in the tree, as the service runs it.
+        #[arg(long, value_name = "PATH", default_value = recab::RECAB_BIN)]
+        bin: String,
     },
 }
 
@@ -176,10 +179,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string(&health)?);
             } else {
-                print_health(&health);
+                print_health(&health, Duration::from_secs(timeout));
             }
         }
-        Command::InstallUnit { root, package } => recab::install_unit(&root, package)?,
+        Command::InstallUnit { root, init, bin } => recab::install_unit(&root, init, &bin)?,
     }
     Ok(())
 }
@@ -243,11 +246,6 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
 }
 
 /// `Health` as text: every public field.
-fn print_health(health: &Health) {
-    let Health { init, finished, state, failed, .. } = health;
-    let finished = if *finished { "finished" } else { "did not finish" };
-    println!("{init} startup {finished} ({state})");
-    for name in failed {
-        println!("failed: {name}");
-    }
+fn print_health(health: &Health, timeout: Duration) {
+    println!("{} startup {}", health.init, health.describe(timeout));
 }

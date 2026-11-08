@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Health",
-  "description": "How startup of the running system ended (`recab health --json`).",
+  "description": "How startup of the running system ended (`recab health --json`): the\nverdict a trial judges by.",
   "type": "object",
   "properties": {
     "failed": {
@@ -12,11 +12,15 @@
       }
     },
     "finished": {
-      "description": "Startup ran to its end (systemd `running` or `degraded`; OpenRC's\ndefault runlevel entered with nothing starting).",
+      "description": "Startup ran to its end, healthy or not (`startup` is `running` or\n`failed`).",
       "type": "boolean"
     },
     "init": {
       "$ref": "#/$defs/InitSystem"
+    },
+    "startup": {
+      "description": "How startup ended.",
+      "$ref": "#/$defs/Startup"
     },
     "state": {
       "description": "The init's own word: systemd's `is-system-running` answer, OpenRC's\nsoftlevel, or `timed out`.",
@@ -25,6 +29,7 @@
   },
   "required": [
     "init",
+    "startup",
     "finished",
     "state",
     "failed"
@@ -36,6 +41,36 @@
       "enum": [
         "systemd",
         "openrc"
+      ]
+    },
+    "Startup": {
+      "description": "How system startup ended, as the init adapter reports it.",
+      "oneOf": [
+        {
+          "description": "Startup ran to its end with nothing failed.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "Startup ran to its end with something failed.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "Startup ended in the init's emergency state.",
+          "type": "string",
+          "const": "emergency"
+        },
+        {
+          "description": "Still starting when the deadline passed.",
+          "type": "string",
+          "const": "timed_out"
+        },
+        {
+          "description": "No verdict (shutting down, the init unreachable).",
+          "type": "string",
+          "const": "inconclusive"
+        }
       ]
     }
   }
