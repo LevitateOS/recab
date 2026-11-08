@@ -39,7 +39,7 @@ level tooling (installers, `recipe`, integration/e2e harnesses).
 - Stage a trial boot of the inactive slot ("try")
 - Commit the booted slot as good ("commit") or roll back ("rollback")
 
-This supports A/B update and rollback validation described in `architecture.md` and the repo-wide A/B default plan (`docs/ab-default-plan.md`).
+This supports A/B update and rollback validation described in `architecture.md`.
 
 ### 1.2 Scope
 
@@ -374,7 +374,6 @@ Primary sources for these requirements:
 
 - `tools/recab/README.md` and `tools/recab/CLAUDE.md` (tool scope and intent)
 - `architecture.md` (A/B update and rollback validation)
-- `docs/ab-default-plan.md` (repo-wide A/B default plan)
 
 ### 11.3 Validation
 
