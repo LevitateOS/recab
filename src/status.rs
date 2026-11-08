@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::state::{committed, known_good, rollback_target, Slot, TrialRecord};
 use crate::entry::{entry_name, layout_name, ENTRIES_DIR};
-use crate::systemd_boot::has_trial_options;
+use crate::trial_options;
 use crate::System;
 
 /// One slot's layout on the ESP, as recab wrote it.
@@ -75,7 +75,7 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
             root: entry.as_ref().and_then(|e| e.root_text()),
             device: device.map(|d| d.display().to_string()),
             bootable: sys.backend.bootable(&sys.boot, slot)?,
-            trial: entry.as_ref().is_some_and(has_trial_options),
+            trial: entry.as_ref().is_some_and(trial_options::is_trial),
         });
     }
     let (sel, state) = (&sys.boot.selection, &sys.state);

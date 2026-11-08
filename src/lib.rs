@@ -29,6 +29,7 @@ mod system;
 mod systemd_boot;
 mod target;
 mod trial;
+mod trial_options;
 
 use anyhow::Result;
 use std::path::Path;

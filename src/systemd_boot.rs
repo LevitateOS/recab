@@ -12,38 +12,18 @@ use std::path::{Path, PathBuf};
 use crate::efivars::{EfiVars, Var};
 use crate::entry::{
     cmdline_root, cmdline_root_text, entry_file, entry_name, layout_name, loader_default, loader_with_default,
-    same_entry, slot_of_entry, Entry, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF, PANIC_KEY, PANIC_OPTION,
+    same_entry, slot_of_entry, Entry, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
 };
+use crate::trial_options::{make_default, make_trial};
 use crate::error::refuse;
-use crate::init_system::crash_option;
 use crate::state::{BootChange, Selection, Slot};
 use crate::target::{partuuid, Kind, Target};
-use recinit::live::FAIL_REBOOT_OPTION;
 
 /// Where the target ships systemd-boot's EFI binaries, relative to its root.
 const SYSTEMD_BOOT_SOURCE_DIR: &str = "usr/lib/systemd/boot/efi";
 /// systemd-boot's EFI binary per firmware architecture suffix, and the
 /// firmware's default loader name for it (`EFI/BOOT/BOOT<ARCH>.EFI`).
 const SYSTEMD_BOOT_ARCHES: &[(&str, &str)] = &[("x64", "BOOTX64.EFI"), ("aa64", "BOOTAA64.EFI")];
-
-/// The kernel options a trial boot's entry carries until it is committed: the
-/// initramfs's fail-reboot word when the entry boots through one (a root that
-/// cannot mount reboots instead of opening a shell), and the init's crash
-/// option. A failure the kernel sees (no initramfs, a dying init) panics,
-/// which `panic=` reboots.
-fn trial_options(entry: &Entry, init: InitSystem) -> Vec<&'static str> {
-    entry.has_initrd().then_some(FAIL_REBOOT_OPTION).into_iter().chain(crash_option(init)).collect()
-}
-
-/// Any option some trial carries: what a committed entry loses.
-fn is_trial_option(option: &str) -> bool {
-    option == FAIL_REBOOT_OPTION || InitSystem::ALL.iter().any(|init| crash_option(*init) == Some(option))
-}
-
-/// The entry carries a trial's options.
-pub(crate) fn has_trial_options(entry: &Entry) -> bool {
-    entry.options().iter().any(|o| is_trial_option(o))
-}
 
 /// The ESP and boot selection of the system the run looks at.
 pub(crate) struct SystemdBoot {
@@ -212,7 +192,7 @@ impl SystemdBoot {
                     }
                 }
                 let init = step!(init());
-                step!(self.set_trial_options(&boot.prefix, slot, Some(init)));
+                step!(self.rewrite_entry(&boot.prefix, slot, |entry| make_trial(entry, init)));
                 entry_changed = true;
                 step!(self.vars.set(Var::OneShot, Some(&id)));
                 Ok(())
@@ -222,7 +202,7 @@ impl SystemdBoot {
                     step!(self.vars.set(Var::OneShot, None));
                     firmware.push(Var::OneShot.name());
                 }
-                step!(self.set_trial_options(&boot.prefix, slot, None));
+                step!(self.rewrite_entry(&boot.prefix, slot, make_default));
                 entry_changed = true;
                 let loader_conf = self.loader_conf();
                 let before = step!(target_root::read_optional(&loader_conf).map_err(anyhow::Error::from));
@@ -240,16 +220,12 @@ impl SystemdBoot {
         }
     }
 
-    /// Give the slot's entry a trial's options for `init`, or none (a default).
-    fn set_trial_options(&self, prefix: &str, slot: Slot, init: Option<InitSystem>) -> Result<()> {
+    /// Rewrite the slot's entry with `edit`, when it changes anything.
+    fn rewrite_entry(&self, prefix: &str, slot: Slot, edit: impl FnOnce(&mut Entry)) -> Result<()> {
         let path = self.entries_dir().join(entry_name(prefix, slot));
         let text = fs::read_to_string(&path).with_context(|| format!("reading entry '{}'", path.display()))?;
         let mut entry = Entry::parse(&text);
-        let wanted = init.map(|init| trial_options(&entry, init)).unwrap_or_default();
-        let mut options = entry.options();
-        options.retain(|o| !is_trial_option(o));
-        options.extend(wanted.iter().map(|o| o.to_string()));
-        entry.set_options(options);
+        edit(&mut entry);
         if entry.render() == text {
             return Ok(());
         }
@@ -426,21 +402,14 @@ pub(crate) struct SlotWrite<'a> {
 
 impl SlotWrite<'_> {
     /// Install the slot's kernel (and initrd) and point its entry at them,
-    /// with `panic=` and, the slot being uncommitted, the trial options for
-    /// `init`. The entry is written first and the kernel last, so the slot
+    /// with the trial options for `init` (the slot is uncommitted). The entry is written first and the kernel last, so the slot
     /// can boot only once everything is in place.
     pub fn finish(self, kernel: &Path, initrd: Option<&Path>, init: InitSystem) -> Result<()> {
         let (backend, prefix, slot) = (self.backend, &self.boot.prefix, self.slot);
         let id = entry_name(prefix, slot);
         let mut entry = backend.entry(prefix, Some(slot))?.ok_or_else(|| backend.missing_entry(&id))?;
         entry.set_boot_files(&layout_name(prefix, Some(slot)), initrd.is_some());
-        let mut options = entry.options();
-        options.retain(|o| !is_trial_option(o));
-        if !options.iter().any(|o| o.starts_with(PANIC_KEY)) {
-            options.push(PANIC_OPTION.to_string());
-        }
-        options.extend(trial_options(&entry, init).iter().map(|o| o.to_string()));
-        entry.set_options(options);
+        make_trial(&mut entry, init);
         let path = backend.entries_dir().join(&id);
         target_root::write_durable(&path, entry.render().as_bytes(), None)
             .with_context(|| format!("writing '{}'", path.display()))?;

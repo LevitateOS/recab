@@ -815,6 +815,22 @@ fn set_next_repairs_a_one_shot_without_its_record() {
     assert_eq!(state["pending_trial_slot"], "B", "{state}");
 }
 
+/// A trial must reboot on a kernel panic: an entry an operator gave
+/// `panic=0` gets a rebooting `panic=` while it is a trial.
+#[test]
+fn a_trial_entry_always_reboots_on_a_panic() {
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+    fs::write(
+        tree.path("boot/loader/entries/lev-b.conf"),
+        "title b\nlinux /vmlinuz\noptions root=PARTUUID=0000-000b rw panic=0\n",
+    )
+    .unwrap();
+    tree.ok(&["set-next", "B"]);
+    let entry = tree.read("boot/loader/entries/lev-b.conf");
+    assert!(entry.contains("panic=10") && !entry.contains("panic=0 "), "{entry}");
+}
+
 /// Fields a newer recab wrote survive an older recab's write.
 #[test]
 fn state_keeps_fields_it_does_not_know() {
