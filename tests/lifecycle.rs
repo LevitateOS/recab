@@ -771,6 +771,50 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
     );
 }
 
+/// While a trial runs uncommitted, the other slot is the known-good one:
+/// set-next of it is refused (it would put the trial options on the
+/// fallback's entry), and its entry stays as it was.
+#[test]
+fn set_next_refuses_the_known_good_slot_during_a_trial() {
+    let tree = Tree::trial_of_b();
+    let entry = tree.read("boot/loader/entries/lev-a.conf");
+    tree.fails(&["set-next", "A"], 21, "running uncommitted");
+    assert_eq!(tree.read("boot/loader/entries/lev-a.conf"), entry);
+}
+
+/// A trial whose one-shot another boot used up (the operator picked the
+/// running slot from the menu) is forgotten, so a later menu pick of the
+/// scheduled slot is no trial: it is neither committed nor rebooted.
+#[test]
+fn a_trial_another_boot_used_up_is_forgotten() {
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+    tree.ok(&["set-next", "B"]);
+    tree.boot_into("a");
+    tree.ok(&["trial", "--timeout", "5"]);
+    let state: serde_json::Value = serde_json::from_str(&tree.read("state/state.json")).unwrap();
+    assert_eq!(state["pending_trial_slot"], serde_json::Value::Null, "{state}");
+
+    tree.boot_into("b");
+    fs::write(tree.path("system-state"), "degraded\n").unwrap();
+    tree.ok(&["trial", "--timeout", "5"]);
+    assert_eq!(tree.status()["committed"], false);
+    assert!(!tree.path("reboot.log").exists(), "a menu pick is not rebooted");
+}
+
+/// A one-shot already set without recab's record of it (a crash between
+/// the firmware write and the state save) is scheduled again, not taken as
+/// done: the trial then gets judged.
+#[test]
+fn set_next_repairs_a_one_shot_without_its_record() {
+    let tree = Tree::new();
+    tree.ok(&["commit"]);
+    tree.set_efivar("LoaderEntryOneShot", Some("lev-b.conf"));
+    tree.ok(&["set-next", "B"]);
+    let state: serde_json::Value = serde_json::from_str(&tree.read("state/state.json")).unwrap();
+    assert_eq!(state["pending_trial_slot"], "B", "{state}");
+}
+
 /// Fields a newer recab wrote survive an older recab's write.
 #[test]
 fn state_keeps_fields_it_does_not_know() {

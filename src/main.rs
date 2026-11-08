@@ -83,7 +83,7 @@ enum Command {
         change_flavour: bool,
     },
 
-    /// Stage a one-shot trial boot for a slot.
+    /// Schedule one trial boot of the inactive slot (A or B).
     SetNext {
         #[arg(value_name = "A|B", value_parser = str::parse::<Slot>)]
         slot: Slot,

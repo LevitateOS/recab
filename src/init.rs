@@ -104,7 +104,9 @@ until they are, they may select another entry.{later}"
             last_operation: Some(Operation::Init(Slot::A).label()),
             ..PersistentState::default()
         };
-        Store::new(&target).save(&state, "init")?;
+        let store = Store::new(&target);
+        store.save(&state)?;
+        store.audit(Operation::Init(Slot::A), Slot::A, &PersistentState::default(), &state);
     }
     Ok(())
 }

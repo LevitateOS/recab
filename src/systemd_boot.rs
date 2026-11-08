@@ -119,18 +119,6 @@ impl SystemdBoot {
         Ok(self.missing_boot_file(&entry_name(&boot.prefix, slot))?.is_none())
     }
 
-    /// Refuse a slot whose entry names files the ESP lacks: systemd-boot
-    /// would skip it and boot another entry.
-    pub fn ensure_bootable(&self, boot: &Boot, slot: Slot) -> Result<()> {
-        let entry = entry_name(&boot.prefix, slot);
-        match self.missing_boot_file(&entry)? {
-            Some(missing) => Err(refuse(format!(
-                "slot {slot} cannot boot: its entry '{entry}' names '{missing}', which is not on the boot partition"
-            ))),
-            None => Ok(()),
-        }
-    }
-
     /// This is an A/B system: both slots' entries exist.
     pub fn is_ab(&self) -> Result<bool> {
         let prefix = self.target.entry_prefix()?;
@@ -158,8 +146,12 @@ impl SystemdBoot {
             Some(slot) if self.missing_boot_file(&entry_name(&prefix, slot))?.is_none() => Some(slot),
             _ => None,
         };
+        let mut bootable = [false; 2];
+        for slot in Slot::ALL {
+            bootable[slot as usize] = self.missing_boot_file(&entry_name(&prefix, slot))?.is_none();
+        }
         Ok(Boot {
-            selection: Selection { active, default, oneshot, foreign_default },
+            selection: Selection { active, default, oneshot, foreign_default, bootable },
             prefix,
             raw_default,
             raw_oneshot,
@@ -183,8 +175,8 @@ impl SystemdBoot {
         Ok(default.and_then(|id| slot_of_entry(&prefix, &id)).map(|default| selected != default))
     }
 
-    /// Write `change`, checking first that the firmware can change and that
-    /// a slot other than the running one can boot. A one-shot points a stale
+    /// Write `change` (`plan` checked the slot can boot), checking first
+    /// that the firmware can change. A one-shot points a stale
     /// default variable at the default `plan` checked, then gives the entry
     /// the trial options for `init()` and sets the one-shot. A new default
     /// clears a pending one-shot first (so the riskier boot is the one
@@ -204,16 +196,11 @@ impl SystemdBoot {
             };
         }
         let slot = match change {
-            BootChange::None => return Ok(()),
             BootChange::OneShot(slot) | BootChange::Default(slot) => slot,
         };
         step!(self.vars.can_change());
-        if slot != boot.selection.active {
-            step!(self.ensure_bootable(boot, slot));
-        }
         let id = entry_name(&boot.prefix, slot);
         match change {
-            BootChange::None => Ok(()),
             BootChange::OneShot(_) => {
                 // A failed trial falls back to the default variable: make it
                 // the default `plan` checked, not a stale value it skipped.

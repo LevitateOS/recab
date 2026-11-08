@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::target::Target;
-use crate::error::refuse;
+use crate::error::{classified, refuse, ErrorClass};
 use crate::state::{Operation, PersistentState, Slot};
 
 /// The audit log record's schema (one JSON object per line). Each record
@@ -66,10 +66,6 @@ impl Store {
         Ok(Lock { _file: file })
     }
 
-    /// recab has written state here.
-    pub fn exists(&self) -> Result<bool> {
-        Ok(target_root::exists(&self.state_path)?)
-    }
 
     /// recab's state, `None` when it has written none here.
     pub fn load(&self) -> Result<Option<PersistentState>> {
@@ -87,13 +83,12 @@ impl Store {
         Ok(Some(state))
     }
 
-    pub fn save(&self, state: &PersistentState, during: &str) -> Result<()> {
+    pub fn save(&self, state: &PersistentState) -> Result<()> {
         let payload = serde_json::to_vec_pretty(state).context("serializing recab state")?;
         target_root::write_durable(&self.state_path, &payload, None).map_err(|err| {
-            refuse(format!(
-                    "failed writing recab state during {during} to '{}': {err:#}",
-                    self.state_path.display()
-                ),
+            classified(
+                ErrorClass::StateOrDetection,
+                format!("failed writing recab state to '{}': {err:#}", self.state_path.display()),
             )
         })
     }
