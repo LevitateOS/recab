@@ -25,14 +25,6 @@ impl Slot {
             Slot::B => Slot::A,
         }
     }
-
-    /// The slot's suffix in entry and directory names (`<prefix>-a`).
-    pub(crate) fn entry_suffix(self) -> &'static str {
-        match self {
-            Slot::A => "a",
-            Slot::B => "b",
-        }
-    }
 }
 
 impl std::fmt::Display for Slot {
@@ -137,6 +129,9 @@ pub(crate) struct Selection {
     pub default: Option<Slot>,
     /// The slot of a one-shot entry not taken yet.
     pub oneshot: Option<Slot>,
+    /// systemd-boot boots another, bootable entry by default (one set from
+    /// the boot menu, an old install's, another OS's): `default` is `None`.
+    pub foreign_default: bool,
 }
 
 impl Selection {
@@ -243,6 +238,11 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {slot}."
     if sel.next_boot() == Some(slot) {
         return Err(refuse(format!(
             "the next boot is slot {slot}; run 'recab rollback' (or 'recab commit') so it is slot {active} before staging slot {slot}"
+        )));
+    }
+    if sel.foreign_default {
+        return Err(refuse(format!(
+            "systemd-boot boots another entry by default; run 'recab commit' so it is slot {active} before staging slot {slot}"
         )));
     }
     // After a one-shot boot of the running slot, the freshly written

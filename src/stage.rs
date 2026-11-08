@@ -13,9 +13,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::target::{partuuid, Target};
+use crate::target::Target;
 use crate::carried::{self, Carry};
-use crate::systemd_boot::{Boot, SystemdBoot};
+use crate::systemd_boot::{Boot, SlotWrite, SystemdBoot};
 use crate::state::Slot;
 use crate::error::refuse;
 use distro_profile::{Flavour, InitSystem};
@@ -153,7 +153,7 @@ pub(crate) fn check_inputs(
         }
     }
     // Stage removes this directory before it installs the kernel and initrd.
-    let slot_dir = backend.slot_boot_files_dir(boot, slot);
+    let slot_dir = backend.kernel_dir(boot, slot);
     if let Some(slot_dir) = target_root::canonical(&slot_dir)? {
         for (what, path) in [
             ("rootfs", Some(rootfs)),
@@ -186,7 +186,7 @@ pub(crate) fn check_target(
     inputs: &Inputs,
 ) -> Result<SlotPartition> {
     use std::os::unix::fs::MetadataExt;
-    let device = backend.slot_device(boot, slot)?;
+    let (device, partuuid) = backend.slot_device(boot, slot)?;
     let table = target.mount_table()?;
     if let Some(point) = target_root::mounted_at(&table, &device)? {
         return Err(refuse(format!(
@@ -229,7 +229,6 @@ pub(crate) fn check_target(
             device.display()
         )));
     }
-    let partuuid = partuuid(&device)?;
     Ok(SlotPartition { device, partuuid })
 }
 
@@ -237,8 +236,7 @@ pub(crate) fn check_target(
 /// until the kernel and entry are installed at the end.
 pub(crate) fn write_slot(
     target: &Target,
-    backend: &SystemdBoot,
-    boot: &Boot,
+    write: SlotWrite,
     slot: Slot,
     request: &StageRequest,
     partition: &SlotPartition,
@@ -246,8 +244,6 @@ pub(crate) fn write_slot(
 ) -> Result<()> {
     let device = &partition.device;
     let running_root = target.root.as_path();
-
-    backend.remove_slot_boot_files(boot, slot)?;
 
     let role = slot_role(slot);
     let label = role.label().expect("slot roles have labels");
@@ -283,13 +279,7 @@ pub(crate) fn write_slot(
     sync_filesystem(&mount_point)?;
     mounted.unmount()?;
 
-    backend.install_slot_boot_files(
-        boot,
-        slot,
-        &request.kernel,
-        request.initrd.as_deref(),
-        init,
-    )
+    write.finish(&request.kernel, request.initrd.as_deref(), init)
 }
 
 

@@ -37,7 +37,7 @@ impl Tree {
         for slot in ["a", "b"] {
             fs::write(
                 entries.join(format!("lev-{slot}.conf")),
-                format!("title {slot}\nlinux /vmlinuz\noptions root=/dev/fake-{slot} rw\n"),
+                format!("title {slot}\nlinux /vmlinuz\noptions root=PARTUUID=0000-000{slot} rw\n"),
             )
             .unwrap();
         }
@@ -84,7 +84,7 @@ esac
         fs::create_dir_all(self.path("proc")).unwrap();
         fs::write(
             self.path("proc/cmdline"),
-            format!("quiet root=/dev/fake-{slot} ro\n"),
+            format!("quiet root=PARTUUID=0000-000{slot} ro\n"),
         )
         .unwrap();
         self.set_efivar("LoaderEntrySelected", Some(&format!("lev-{slot}.conf")));
@@ -195,7 +195,7 @@ esac
     fn slot_kernel(&self, slot: &str, with_kernel: bool) {
         fs::write(
             self.path(&format!("boot/loader/entries/lev-{slot}.conf")),
-            format!("title {slot}\nlinux /lev-{slot}/vmlinuz\noptions root=/dev/fake-{slot} rw\n"),
+            format!("title {slot}\nlinux /lev-{slot}/vmlinuz\noptions root=PARTUUID=0000-000{slot} rw\n"),
         )
         .unwrap();
         if with_kernel {
@@ -361,7 +361,7 @@ fn a_failed_firmware_write_leaves_the_state_alone() {
     let loader = tree.read("boot/loader/loader.conf");
     let state = tree.read("state/state.json");
     tree.block_efivar("LoaderEntryDefault", true);
-    tree.fails(&["rollback"], 22, "one-shot boot was cleared");
+    tree.fails(&["rollback"], 22, "changed LoaderEntryOneShot");
     assert_eq!(
         tree.read("boot/loader/loader.conf"),
         loader,
@@ -381,10 +381,10 @@ fn set_next_refuses_a_slot_without_its_kernel() {
     tree.ok(&["commit"]);
     fs::write(
         tree.path("boot/loader/entries/lev-b.conf"),
-        "title b\nlinux /lev-b/vmlinuz\noptions root=/dev/fake-b rw\n",
+        "title b\nlinux /lev-b/vmlinuz\noptions root=PARTUUID=0000-000b rw\n",
     )
     .unwrap();
-    tree.fails(&["set-next", "B"], 21, "not bootable");
+    tree.fails(&["set-next", "B"], 21, "cannot boot");
     assert!(!tree.has_efivar("LoaderEntryOneShot"));
 }
 
@@ -395,7 +395,7 @@ fn a_default_naming_an_unbootable_slot_is_ignored() {
     let tree = Tree::new();
     fs::write(
         tree.path("boot/loader/entries/lev-b.conf"),
-        "title b\nlinux /lev-b/vmlinuz\noptions root=/dev/fake-b rw\n",
+        "title b\nlinux /lev-b/vmlinuz\noptions root=PARTUUID=0000-000b rw\n",
     )
     .unwrap();
     fs::write(tree.path("boot/loader/loader.conf"), "default lev-a.conf\n").unwrap();
@@ -460,10 +460,9 @@ fn stage_refuses_bad_inputs_before_touching_the_slot() {
 }
 
 /// A firmware default left by an earlier install names slot B, which has
-/// no kernel, so systemd-boot skips it. Once stage writes B's kernel it
-/// would boot B by default, untried: stage points it at slot A first, and
-/// removes a stale one-shot of B. (The scratch tree has no PARTUUID slot
-/// partition, so the stage stops at its partition check afterwards.)
+/// no kernel, so systemd-boot skips it (status: the default is A). Stage
+/// needs efivarfs to reset it before writing B, and refuses without; a
+/// stage refused for another reason leaves the variables as they are.
 #[test]
 fn stage_resets_a_stale_firmware_selection_of_its_slot() {
     let tree = Tree::new();
@@ -487,12 +486,12 @@ fn stage_resets_a_stale_firmware_selection_of_its_slot() {
     assert_eq!(out.status.code(), Some(20), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(tree.efivar("LoaderEntryDefault").as_deref(), Some("lev-b.conf"));
 
-    tree.fails(&args, 21, "root=PARTUUID=");
-    assert_eq!(
-        tree.efivar("LoaderEntryDefault").as_deref(),
-        Some("lev-a.conf")
-    );
-    assert!(!tree.has_efivar("LoaderEntryOneShot"));
+    // A stage that is refused (here: the scratch tree has no slot partition)
+    // changes nothing, firmware variables included; one that passes its
+    // checks points them at slot A before it writes slot B (VM scenario).
+    tree.fails(&args, 21, "which is not present");
+    assert_eq!(tree.efivar("LoaderEntryDefault").as_deref(), Some("lev-b.conf"));
+    assert!(tree.has_efivar("LoaderEntryOneShot"));
     assert!(!tree.path("state/state.json").exists(), "nothing recorded");
 }
 
@@ -676,8 +675,12 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
     )
     .unwrap();
 
+    // Installing from a live medium: this machine's own ESP holds no A/B
+    // install, so init resets this machine's firmware variables.
+    fs::create_dir_all(tree.path("live-esp")).unwrap();
     let out = tree
         .command(true)
+        .env("RECAB_BOOT_ROOT", tree.path("live-esp"))
         .env(
             "PATH",
             format!(
@@ -754,6 +757,7 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
             ),
         )
         .env("RECAB_SYS_FIRMWARE_EFI_PATH", tree.path("no-efi"))
+        .env("RECAB_BOOT_ROOT", tree.path("live-esp"))
         .args(["init", "--root", target.to_str().unwrap()])
         .args(["--slot-a", "/dev/part-a", "--slot-b", "/dev/part-b"])
         .args(["--kernel", tree.path("kernel").to_str().unwrap()])

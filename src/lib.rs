@@ -13,6 +13,8 @@
 //! selection); `store` keeps recab's state and audit log.
 
 mod carried;
+mod efivars;
+mod entry;
 #[cfg(feature = "contracts")]
 pub mod contract;
 mod error;
@@ -39,16 +41,16 @@ pub use init_system::Health;
 pub use package::{trial_service_link, TRIAL_TIMEOUT_SECS};
 pub use state::{Slot, TrialRecord};
 pub use status::{status, SlotView, Status};
-pub use systemd_boot::{entry_name, layout_name, ENTRIES_DIR};
+pub use entry::{entry_name, layout_name, ENTRIES_DIR};
 
 use target::Target;
 use error::{classified, or_class};
 use state::{
-    judge_trial, known_good, plan, plan_stage, BootChange, Operation, PersistentState, Request, Startup,
+    judge_trial, known_good, plan, plan_stage, Operation, PersistentState, Request, Startup,
     Transition, TrialVerdict, TrialView,
 };
 use store::{now, Lock, Store};
-use systemd_boot::{ApplyError, Boot, SystemdBoot};
+use systemd_boot::{Boot, SelectError, SystemdBoot};
 
 /// What `trial` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,17 +140,11 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     };
     let request = &request;
     let transition = plan_stage(&sys.boot.selection, &sys.state)?;
-    let active = sys.boot.selection.active;
-    let slot = active.other();
+    let slot = sys.boot.selection.active.other();
     let init = sys.target.init()?;
-    // A firmware variable systemd-boot skips today, because it names this
-    // slot without a kernel, would take effect once the slot is written:
-    // stage must be able to read and reset them.
-    sys.backend.ensure_can_change()?;
+    // Stage resets stale firmware variables before it writes the slot.
+    sys.backend.can_change()?;
     let inputs = stage::check_inputs(&sys.backend, &sys.boot, slot, request)?;
-    // The plan made sure the running slot is the known-good one and the
-    // default (if any); this changes nothing systemd-boot boots now.
-    sys.backend.reset_stale_selection(&sys.boot, active, slot)?;
     let partition = stage::check_target(&sys.target, &sys.backend, &sys.boot, slot, &inputs)?;
     stage::check_flavour(&sys.target, &inputs, change_flavour)?;
     // Recorded before the slot is touched: from here its old system is gone,
@@ -157,7 +153,8 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     sys.store.save(&next, "stage")?;
     sys.store
         .audit(transition.operation, sys.boot.selection.active, &sys.state, &next);
-    stage::write_slot(&sys.target, &sys.backend, &sys.boot, slot, request, &partition, init)
+    let write = sys.backend.begin_slot_write(&sys.boot, slot)?;
+    stage::write_slot(&sys.target, write, slot, request, &partition, init)
 }
 
 /// Configure a one-shot trial boot of the inactive `slot`.
@@ -310,45 +307,12 @@ fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentSt
         return Ok(());
     };
     let active = sys.boot.selection.active;
-    // systemd-boot skips an entry it cannot boot: never select one.
-    match transition.boot {
-        BootChange::OneShot(slot) | BootChange::Default(slot) if slot != active => {
-            sys.backend.ensure_bootable(&sys.boot, slot)?;
-        }
-        _ => {}
-    }
     let name = transition.operation.name();
-    sys.backend.ensure_can_change()?;
-    // A trial falls back to the default the firmware variable names: make it
-    // the known-good default `plan` checked, not a stale value it skipped.
-    if let (BootChange::OneShot(slot), Some(default)) = (transition.boot, sys.boot.selection.default) {
-        sys.backend.reset_stale_selection(&sys.boot, default, slot)?;
-    }
-
     let mut next = stamped(&transition)?;
     annotate(&mut next);
-    let init = sys.target.init()?;
-    match sys.backend.apply(&sys.boot, transition.boot, init) {
-        Ok(()) => {}
-        Err(ApplyError::Untouched(cause)) => {
-            return Err(cause.context(format!("{name} aborted; the boot selection is unchanged")));
-        }
-        Err(ApplyError::FirmwareChanged(cause)) => {
-            return Err(classified(
-                ErrorClass::PartialUpdate,
-                format!("{name} changed the boot selection only in part, and recab's state was not updated: {cause:#}"),
-            ));
-        }
-        Err(ApplyError::RestoreFailed { cause, restore }) => {
-            return Err(classified(
-                ErrorClass::PartialUpdate,
-                format!(
-                    "{name} failed and loader.conf could not be put back; recab's state was not updated.\n\
-primary error: {cause:#}\nrestore error: {restore:#}"
-                ),
-            ));
-        }
-    }
+    sys.backend
+        .select(&sys.boot, transition.boot, || sys.target.init())
+        .map_err(|err| select_failed(name, err))?;
     sys.store.save(&next, name).map_err(|err| {
         classified(
             ErrorClass::PartialUpdate,
@@ -357,4 +321,29 @@ primary error: {cause:#}\nrestore error: {restore:#}"
     })?;
     sys.store.audit(transition.operation, active, &sys.state, &next);
     Ok(())
+}
+
+/// The error of a failed boot-selection change, saying what it changed.
+fn select_failed(name: &str, err: SelectError) -> anyhow::Error {
+    let SelectError { cause, firmware, entry, restore } = err;
+    if let Some(restore) = restore {
+        return classified(
+            ErrorClass::PartialUpdate,
+            format!(
+                "{name} failed and loader.conf could not be put back; recab's state was not updated.\n\
+primary error: {cause:#}\nrestore error: {restore:#}"
+            ),
+        );
+    }
+    if !firmware.is_empty() {
+        return classified(
+            ErrorClass::PartialUpdate,
+            format!(
+                "{name} changed {} but not the rest of the boot selection, and recab's state was not updated: {cause:#}",
+                firmware.join(" and ")
+            ),
+        );
+    }
+    let entry = if entry { " (the slot's entry options were rewritten)" } else { "" };
+    cause.context(format!("{name} aborted; the boot selection is unchanged{entry}"))
 }

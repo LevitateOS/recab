@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::state::{committed, known_good, rollback_target, Slot, TrialRecord};
-use crate::systemd_boot::{entry_name, entry_root, has_trial_options, slot_boot_dir, ENTRIES_DIR};
+use crate::entry::{entry_name, layout_name, ENTRIES_DIR};
+use crate::systemd_boot::has_trial_options;
 use crate::System;
 
 /// One slot's layout on the ESP, as recab wrote it.
@@ -61,19 +62,20 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
     let sys = System::read(root)?;
     let mut slots = Vec::new();
     for slot in Slot::ALL {
-        let content = sys.backend.entry_text(&sys.boot, slot)?;
-        let root = match content.as_deref() {
-            Some(content) => entry_root(content)?,
+        let entry = sys.backend.entry(&sys.boot.prefix, Some(slot))?;
+        let partuuid = entry.as_ref().and_then(|e| e.root_partuuid());
+        let device = match &partuuid {
+            Some(partuuid) => target_root::device_with_tag("PARTUUID", partuuid)?,
             None => None,
         };
         slots.push(SlotView {
             slot,
             entry: format!("{ENTRIES_DIR}/{}", entry_name(&sys.boot.prefix, slot)),
-            boot_dir: slot_boot_dir(&sys.boot.prefix, slot),
-            device: root.as_ref().and_then(|(_, device)| device.as_ref()).map(|d| d.display().to_string()),
-            root: root.map(|(selector, _)| selector),
+            boot_dir: layout_name(&sys.boot.prefix, Some(slot)),
+            root: entry.as_ref().and_then(|e| e.root_text()),
+            device: device.map(|d| d.display().to_string()),
             bootable: sys.backend.bootable(&sys.boot, slot)?,
-            trial: content.as_deref().is_some_and(has_trial_options),
+            trial: entry.as_ref().is_some_and(has_trial_options),
         });
     }
     let (sel, state) = (&sys.boot.selection, &sys.state);

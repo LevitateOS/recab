@@ -10,16 +10,12 @@
 //! root, with the same options.
 
 use anyhow::{Context, Result};
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::refuse;
 use crate::state::{Operation, PersistentState, Slot};
 use crate::store::Store;
-use crate::systemd_boot::{
-    install_loader, layout_entry_name, layout_name, loader_with_default, new_entry, SystemdBoot, ENTRIES_DIR,
-    INITRD_FILE, KERNEL_FILE, LOADER_CONF,
-};
+use crate::systemd_boot::SystemdBoot;
 use crate::target::{partuuid, Target};
 use recpart::policy::STATE_MOUNT;
 
@@ -47,76 +43,68 @@ pub struct InitRequest {
 
 /// Set up the system `target` (installed under `request.root`).
 pub(crate) fn run(target: Target, request: &InitRequest) -> Result<()> {
-    let esp = target.esp.clone();
-    let prefix = target.entry_prefix()?;
     let name = target.os_name()?;
 
-    // The entries, each with its slot (`None`: the mutable root) and title;
-    // the first is the installed system's.
-    let entries: Vec<(Option<Slot>, String, String)> = match &request.layout {
+    // The entries, each with its slot (`None`: the mutable root), title and
+    // root PARTUUID.
+    let (entries, installed_root): (Vec<(Option<Slot>, String, String)>, String) = match &request.layout {
         InitLayout::Ab { slot_a, slot_b } => {
             let (a, b) = (partuuid(slot_a)?, partuuid(slot_b)?);
             if a == b {
                 return Err(refuse("slot A and slot B are the same partition"));
             }
-            vec![
-                (Some(Slot::A), format!("{name} (Slot A)"), a),
-                (Some(Slot::B), format!("{name} (Slot B)"), b),
-            ]
+            (vec![(Some(Slot::A), format!("{name} (Slot A)"), a.clone()), (Some(Slot::B), format!("{name} (Slot B)"), b)], a)
         }
-        InitLayout::Mutable { root_device } => vec![(None, name.clone(), partuuid(root_device)?)],
+        InitLayout::Mutable { root_device } => {
+            let root = partuuid(root_device)?;
+            (vec![(None, name.clone(), root.clone())], root)
+        }
     };
-    check_mounts(&target, &request.layout, &entries[0].2)?;
-    let installed = entries[0].0;
+    check_mounts(&target, &request.layout, &installed_root)?;
+    // The installed system's kernel goes to its own directory; slot B's stays
+    // empty, so its entry cannot boot until `recab stage` fills it.
+    let installed = match request.layout {
+        InitLayout::Ab { .. } => Some(Slot::A),
+        InitLayout::Mutable { .. } => None,
+    };
+    let default_entry = SystemdBoot::new(&target).install_layout(
+        &entries,
+        installed,
+        &request.kernel,
+        request.initrd.as_deref(),
+        &request.options,
+    )?;
 
-    install_loader(&target.root, &esp)?;
-
-    // The installed system's kernel; slot B's directory stays empty, so its
-    // entry cannot boot until `recab stage` fills it.
-    let dir = esp.join(layout_name(&prefix, installed));
-    fs::create_dir_all(&dir).with_context(|| format!("creating '{}'", dir.display()))?;
-    target_root::copy_durable(&request.kernel, &dir.join(KERNEL_FILE))?;
-    if let Some(initrd) = &request.initrd {
-        target_root::copy_durable(initrd, &dir.join(INITRD_FILE))?;
+    // The boot selection before recab's state. A previous install may have
+    // left systemd-boot variables naming another entry; they win over
+    // loader.conf. This machine's firmware boots the target only when this
+    // machine is not itself a recab install (installing from the live
+    // medium, not from an installed system onto another disk).
+    let host = SystemdBoot::new(&Target::running()?);
+    if host.is_ab()? {
+        eprintln!(
+            "recab: note: this machine runs its own A/B install, so its firmware variables were left as they are; \
+the installed system boots '{default_entry}' from its own loader.conf"
+        );
+    } else if host.firmware_writable() {
+        host.point_firmware_at(&default_entry)
+            .with_context(|| format!("pointing systemd-boot's firmware variables at '{default_entry}'"))?;
+    } else {
+        let later = if installed.is_some() { " 'recab stage' resets them before it writes slot B." } else { "" };
+        eprintln!(
+            "recab: warning: EFI variables are not available here (no efivarfs), so systemd-boot's \
+LoaderEntryDefault and LoaderEntryOneShot left by an earlier install could not be reset to '{default_entry}'; \
+until they are, they may select another entry.{later}"
+        );
     }
 
-    let entries_dir = esp.join(ENTRIES_DIR);
-    fs::create_dir_all(&entries_dir).with_context(|| format!("creating '{}'", entries_dir.display()))?;
-    for (slot, title, partuuid) in &entries {
-        let entry = new_entry(title, &prefix, *slot, request.initrd.is_some(), partuuid, &request.options);
-        let path = entries_dir.join(layout_entry_name(&prefix, *slot));
-        target_root::write_durable(&path, entry.as_bytes(), None).with_context(|| format!("writing '{}'", path.display()))?;
-    }
-
-    let default_entry = layout_entry_name(&prefix, installed);
-    let loader_conf = esp.join(LOADER_CONF);
-    let before = target_root::read_optional(&loader_conf)?;
-    target_root::write_durable(&loader_conf, loader_with_default(before.as_deref(), &default_entry).as_bytes(), None)
-        .with_context(|| format!("writing '{}'", loader_conf.display()))?;
-
-    if let InitLayout::Ab { .. } = request.layout {
+    if installed.is_some() {
         let state = PersistentState {
             known_good_slot: Some(Slot::A),
             last_operation: Some(Operation::Init(Slot::A).label()),
             ..PersistentState::default()
         };
         Store::new(&target).save(&state, "init")?;
-    }
-
-    // A previous install may have left systemd-boot variables naming another
-    // entry; they win over loader.conf. Point this machine's at the installed one.
-    let backend = SystemdBoot::new(&Target::running()?);
-    if backend.efivars_available() {
-        backend
-            .set_loader_efivar("LoaderEntryDefault", Some(&default_entry))
-            .and_then(|()| backend.set_loader_efivar("LoaderEntryOneShot", None))
-            .with_context(|| format!("pointing systemd-boot's firmware variables at '{default_entry}'"))?;
-    } else {
-        eprintln!(
-            "recab: warning: EFI variables are not available here (no efivarfs), so systemd-boot's \
-LoaderEntryDefault and LoaderEntryOneShot left by an earlier install could not be reset to '{default_entry}'; \
-until they are, they may select another entry. 'recab stage' resets them before it writes slot B."
-        );
     }
     Ok(())
 }
