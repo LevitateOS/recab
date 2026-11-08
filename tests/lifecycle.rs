@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+/// The distro profile lines of a systemd and an OpenRC system's os-release.
+const SYSTEMD_PROFILE: &str = "REC_PACKAGES=rpm\nREC_INIT=systemd\nREC_LIBC=glibc\nREC_PRIVILEGE=sudo\nREC_DESKTOP=plasma\nREC_KERNEL_LINE=lts\n";
+const OPENRC_PROFILE: &str = "REC_PACKAGES=apk\nREC_INIT=openrc\nREC_LIBC=musl\nREC_PRIVILEGE=doas\nREC_DESKTOP=lxqt\nREC_KERNEL_LINE=latest\n";
 
 struct Tree {
     dir: tempfile::TempDir,
@@ -39,7 +42,8 @@ impl Tree {
             .unwrap();
         }
         fs::write(root.join("boot/vmlinuz"), "kernel").unwrap();
-        fs::write(root.join("os-release"), "ID=lev\n").unwrap();
+        fs::write(root.join("os-release"), format!("ID=lev\n{SYSTEMD_PROFILE}")).unwrap();
+        fs::write(root.join("os-release-openrc"), format!("ID=lev\n{OPENRC_PROFILE}")).unwrap();
         executable(
             &root.join("systemctl"),
             &format!(
@@ -131,7 +135,6 @@ esac
             .env("RECAB_PROC_CMDLINE_PATH", self.path("cmdline"))
             .env("RECAB_SYS_FIRMWARE_EFI_PATH", self.path("efi"))
             .env("RECAB_EFIVARS_PATH", self.path("efi/efivars"))
-            .env("RECAB_INIT_SYSTEM", "systemd")
             .env("RECAB_SYSTEMCTL_BIN", self.path("systemctl"))
             .env("RECAB_OPENRC_DIR", self.path("openrc"))
             .env("RECAB_RUNLEVELS_DIR", self.path("runlevels"))
@@ -610,6 +613,8 @@ fn trial_without_the_esp_still_reboots_a_failed_trial() {
 #[test]
 fn install_unit_writes_and_enables_the_trial_service() {
     let tree = Tree::new();
+    fs::create_dir_all(tree.path("target/etc")).unwrap();
+    fs::write(tree.path("target/etc/os-release"), format!("ID=lev\n{SYSTEMD_PROFILE}")).unwrap();
     tree.ok(&[
         "install-unit",
         "--root",
@@ -634,7 +639,11 @@ fn init_sets_up_the_boot_layout_of_an_installed_system() {
     fs::create_dir_all(target.join("boot/EFI/systemd")).unwrap();
     fs::write(target.join("boot/EFI/systemd/systemd-bootx64.efi"), "efi").unwrap();
     fs::create_dir_all(target.join("etc")).unwrap();
-    fs::write(target.join("etc/os-release"), "NAME=\"Lev OS\"\nID=lev\n").unwrap();
+    fs::write(
+        target.join("etc/os-release"),
+        format!("NAME=\"Lev OS\"\nID=lev\n{SYSTEMD_PROFILE}"),
+    )
+    .unwrap();
     fs::create_dir_all(target.join("usr/lib/systemd/system")).unwrap();
     fs::write(
         target.join("usr/lib/systemd/system/recab-trial.service"),
@@ -767,7 +776,7 @@ fn state_keeps_fields_it_does_not_know() {
 fn openrc_trials_commit_when_healthy_and_reboot_when_a_service_failed() {
     let openrc = |tree: &Tree, args: &[&str]| {
         tree.command(true)
-            .env("RECAB_INIT_SYSTEM", "openrc")
+            .env("RECAB_OS_RELEASE_PATH", tree.path("os-release-openrc"))
             .env("RECAB_REBOOT_BIN", tree.path("reboot"))
             .args(args)
             .output()
@@ -831,11 +840,10 @@ fn openrc_trials_commit_when_healthy_and_reboot_when_a_service_failed() {
 fn install_unit_writes_and_enables_the_openrc_service() {
     let tree = Tree::new();
     let target = tree.path("target");
-    fs::create_dir_all(target.join("sbin")).unwrap();
-    fs::write(target.join("sbin/openrc-run"), "").unwrap();
+    fs::create_dir_all(target.join("etc")).unwrap();
+    fs::write(target.join("etc/os-release"), format!("ID=lev\n{OPENRC_PROFILE}")).unwrap();
     let out = tree
         .command(true)
-        .env_remove("RECAB_INIT_SYSTEM")
         .args(["install-unit", "--root", target.to_str().unwrap()])
         .output()
         .unwrap();

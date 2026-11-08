@@ -1,11 +1,13 @@
-//! What depends on the init system: how `recab trial` learns that startup
-//! finished and what failed, how it reboots, the service that runs it on
-//! every boot, the kernel options of a trial, and the machine configuration
-//! `stage` carries into a new slot.
+//! What depends on the system's distro profile (the `REC_*` fields of its
+//! os-release): how `recab trial` learns that startup finished and what
+//! failed, how it reboots, the service that runs it on every boot, the kernel
+//! options of a trial, and the machine configuration `stage` carries into a
+//! new slot.
 //!
-//! systemd (LevitateOS) and OpenRC (AcornOS) are supported.
+//! systemd and OpenRC are supported.
 
 use anyhow::{bail, Context, Result};
+use distro_profile::{InitSystem, PrivilegeTool, Profile};
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{symlink, PermissionsExt};
@@ -17,144 +19,156 @@ use crate::state::Startup;
 use crate::store::write_durable;
 use crate::{tagged_err, ErrorClass};
 
-/// The init system of a recab-managed system.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InitSystem {
-    Systemd,
-    OpenRc,
-}
-
 /// What `stage` copies from the running system into the new one, on top of
 /// the identity and account files every system carries.
 pub(crate) struct Carried {
     /// Files (or symlinks) copied over the image's.
-    pub files: &'static [&'static str],
+    pub files: Vec<&'static str>,
     /// Directories whose contents are copied over the image's, adding what
     /// the machine enabled or configured without removing what the image adds.
-    pub dirs: &'static [&'static str],
+    pub dirs: Vec<&'static str>,
 }
 
 const SYSTEMD_UNIT: &str = include_str!("services/recab-trial.service");
 const OPENRC_SERVICE: &str = include_str!("services/recab-trial.openrc");
 
-impl InitSystem {
-    /// The init system running now (`RECAB_INIT_SYSTEM` overrides).
-    pub(crate) fn running() -> Result<Self> {
-        if let Some(init) = Self::from_override()? {
-            return Ok(init);
-        }
-        if Path::new("/run/systemd/system").is_dir() {
-            Ok(Self::Systemd)
-        } else if Path::new("/run/openrc").is_dir() {
-            Ok(Self::OpenRc)
-        } else {
-            Err(tagged_err(
-                ErrorClass::BackendUnavailable,
-                "cannot tell the init system: neither /run/systemd/system nor /run/openrc exists (set RECAB_INIT_SYSTEM to systemd or openrc)",
-            ))
-        }
-    }
+/// The profile of the running system, from its os-release
+/// (`RECAB_OS_RELEASE_PATH`, default `/etc/os-release`).
+pub(crate) fn running_profile() -> Result<Profile> {
+    let path = std::env::var_os("RECAB_OS_RELEASE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/os-release"));
+    let text = fs::read_to_string(&path).map_err(|error| {
+        tagged_err(
+            ErrorClass::BackendUnavailable,
+            format!("cannot read '{}': {error}", path.display()),
+        )
+    })?;
+    Profile::from_os_release(&text).map_err(|error| {
+        tagged_err(
+            ErrorClass::BackendUnavailable,
+            format!("{}: {error}", path.display()),
+        )
+    })
+}
 
-    /// The init system installed under `root` (`RECAB_INIT_SYSTEM` overrides).
-    pub(crate) fn installed_in(root: &Path) -> Result<Self> {
-        if let Some(init) = Self::from_override()? {
-            return Ok(init);
-        }
-        let has = |rel: &str| root.join(rel).exists();
-        if has("sbin/openrc-run") || has("usr/sbin/openrc-run") || has("usr/bin/openrc-run") {
-            Ok(Self::OpenRc)
-        } else if has("usr/lib/systemd/systemd") {
-            Ok(Self::Systemd)
-        } else {
-            Err(tagged_err(
+/// The profile of the system installed under `root`, from its os-release.
+pub(crate) fn installed_profile(root: &Path) -> Result<Profile> {
+    let (path, text) = ["etc/os-release", "usr/lib/os-release"]
+        .iter()
+        .find_map(|rel| {
+            let path = root.join(rel);
+            fs::read_to_string(&path).ok().map(|text| (path, text))
+        })
+        .ok_or_else(|| {
+            tagged_err(
                 ErrorClass::StateOrDetection,
-                format!(
-                    "cannot tell the init system installed in '{}': no openrc-run and no systemd (set RECAB_INIT_SYSTEM to systemd or openrc)",
-                    root.display()
-                ),
-            ))
+                format!("'{}' has no os-release", root.display()),
+            )
+        })?;
+    Profile::from_os_release(&text).map_err(|error| {
+        tagged_err(
+            ErrorClass::StateOrDetection,
+            format!("{}: {error}", path.display()),
+        )
+    })
+}
+
+/// The machine configuration the system keeps outside the files every system
+/// carries: its init system's and its privilege tool's.
+pub(crate) fn carried(profile: &Profile) -> Carried {
+    let mut carried = match profile.init {
+        InitSystem::Systemd => Carried {
+            files: vec![],
+            dirs: vec![
+                "etc/systemd/system",
+                "etc/NetworkManager/system-connections",
+            ],
+        },
+        InitSystem::Openrc => Carried {
+            files: vec!["etc/network/interfaces", "etc/inittab"],
+            dirs: vec!["etc/runlevels", "etc/conf.d"],
+        },
+    };
+    match profile.privilege {
+        PrivilegeTool::Sudo => {}
+        PrivilegeTool::Doas => {
+            carried.files.push("etc/doas.conf");
+            carried.dirs.push("etc/doas.d");
         }
     }
+    carried
+}
 
-    fn from_override() -> Result<Option<Self>> {
-        match std::env::var("RECAB_INIT_SYSTEM").as_deref() {
-            Err(_) => Ok(None),
-            Ok("systemd") => Ok(Some(Self::Systemd)),
-            Ok("openrc") => Ok(Some(Self::OpenRc)),
-            Ok(other) => bail!("RECAB_INIT_SYSTEM is '{other}', not systemd or openrc"),
-        }
+/// The trial service's file, relative to the root.
+fn trial_service_path(init: InitSystem) -> &'static str {
+    match init {
+        InitSystem::Systemd => "usr/lib/systemd/system/recab-trial.service",
+        InitSystem::Openrc => "etc/init.d/recab-trial",
     }
+}
 
+/// What recab does differently per init system.
+pub trait InitSystemExt: Copy {
     /// The link that enables the trial service, relative to the root.
-    pub fn trial_service_link(self) -> &'static str {
-        match self {
-            Self::Systemd => "etc/systemd/system/sysinit.target.wants/recab-trial.service",
-            Self::OpenRc => "etc/runlevels/boot/recab-trial",
-        }
-    }
-
-    /// The trial service's file, relative to the root.
-    fn trial_service_path(self) -> &'static str {
-        match self {
-            Self::Systemd => "usr/lib/systemd/system/recab-trial.service",
-            Self::OpenRc => "etc/init.d/recab-trial",
-        }
-    }
+    fn trial_service_link(self) -> &'static str;
 
     /// Kernel options a trial's entry carries until it is committed.
+    fn trial_options(self) -> &'static [&'static str];
+
+    /// The trial service is enabled under `root`.
+    fn trial_service_enabled(self, root: &Path) -> bool;
+
+    /// Write the trial service under `root` and enable it, as
+    /// `systemctl enable` or `rc-update add` would.
+    fn install_trial_service(self, root: &Path) -> Result<()>;
+
+    /// Enable the service packaged by Recipe; never replace package contents.
+    fn enable_trial_service(self, root: &Path) -> Result<()>;
+
+    /// Ask for a clean reboot without waiting for it.
+    fn reboot(self) -> Result<()>;
+}
+
+impl InitSystemExt for InitSystem {
+    fn trial_service_link(self) -> &'static str {
+        match self {
+            InitSystem::Systemd => "etc/systemd/system/sysinit.target.wants/recab-trial.service",
+            InitSystem::Openrc => "etc/runlevels/boot/recab-trial",
+        }
+    }
+
     /// systemd: the initramfs reboots instead of opening an emergency shell,
     /// and a crashing PID 1 reboots. OpenRC systems boot without an
     /// initramfs: a root that cannot mount and a dying init both panic, which
     /// `panic=` already turns into a reboot.
-    pub(crate) fn trial_options(self) -> &'static [&'static str] {
+    fn trial_options(self) -> &'static [&'static str] {
         match self {
-            Self::Systemd => &["rd.emergency=reboot", "systemd.crash_action=reboot"],
-            Self::OpenRc => &[],
+            InitSystem::Systemd => &["rd.emergency=reboot", "systemd.crash_action=reboot"],
+            InitSystem::Openrc => &[],
         }
     }
 
-    /// The machine configuration this init system keeps outside the files
-    /// every system carries.
-    pub(crate) fn carried(self) -> Carried {
-        match self {
-            Self::Systemd => Carried {
-                files: &[],
-                dirs: &[
-                    "etc/systemd/system",
-                    "etc/NetworkManager/system-connections",
-                ],
-            },
-            Self::OpenRc => Carried {
-                files: &["etc/network/interfaces", "etc/inittab", "etc/doas.conf"],
-                dirs: &["etc/runlevels", "etc/conf.d", "etc/doas.d"],
-            },
-        }
-    }
-
-    /// The trial service is enabled under `root`.
-    pub(crate) fn trial_service_enabled(self, root: &Path) -> bool {
+    fn trial_service_enabled(self, root: &Path) -> bool {
         root.join(self.trial_service_link())
             .symlink_metadata()
             .is_ok()
     }
 
-    /// Write the trial service under `root` and enable it, as
-    /// `systemctl enable` or `rc-update add` would.
-    pub(crate) fn install_trial_service(self, root: &Path) -> Result<()> {
+    fn install_trial_service(self, root: &Path) -> Result<()> {
         let (content, mode) = match self {
-            Self::Systemd => (SYSTEMD_UNIT, 0o644),
-            Self::OpenRc => (OPENRC_SERVICE, 0o755),
+            InitSystem::Systemd => (SYSTEMD_UNIT, 0o644),
+            InitSystem::Openrc => (OPENRC_SERVICE, 0o755),
         };
-        let path = root.join(self.trial_service_path());
+        let path = root.join(trial_service_path(self));
         write_durable(&path, content.as_bytes())
             .with_context(|| format!("writing '{}'", path.display()))?;
         fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
         self.enable_trial_service(root)
     }
 
-    /// Enable the service packaged by Recipe; never replace package contents.
-    pub(crate) fn enable_trial_service(self, root: &Path) -> Result<()> {
-        let path = root.join(self.trial_service_path());
+    fn enable_trial_service(self, root: &Path) -> Result<()> {
+        let path = root.join(trial_service_path(self));
         if !path.is_file() {
             bail!(
                 "{} is missing; deploy a complete recab package produced by Recipe",
@@ -169,24 +183,15 @@ impl InitSystem {
         if link.symlink_metadata().is_ok() {
             fs::remove_file(&link).with_context(|| format!("replacing '{}'", link.display()))?;
         }
-        let target = Path::new("/").join(self.trial_service_path());
+        let target = Path::new("/").join(trial_service_path(self));
         symlink(&target, &link).with_context(|| format!("enabling '{}'", link.display()))
     }
 
-    /// Wait until startup finishes, at most `timeout`, and name what failed.
-    pub(crate) fn wait_for_startup(self, timeout: Duration) -> Result<(Startup, Vec<String>)> {
-        match self {
-            Self::Systemd => systemd_startup(timeout),
-            Self::OpenRc => openrc_startup(timeout),
-        }
-    }
-
-    /// Ask for a clean reboot without waiting for it.
-    pub(crate) fn reboot(self) -> Result<()> {
+    fn reboot(self) -> Result<()> {
         let (program, args): (String, Vec<&str>) = match (std::env::var("RECAB_REBOOT_BIN"), self) {
             (Ok(program), _) => (program, vec![]),
-            (Err(_), Self::Systemd) => (systemctl(), vec!["--no-block", "reboot"]),
-            (Err(_), Self::OpenRc) => {
+            (Err(_), InitSystem::Systemd) => (systemctl(), vec!["--no-block", "reboot"]),
+            (Err(_), InitSystem::Openrc) => {
                 // openrc-init is shut down with openrc-shutdown; busybox init
                 // (with an inittab) with reboot.
                 let pid1 = fs::read_to_string("/proc/1/comm").unwrap_or_default();
@@ -205,6 +210,17 @@ impl InitSystem {
             bail!("'{program} {}' failed ({status})", args.join(" "));
         }
         Ok(())
+    }
+}
+
+/// Wait until startup finishes, at most `timeout`, and name what failed.
+pub(crate) fn wait_for_startup(
+    init: InitSystem,
+    timeout: Duration,
+) -> Result<(Startup, Vec<String>)> {
+    match init {
+        InitSystem::Systemd => systemd_startup(timeout),
+        InitSystem::Openrc => openrc_startup(timeout),
     }
 }
 

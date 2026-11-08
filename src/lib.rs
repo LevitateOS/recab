@@ -27,7 +27,8 @@ pub use error::{
     stable_exit_code, EXIT_CODE_BACKEND_UNAVAILABLE, EXIT_CODE_GENERIC, EXIT_CODE_PARTIAL_UPDATE,
     EXIT_CODE_PERMISSION, EXIT_CODE_STATE_OR_DETECTION, EXIT_CODE_TRIAL_FAILED,
 };
-pub use init_system::InitSystem;
+pub use distro_profile::InitSystem;
+pub use init_system::InitSystemExt;
 
 use error::{tagged_err, ErrorClass};
 use state::{
@@ -217,7 +218,7 @@ pub fn stage(request: &StageRequest) -> Result<()> {
     require_root("stage")?;
     let active = sys.boot.selection.active;
     let slot = active.other();
-    let init = InitSystem::running()?;
+    let profile = init_system::running_profile()?;
     // A firmware variable systemd-boot skips today, because it names this
     // slot without a kernel, would take effect once the slot is written:
     // stage must be able to read and reset them.
@@ -233,7 +234,7 @@ pub fn stage(request: &StageRequest) -> Result<()> {
     sys.store.save(&next, "stage")?;
     sys.store
         .audit(transition.operation, sys.boot.selection.active, &sys.state, &next);
-    stage::write_slot(&sys.backend, &sys.boot, slot, request, &target, init)
+    stage::write_slot(&sys.backend, &sys.boot, slot, request, &target, &profile)
 }
 
 /// Configure a one-shot trial boot of the inactive `slot`.
@@ -256,8 +257,8 @@ pub fn rollback() -> Result<()> {
 /// unit failed; otherwise not committed, the known-good slot made the next
 /// boot, and the machine rebooted into it.
 pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
-    let init = InitSystem::running()?;
-    let (startup, failed) = init.wait_for_startup(timeout)?;
+    let init = init_system::running_profile()?.init;
+    let (startup, failed) = init_system::wait_for_startup(init, timeout)?;
     let problem = match &startup {
         Startup::Running => String::new(),
         Startup::Failed(state) => format!("finished starting in state '{state}'"),
@@ -350,7 +351,9 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
 /// Install and enable the trial service of the init system under `root`
 /// (`/` for this system, or an install target).
 pub fn install_unit(root: &Path) -> Result<()> {
-    InitSystem::installed_in(root)?.install_trial_service(root)
+    init_system::installed_profile(root)?
+        .init
+        .install_trial_service(root)
 }
 
 fn require_root(operation: &str) -> Result<()> {
@@ -406,7 +409,9 @@ fn change(sys: System, request: Request, annotate: impl FnOnce(&mut PersistentSt
     let mut next = stamped(&transition)?;
     annotate(&mut next);
     // Without a known init system a trial still gets panic=, not its options.
-    let trial_options = InitSystem::running().map(|init| init.trial_options()).unwrap_or(&[]);
+    let trial_options = init_system::running_profile()
+        .map(|profile| profile.init.trial_options())
+        .unwrap_or(&[]);
     match sys.backend.apply(&sys.boot, transition.boot, trial_options) {
         Ok(()) => {}
         Err(ApplyError::Untouched(cause)) => {

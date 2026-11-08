@@ -11,7 +11,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::init_system::InitSystem;
+use crate::init_system::{self, InitSystemExt};
+use distro_profile::Profile;
 use crate::store::write_durable;
 use crate::systemd_boot::{Boot, SystemdBoot};
 use crate::{tagged_err, ErrorClass, Slot, StageRequest};
@@ -19,7 +20,7 @@ use crate::{tagged_err, ErrorClass, Slot, StageRequest};
 /// Machine configuration every new system keeps from the running one:
 /// identity, locale and time. Everything else under /etc comes from the new
 /// image, except the accounts ([`ACCOUNT_FILES`]) and what the init system
-/// keeps ([`InitSystem::carried`]).
+/// keeps ([`init_system::carried`]).
 const CARRIED_FILES: &[&str] = &[
     "etc/hostname",
     "etc/hosts",
@@ -201,8 +202,9 @@ pub(crate) fn write_slot(
     slot: Slot,
     request: &StageRequest,
     target: &Target,
-    init: InitSystem,
+    profile: &Profile,
 ) -> Result<()> {
+    let init = profile.init;
     let device = &target.device;
     let running_root = Path::new("/");
 
@@ -232,7 +234,7 @@ pub(crate) fn write_slot(
         ],
     )
     .context("extracting the rootfs image into the slot")?;
-    carry_configuration(running_root, &mount_point, init)?;
+    carry_configuration(running_root, &mount_point, profile)?;
     if init.trial_service_enabled(running_root) {
         init.enable_trial_service(&mount_point)
             .context("enabling the new system's packaged trial service")?;
@@ -324,9 +326,9 @@ fn mounted_at(device: &Path) -> Result<Option<String>> {
 }
 
 /// Copy the machine configuration from the running root into the new one.
-fn carry_configuration(from: &Path, to: &Path, init: InitSystem) -> Result<()> {
-    let carried = init.carried();
-    for rel in CARRIED_FILES.iter().chain(carried.files) {
+fn carry_configuration(from: &Path, to: &Path, profile: &Profile) -> Result<()> {
+    let carried = init_system::carried(profile);
+    for rel in CARRIED_FILES.iter().chain(&carried.files) {
         let source = from.join(rel);
         if source.symlink_metadata().is_ok() {
             copy_tree(&source, &to.join(rel))?;
@@ -335,7 +337,7 @@ fn carry_configuration(from: &Path, to: &Path, init: InitSystem) -> Result<()> {
     for rel in ACCOUNT_FILES {
         merge_accounts(&from.join(rel), &to.join(rel))?;
     }
-    for rel in carried.dirs {
+    for rel in &carried.dirs {
         let source = from.join(rel);
         if source.is_dir() {
             copy_tree(&source, &to.join(rel))?;

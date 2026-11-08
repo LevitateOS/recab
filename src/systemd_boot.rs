@@ -24,7 +24,7 @@ const LOADER_VENDOR_GUID: &str = "4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
 pub(crate) const PANIC_OPTION: &str = "panic=10";
 
 /// Every kernel option any init system uses as a trial option (see
-/// `InitSystem::trial_options`): an entry that becomes the default loses
+/// `InitSystemExt::trial_options`): an entry that becomes the default loses
 /// all of them.
 const ALL_TRIAL_OPTIONS: &[&str] = &["rd.emergency=reboot", "systemd.crash_action=reboot"];
 

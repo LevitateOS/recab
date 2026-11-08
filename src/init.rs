@@ -10,7 +10,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::init_system::InitSystem;
+use crate::init_system::{self, InitSystemExt};
 use crate::state::PersistentState;
 use crate::store::{copy_durable, read_optional, write_durable, Store};
 use crate::systemd_boot::{loader_with_default, SystemdBoot, PANIC_OPTION};
@@ -35,7 +35,7 @@ pub(crate) fn run(request: &InitRequest) -> Result<()> {
             boot_root.display()
         );
     }
-    let init = InitSystem::installed_in(root)?;
+    let init = init_system::installed_profile(root)?.init;
     let (id, name) = os_identity(root)?;
     let partuuids = [
         (Slot::A, partuuid(&request.slot_a)?),

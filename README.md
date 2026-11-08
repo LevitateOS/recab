@@ -39,7 +39,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   firmware variables at slot A, so a default left by an earlier install cannot
   win; where efivars are not available it warns on stderr that they could not
   be reset (`stage` resets them before it writes slot B). The prefix and titles come from the target's os-release (`ID`, `NAME`);
-  the init system from what the target has installed. It creates `loader/` when
+  the init system from the target's distro profile (os-release `REC_INIT`). It creates `loader/` when
   the installer only copied systemd-boot's EFI binary (AcornOS has no `bootctl`).
 - `status` reports the active and inactive slot, the default, the known-good
   slot, whether the running slot is committed, the rollback target, whether a
@@ -74,10 +74,10 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   - hostname, machine-id, locale, time, subuid/subgid and SSH host keys are copied;
   - `passwd`, `group`, `shadow` and `gshadow` are merged by name: the image's
     entries (new system users) plus the running system's, whose lines win;
-  - hostname, `/etc/hosts`, and what the init system keeps: on systemd
-    `/etc/systemd/system` and NetworkManager connections; on OpenRC
-    `/etc/runlevels`, `/etc/conf.d`, `/etc/network/interfaces`, `/etc/inittab`
-    and doas's configuration. Directories are copied over the image's, adding
+  - hostname, `/etc/hosts`, and what the init system and privilege tool keep
+    (os-release `REC_INIT`, `REC_PRIVILEGE`): on systemd `/etc/systemd/system`
+    and NetworkManager connections; on OpenRC `/etc/runlevels`, `/etc/conf.d`,
+    `/etc/network/interfaces` and `/etc/inittab`; with doas its configuration. Directories are copied over the image's, adding
     what the machine enabled without removing what the image enables;
   - when the trial service is enabled, the new image's own recab installs it;
   - the new `fstab` names the slot's root by PARTUUID.
@@ -256,7 +256,7 @@ a `[RECAB_ERR_*]` tag and exits with its class's code:
 | Code | Tag | Meaning |
 |---|---|---|
 | 13 | `RECAB_ERR_PERMISSION` | needs root |
-| 20 | `RECAB_ERR_BACKEND` | no UEFI or efivars, or an unknown init system |
+| 20 | `RECAB_ERR_BACKEND` | no UEFI or efivars, or the running os-release has no distro profile (`REC_*`) |
 | 21 | `RECAB_ERR_STATE` | refused, or the slots or state could not be read |
 | 22 | `RECAB_ERR_PARTIAL_UPDATE` | the boot selection changed only in part, or recab's state was not saved after it changed |
 | 23 | `RECAB_ERR_TRIAL_FAILED` | a trial boot was not healthy and was not committed |
@@ -269,11 +269,10 @@ They are defined in [`src/error.rs`](src/error.rs).
 - `RECAB_STATE_PATH` (default `/var/lib/recab/state.json`)
 - `RECAB_AUDIT_PATH` (default `/var/lib/recab/audit.log`)
 - `RECAB_LOCK_PATH` (default `/run/lock/recab.lock`)
-- `RECAB_OS_RELEASE_PATH` (default `/etc/os-release`)
+- `RECAB_OS_RELEASE_PATH` (default `/etc/os-release`; its `ID` names the entries and its `REC_*` distro profile picks the init system and privilege tool)
 - `RECAB_PROC_CMDLINE_PATH` (default `/proc/cmdline`)
 - `RECAB_SYS_FIRMWARE_EFI_PATH` (default `/sys/firmware/efi`)
 - `RECAB_EFIVARS_PATH` (default `/sys/firmware/efi/efivars`)
-- `RECAB_INIT_SYSTEM` (`systemd` or `openrc`; default: detected)
 - `RECAB_SYSTEMCTL_BIN` (default `systemctl`, used by `trial` on systemd)
 - `RECAB_OPENRC_DIR` (default `/run/openrc`, used by `trial` on OpenRC)
 - `RECAB_RC_STATUS_BIN` (default `rc-status`, used by `trial` on OpenRC)
