@@ -208,7 +208,7 @@ pub(crate) fn write_slot(
     let label = role.label().expect("slot roles have labels");
     target_root::run(
         Command::new(format!("mkfs.{}", role.filesystem().as_str()))
-            .args(["-F", "-q", "-L", &label])
+            .args(["-F", "-q", "-L", label])
             .arg(device),
     )?;
 
