@@ -209,16 +209,18 @@ fn openrc_failed(target: &Target) -> Result<Vec<String>> {
             }
         }
     }
-    // rc-status exits non-zero when it lists a crashed daemon: its output is
-    // the answer; a missing rc-status is an error.
+    // rc-status --crashed exits 1 with no output when no daemon crashed,
+    // and 0 when it lists crashed services (OpenRC's documented contract).
+    // A missing binary, signal, unexpected status or diagnostic is an error.
     let out = Command::new(&target.programs.rc_status)
         .arg("--crashed")
         .output()
         .with_context(|| format!("running '{} --crashed'", target.programs.rc_status))?;
     let crashed = String::from_utf8_lossy(&out.stdout);
-    // It exits non-zero when it lists a crashed daemon; non-zero with nothing
-    // listed is rc-status itself failing.
-    if !out.status.success() && crashed.trim().is_empty() {
+    let no_crashes = out.status.code() == Some(1)
+        && crashed.trim().is_empty()
+        && out.stderr.is_empty();
+    if !out.status.success() && !no_crashes {
         anyhow::bail!(
             "'{} --crashed' failed ({}): {}",
             target.programs.rc_status,

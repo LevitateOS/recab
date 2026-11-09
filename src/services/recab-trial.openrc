@@ -1,18 +1,35 @@
 #!/sbin/openrc-run
-# The trial service, packaged by `recab install-unit --init openrc`.
+# The asynchronous one-shot trial, packaged by recab install-unit.
 description="@DESCRIPTION@"
 
-# openrc-run runs it in the background and stops it at shutdown (no
-# verdict then); its one line goes to the kernel log, OpenRC having no
-# journal.
-command="@RECAB@"
-command_args="trial"
+# Startup must continue while trial waits for the final runlevel. A helper
+# records successful completion as inactive, rather than leaving a finished
+# one-shot in OpenRC's crashed-daemon state. Failure remains a failed service.
+command="/sbin/openrc-run"
+command_args="/etc/init.d/recab-trial run_trial"
 command_background=true
 pidfile="/run/recab-trial.pid"
 output_log="/dev/kmsg"
 error_log="/dev/kmsg"
+extra_commands="run_trial"
+
+run_trial() {
+    "@RECAB@" trial &
+    trial_pid=$!
+    # Stopping the service must also stop the actual trial process.
+    trap 'kill "$trial_pid" 2>/dev/null || :; wait "$trial_pid" || :; exit 1' HUP INT TERM
+    result=0
+    wait "$trial_pid" || result=$?
+    trap - HUP INT TERM
+    if [ "$result" -eq 0 ]; then
+        mark_service_inactive
+    else
+        mark_service_failed
+    fi
+    return "$result"
+}
 
 depend() {
-	# sysfs mounts efivarfs, which tells a trial boot from the firmware.
-	after sysfs
+    # sysfs mounts efivarfs, which tells a trial boot from the firmware.
+    after sysfs
 }

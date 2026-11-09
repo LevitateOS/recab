@@ -64,7 +64,7 @@ esac
                 root.display()
             ),
         );
-        executable(&root.join("rc-status"), "#!/bin/sh\n");
+        executable(&root.join("rc-status"), "#!/bin/sh\nexit 1\n");
         fs::create_dir_all(root.join("openrc/starting")).unwrap();
         fs::create_dir_all(root.join("openrc/failed")).unwrap();
         fs::write(root.join("openrc/softlevel"), "default\n").unwrap();
@@ -879,6 +879,19 @@ fn openrc_trials_commit_when_healthy_and_reboot_when_a_service_failed() {
     );
     assert_eq!(tree.status()["committed"], true);
 
+    // A real rc-status --crashed returns 0 and names crashed services.
+    // This must fail health independently of failed/ and runlevel entries.
+    executable(&tree.path("rc-status"), "#!/bin/sh\nprintf 'crashed-daemon\\n'\n");
+    let out = openrc(&tree, &["health", "--timeout", "1", "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let health: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(health["failed"], serde_json::json!(["crashed-daemon"]));
+    executable(&tree.path("rc-status"), "#!/bin/sh\necho diagnostic >&2\nexit 1\n");
+    let out = openrc(&tree, &["health", "--timeout", "1", "--json"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("diagnostic"));
+    executable(&tree.path("rc-status"), "#!/bin/sh\nexit 1\n");
+
     tree.ok(&["set-next", "A"]);
     tree.boot_into("a");
     fs::write(tree.path("openrc/failed/sshd"), "").unwrap();
@@ -935,8 +948,10 @@ fn install_unit_writes_and_enables_the_openrc_service() {
     let service = tree.read("target/etc/init.d/recab-trial");
     assert!(
         service.starts_with("#!/sbin/openrc-run")
-            && service.contains("command=\"/usr/bin/recab\"")
-            && service.contains("command_args=\"trial\"")
+            && service.contains("\"/usr/bin/recab\" trial &")
+            && service.contains("command_args=\"/etc/init.d/recab-trial run_trial\"")
+            && service.contains("mark_service_inactive")
+            && service.contains("mark_service_failed")
             && !service.contains('@'),
         "{service}"
     );
