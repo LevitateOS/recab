@@ -1,5 +1,7 @@
 # Untangle log
 
+> Scope correction, 2026-11-10: this log records earlier code and refactoring decisions. It is not the current product contract. Recab owns system updates and symmetric A/B continuation, with equivalent initial slots, incremental preparation and preservation of changes through updates. The narrow boot-selection scope and destructive-staging assumptions below are superseded by [REQUIREMENTS.md](REQUIREMENTS.md); historical results do not prove the missing lifecycle.
+
 ## Scope
 
 - **Target:** the `recab` repository (`tools/recab`), all of it: `src/`, `src/services/`, `tests/`, `docs/`, `Cargo.toml`, `README.md`, `REQUIREMENTS.md`, `CLAUDE.md`, `AGENTS.md`.

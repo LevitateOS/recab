@@ -1,6 +1,20 @@
 # recab
 
-Purpose: manage A/B slot boot selection + commit/rollback semantics for immutable-by-default OS images.
+Purpose: own system updates and symmetric A/B continuation for LevitateOS and
+AcornOS. Follow `REQUIREMENTS.md` for the product contract and `README.md` for
+the intended lifecycle and current implementation gaps.
+
+Installation must populate A and B with equivalent personalized systems and
+boot artifacts. The running system root stays immutable; recab prepares the
+inactive system using only differences, coordinates changes and downloaded
+updates through Recipe in that same preparation, then trial-boots and commits
+it or falls back. Everything possible A→B must also work B→A. Never erase pending
+changes to apply an update, or overwrite the fallback of an uncommitted trial.
+
+The current destructive image-staging implementation is incomplete. Empty B at
+installation, formatting on each continuation and limiting recab to boot
+selection are not the intended design. Recipe owns software operations inside
+Ginux; recab owns their destination and the system lifecycle.
 
 Keep this tool:
 

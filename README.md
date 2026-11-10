@@ -1,28 +1,80 @@
 # recab
 
-`recab` manages an A/B system on systemd-boot, with systemd (LevitateOS) or
-OpenRC (AcornOS) as init: two root slots, one running.
-It sets up the boot layout at install time, writes a new system into the
-other slot, boots it once as a trial, keeps it when the trial is healthy,
-returns to the previous slot when it is not, and rolls back on request.
+`recab` owns system updates and A/B continuation for LevitateOS and AcornOS.
+It prepares the next system in the inactive slot, coordinates system changes
+and downloaded updates through Recipe, trial-boots the result, commits a healthy
+system and returns to the previous system when the trial fails. It uses
+systemd-boot with systemd (LevitateOS) or OpenRC (AcornOS).
 
-It is the slot state machine for LevitateOS's A/B layout, called by people,
-installers and scenario harnesses. Requirements: [REQUIREMENTS.md](REQUIREMENTS.md).
+## Required update lifecycle
 
-## Commands
+1. Installation populates A and B with the same system and machine configuration,
+   including both slots' kernels and initramfs images. Partition references,
+   boot paths and slot identity differ; system contents are equivalent. Both
+   slots must be bootable at first use, after personalization is complete.
+2. The user boots committed A. Its system root is immutable. To make system
+   change X, recab prepares writable B as a continuation of A.
+3. Recipe applies X to B. If a system update becomes available before reboot,
+   recab coordinates its discovery, download and application to that same B.
+   The update preserves X or reports a conflict; it does not erase pending work.
+4. Recab finalizes B and its matching boot artifacts before scheduling a trial.
+   A remains the protected fallback. A healthy boot commits B; a failed trial
+   returns to A once the failure causes a reboot.
+5. To make change Y while running committed B, recab synchronizes inactive A
+   to B's current system using only the differences, then applies Y to A.
+   X and the update are therefore retained. The same lifecycle repeats A→B→A.
 
-- `recab init --root <dir> [--mode ab] --slot-a <dev> --slot-b <dev> --kernel <vmlinuz> [--initrd <img>] [--options <kernel options>]`
+A and B have the same capabilities. Active, inactive, prepared and known-good
+are roles, not permanent properties of a slot letter. Preparation reuses the
+inactive filesystem and avoids rewriting unchanged system data. Synchronization
+must include deletions, metadata and links, exclude shared data and runtime
+mounts, and preserve the destination's slot identity. A fresh install's matching
+slots avoid an unnecessary full-system rewrite on the first continuation.
+
+User data and caches may be shared on `/var`; system package selection and
+configuration must belong to the system being prepared. Once preparation starts
+overwriting the previous slot, that older rollback is gone: the committed running
+slot is the fallback. Never overwrite that fallback while running an uncommitted
+trial. Requirements: [REQUIREMENTS.md](REQUIREMENTS.md).
+
+## Implementation status
+
+The current implementation has release-image staging, trial boot, commit and
+rollback. It does **not yet implement the full lifecycle above**:
+
+- `init` prepares A and writes both boot entries, but leaves B unpopulated and
+  without its own kernel. Identical initial slots are still required.
+- `stage` reformats the inactive slot and carries selected configuration from
+  the running slot. It cannot continue a system incrementally or preserve X
+  already prepared in the inactive slot when applying an update.
+- Preparation sessions, whole-system deltas, update discovery/download,
+  conflict handling and Recipe integration with an inactive system are missing.
+- Root's current Recipe profile is shared on `/var`; this is not a substitute
+  for package selection tied to a prepared system.
+- The immutability work in this checkout protects the root and supplies writable
+  per-slot `/etc` configuration. It is not proof that every system configuration
+  change already follows the continuation lifecycle.
+
+These are implementation gaps in recab's update responsibility, not exclusions
+from its purpose. The commands below describe the existing implementation.
+
+## Current commands
+
+- `recab init --root <dir> [--mode ab] --slot-a <dev> --slot-b <dev> --kernel <vmlinuz> --initrd <img> [--options <kernel options>]`
 - `recab init --root <dir> --mode mutable --root-device <dev> --kernel <vmlinuz> [--initrd <img>] [--options <kernel options>]`
 - `recab status [--json] [--root <dir>]`
-- `recab stage --from-media <device|dir>`, or `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> [--initrd <img>]`
+- `recab stage --from-media <device|dir>`, or `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> --initrd <img> [--change-flavour]`
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
 - `recab trial [--timeout <secs>]` (run by the trial service on every boot)
 - `recab health [--json] [--timeout <secs>]` (how startup ended: the verdict a trial judges by)
-- `recab install-unit [--root <dir>] [--package <systemd|openrc>]`
+- `recab baseline --root <dir>`
+- `recab install-unit [--root <dir>] --init <systemd|openrc> [--bin <path>]`
 
-An update:
+A release-image update with today's destructive staging path, starting in A
+(use A as the trial target instead when running B). This replaces the inactive
+system; it does not preserve a continuation already prepared there:
 
 ```sh
 recab stage --from-media /dev/sr0   # the release medium: its rootfs, kernel and installed initramfs
@@ -31,7 +83,7 @@ reboot                # into B: committed if it comes up healthy, else back to A
 recab rollback        # later, if wanted: back to A, while A still holds its system
 ```
 
-## Behavior
+## Current command behavior
 
 - `init` sets up a freshly installed system's ESP (recab is the only writer of
   it, for both layouts): it copies the target's own systemd-boot
@@ -40,26 +92,32 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   `root=PARTUUID=` with `ro rootwait panic=10` and any `--options`, the kernel
   in `/boot/<id>-a/` (A/B) or `/boot/<id>/` (mutable, entry `<id>.conf`), and
   `loader.conf` defaulting to it (`timeout 5`, `editor 0` when recab creates
-  it). For A/B it also writes recab's state with slot A known-good. It points
+  it). For A/B it also prepares A's immutable boot configuration and writes
+  recab's state with slot A known-good; it does not yet populate B. It points
   systemd-boot's firmware variables at the installed entry, so a default left
   by an earlier install cannot win; where efivars are not available it warns
-  on stderr that they could not be reset (`stage` resets them before it writes
-  slot B). The prefix and titles come from the target's os-release (`ID`,
+  on stderr that they could not be reset (`stage` resets them before writing
+  the inactive slot). When installing from a running recab A/B system, its
+  host firmware variables are left alone. The prefix and titles come from the target's os-release (`ID`,
   `NAME`); the reader finds the entries by the same rule.
 - `status` reports the active and inactive slot, the default, the known-good
   slot, whether the running slot is committed, the rollback target, whether a
   trial is pending, the next boot, and how the last trial ended. It only reads,
   so it also works off UEFI. `slots` lists each slot's entry, kernel
   directory, `root=`, device, whether it can boot and whether it carries the
-  trial options. With `--root <dir>` it reads the system installed there (its
+  trial options. `bootable` currently checks the entry's referenced ESP files,
+  not whether a system preparation is complete. With `--root <dir>` it reads the system installed there (its
   root is the partition mounted at `<dir>`). The default is the `LoaderEntryDefault` EFI
   variable, else `loader.conf`'s `default`, skipping an entry whose files are
   missing from the ESP (systemd-boot skips it too). A trial is pending while
   `LoaderEntryOneShot` names a bootable slot entry.
 - `stage` writes a prebuilt system into the inactive slot. Before it changes
   anything on the slot it checks (refusing with exit 21):
-  - the rootfs is a file or block device starting with an EROFS superblock
+  - the rootfs is an `.erofs` file or block device with an EROFS superblock
     (magic `0xE0F5E1E2` at byte 1024), and the kernel and initrd are files;
+  - the initramfs supports immutable boot, `/var` is a separate ext4 state
+    partition, and the image matches the running distro and init system
+    (and flavour unless `--change-flavour` is given);
   - none of the rootfs, kernel and initrd is inside the slot's kernel directory
     (`/boot/<id>-a|b/`), which stage removes first: copy them elsewhere;
   - the slot's entry names its partition by `root=PARTUUID=`, the partition
@@ -73,21 +131,25 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   entry than the running slot's, or a `LoaderEntryOneShot` naming the slot
   while no trial is pending, is skipped by systemd-boot while the slot has no
   kernel, but would boot the freshly written slot (as the default, untried)
-  once it has one. Stage points the default at the running slot's entry and
-  removes such a one-shot, which changes nothing systemd-boot boots now, and
-  refuses if it cannot. It then records the slot as no longer a rollback
-  target, removes the slot's kernel directory, formats the partition with the
+  once it has one. After input checks, stage records the slot as no longer a
+  rollback target, points a stale default at the running slot and removes such
+  a one-shot before removing the slot's kernel directory. It aborts if those
+  firmware changes fail. It then formats the partition with the
   filesystem and label recpart's layout gives the slot, extracts the image with
   `recstrap`, and carries over the machine state the new image lists in
-  `/usr/lib/recab/carried` (packaged with recab; the list states its format:
-  files and directories copied over the image's, account files merged by name).
+  `/usr/lib/recab/carried` (packaged with recab). A baseline records the original
+  image's selected paths; changed files win over the release's whole file, with
+  no conflict report. Accounts are merged by name. This does not preserve all
+  system changes, account deletions or attribute-only edits.
   The new `fstab` names the slot's root by PARTUUID. `--from-media` mounts a
-  release medium read-only and stages its rootfs, kernel and, when it has one,
-  installed initramfs.
+  release medium read-only and requires its rootfs, kernel and installed
+  initramfs. A/B staging requires an initramfs supporting immutable boot.
   Last it installs the kernel (and initrd) and rewrites the entry's
   `linux`/`initrd` lines, with `panic=10` and the trial options (below). It
   refuses while the running slot is uncommitted (the other slot is then the
-  only fallback) and while the slot is the next boot or the default.
+  only fallback) and while the slot is the next boot or the default. Some
+  carry-path and immutable-layout checks still happen during the write phase;
+  a failure there can leave the inactive slot erased and unbootable.
 - `set-next` sets a one-shot boot of the inactive slot (`LoaderEntryOneShot`)
   and adds the trial options to its entry. A `LoaderEntryDefault` naming
   another entry than the known-good default (one systemd-boot skips) is first
@@ -103,8 +165,8 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   before it, as long as that slot has not been staged over since.
 - A new default (`commit`, `rollback`) first clears a pending one-shot, then
   loses the trial options, then is written to `loader.conf` and the firmware
-  variable. recab never selects a slot whose entry cannot boot.
-- `trial` waits for startup to finish (at most `--timeout`, default 900 s),
+  variable. recab refuses entries whose referenced ESP files are missing.
+- `trial` waits for startup to finish (`--timeout`, default 900 s),
   then judges only the boot `set-next`
   scheduled: a committed slot, a slot picked from the boot menu, or a trial an
   operator already rolled back is left alone. A healthy trial is committed;
@@ -119,17 +181,20 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
     directory, `/run/openrc`); a service OpenRC marked failed, a crashed
     daemon (`rc-status --crashed`) or the single-user runlevel is a failure. When the ESP or `/var` cannot be read, the firmware
   still tells: a failed boot whose `LoaderEntrySelected` is not the default is a
-  one-shot trial, and is rebooted.
+  one-shot trial, and is rebooted. Health-collection errors can currently return
+  before recovery, and helper subprocesses are not all bounded by the timeout.
 - `health` waits for startup like `trial` and prints the verdict (`--json`:
-  `init`, `finished`, `state`, `failed`); it changes nothing and needs no A/B
+  `schema_version`, `init`, `startup`, `finished`, `state`, `failed`); it changes nothing and needs no A/B
   layout. It exits non-zero only when no verdict can be formed.
-- `install-unit --package <init>` writes recab's package contents into a tree:
+- `baseline --root <dir>` records the extracted image's carried paths before
+  personalization. It is a configuration baseline, not a whole-system delta.
+- `install-unit --init <init>` writes recab's package contents into a tree:
   the trial service, enabled (`recab-trial.service` in `sysinit.target`, or
   `/etc/init.d/recab-trial` in the boot runlevel, which runs `recab trial` in
   the background, logging to the kernel log, and stops it at shutdown), and the
   carried-state list. The install-tools recipe packages it so, so every image
-  runs the trial service; with no recab state and no one-shot boot it exits at
-  once.
+  runs the trial service. The service waits for startup health before deciding
+  whether this boot is a trial.
 
 ### Trial options
 
@@ -138,8 +203,8 @@ committed), its entry carries the trial options: recinit's fail-reboot word
 (`recinit::live::FAIL_REBOOT_OPTION`) when the entry boots through an
 initramfs, so the initramfs reboots instead of opening an emergency shell, and
 the init's crash option (systemd's `systemd.crash_action=reboot`; OpenRC has
-none). Without an initramfs a root that cannot mount and a dying init both
-panic, and `panic=10` already reboots. An entry loses them when it becomes
+none). A/B boot requires the installed-system initramfs on both distros.
+An entry loses the trial-specific options when it becomes
 the default, so a committed slot that fails gets a shell to repair it rather
 than a reboot loop.
 
@@ -152,7 +217,7 @@ known-good default. Something has to cause that reboot:
 |---|---|
 | Units or services fail, emergency mode, single-user runlevel | the trial service (on systemd it starts early and survives isolation) |
 | Startup never finishes | `recab trial`'s timeout |
-| The root cannot be mounted | systemd: `rd.emergency=reboot` (recinit's systemd initramfs); OpenRC, no initramfs: the kernel panics, `panic=10` |
+| The root cannot be mounted | `rd.emergency=reboot` in recinit's installed initramfs, on both distros |
 | PID 1 crashes | systemd: `systemd.crash_action=reboot`; OpenRC: the kernel panics, `panic=10` |
 | Kernel panic | `panic=10` |
 | Kernel or PID 1 hangs without crashing | nothing yet: needs a hardware watchdog (`RuntimeWatchdogSec=`) |
@@ -170,8 +235,9 @@ The A/B layout mounts its state partition at `/var`, so both slots share recab's
 - Lock: `/run/lock/recab.lock`, held by every run that changes anything
 
 Both slots' recab read the same state file, so a newer schema only adds
-fields: an older recab keeps the fields it does not know and never lowers the
-schema number.
+fields: the current reader keeps unknown fields and never lowers the schema
+number. This does not make it understand new safety rules. Preparation-state
+changes require compatibility checks before an older recab may mutate that state.
 
 A boot-selection change writes the boot selection first and recab's state
 second: after a crash between the two, the machine boots what was asked and
@@ -209,11 +275,12 @@ and `trial` when it commits or reboots) requires root.
 | `src/state.rs` | The state machine without I/O: what each request changes or why it is refused, and how a trial is judged |
 | `src/systemd_boot.rs` | The boot selection: entries, `loader.conf`, EFI variables, slot kernels, trial options on entries |
 | `src/store.rs` | The state file, audit log, lock and durable file replacement |
-| `src/init.rs` | The install-time boot layout |
-| `src/stage.rs` | Formatting and filling a slot, and carrying configuration |
+| `src/init.rs` | The current install-time boot layout; matching initial slot population is missing |
+| `src/stage.rs` | The current destructive release-image update path |
+| `src/immutable.rs` | Preparing immutable boot configuration and resetting a slot's `/etc` overlay |
 | `src/init_system.rs` | The init adapter: startup and failures (`health`), reboot, the crash option |
 | `src/package.rs`, `src/services/` | The trial service files and the carried-state list recab's package carries |
-| `src/carried.rs` | Reading an image's carried-state list |
+| `src/carry.rs` | The carried-state list, configuration baseline, copying and account merge |
 | `src/error.rs` | Error classes and exit codes |
 
 ## Tests
@@ -222,15 +289,18 @@ and `trial` when it commits or reboots) requires root.
 fake devices, a stand-in `/proc/cmdline`, an efivars directory recab writes
 systemd-boot's variables into, a fake `systemctl` whose startup state the test
 sets, and a fake OpenRC state directory. No disk is touched. Runs that need root get it in a user namespace
-(`unshare --user --map-root-user`), so `cargo test -p recab` runs everything
-unprivileged.
+(`unshare --user --map-root-user`). Some fixtures still encode the old empty-B
+installation and lack the initramfs now required by this checkout. These checks
+do not establish the required continuation lifecycle.
 
 ## End-to-End Validation
 
-On 2026-11-08, the existing `ab-update` scenario passed across seven boots on
+The previously recorded release-image `ab-update` run on 2026-11-08 passed across seven boots on
 both LevitateOS (systemd) and AcornOS (OpenRC), using fresh A/B installations
 and live-tools images under the libvirt user session with OVMF. All eight
-scenarios in `test all` passed on each distro.
+scenarios in `test all` passed on each distro. This is historical evidence for
+those artifacts, not validation of the current working tree or the missing
+continuation, incremental synchronization and matching initial slots.
 
 ```sh
 cargo xtask test all levitate
@@ -286,7 +356,12 @@ plain directory holds the variables as plain files.
 - `RECAB_OPENRC_DIR` (default `/run/openrc`) and `RECAB_RUNLEVELS_DIR` (default the root's `etc/runlevels`), read on OpenRC
 - `RECAB_SYSTEMCTL_BIN` (default `systemctl`), `RECAB_RC_STATUS_BIN` (default `rc-status`), `RECAB_REBOOT_BIN` (default `reboot`, busybox init's, used on OpenRC), `RECAB_RECSTRAP_BIN` (default `recstrap`)
 
-## Non-Goals
+## Ownership
 
-- Not a full updater: it writes a prebuilt image into a slot, but does not build filesystem trees or download anything.
-- Not a package manager (that stays in `tools/recipe`).
+Recab owns the system update lifecycle: obtaining updates, preparing and
+continuing a system, applying updates without losing pending changes, trial
+boot, commit and rollback. Recipe owns software acquisition, builds, installation,
+update and removal inside Ginux; recab coordinates those operations for its
+prepared system. Installers call recab to establish the initial A/B systems.
+Frontends expose recab's state and operations instead of implementing another
+updater. Missing implementation belongs in these existing owners.

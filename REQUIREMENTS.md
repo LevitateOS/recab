@@ -1,15 +1,22 @@
 # recab Requirements
 
-**Version:** 0.2.0  
-**Status:** Draft  
-**Last Updated:** 2026-11-06
+**Version:** 0.3.0
 
-This document defines the requirements for `recab`: an A/B (slot-based) boot
-selection and commit/rollback manager for LevitateOS-style immutable systems.
+**Status:** Product contract; implementation incomplete
 
-`recab` is intentionally small: it does not build filesystem trees, download
-packages, or manage recipes. It is the slot state machine glue called by higher
-level tooling (installers, `recipe`, integration/e2e harnesses).
+**Last Updated:** 2026-11-10
+
+`recab` owns system updates and symmetric A/B continuation for LevitateOS and
+AcornOS. It coordinates obtaining updates, preparing the inactive system,
+applying system changes and updates through Recipe, finalizing a candidate,
+trial boot, commit and rollback. Recipe owns software operations inside Ginux;
+recab owns the system destination and lifecycle.
+
+The current implementation supports destructive release-image staging and boot
+selection. It does not yet meet the requirements for identical initial slots,
+incremental continuation, preservation of pending changes through updates, or
+Recipe operations directed at an inactive system. Requirements below describe
+the intended behavior; they are not claims that these features already work.
 
 ---
 
@@ -33,11 +40,16 @@ level tooling (installers, `recipe`, integration/e2e harnesses).
 
 ### 1.1 Purpose
 
-`recab` manages slot selection for A/B immutable systems:
+`recab` manages the system update lifecycle:
 
-- Identify active vs inactive slot (A vs B)
-- Stage a trial boot of the inactive slot ("try")
-- Commit the booted slot as good ("commit") or roll back ("rollback")
+- Install equivalent personalized systems into A and B, both bootable at first use.
+- Keep the active system root immutable and prepare its continuation in the
+  inactive slot, synchronizing differences rather than rewriting unchanged data.
+- Apply change X and a downloaded system update to the same prepared system,
+  preserving X or reporting a conflict before activation.
+- Finalize and trial-boot that system; commit a healthy result or return to the
+  protected known-good system after failure.
+- Repeat from B to A for change Y, retaining X and the previous update.
 
 This supports A/B update and rollback validation described in `architecture.md`.
 
@@ -45,16 +57,18 @@ This supports A/B update and rollback validation described in `architecture.md`.
 
 This specification covers:
 
-- The slot state machine behavior
-- CLI command behavior and output
-- A backend abstraction (systemd-boot is the initial target)
-- Persistent state/audit recording under `/var`
+- Initial slot population and machine personalization
+- Update discovery, download and application coordinated with Recipe
+- Incremental system continuation and preparation-session behavior
+- System and boot-artifact finalization, trial, commit and rollback
+- CLI/library contracts and frontend status
+- The systemd-boot backend and persistent state under `/var`
 
-This specification does not cover:
-
-- Building slot filesystems (handled by installers / `recipe`)
-- Downloading update payloads (handled elsewhere)
-- Package dependency resolution (handled by `tools/recipe`)
+Recipe owns package facts, dependency resolution, acquisition, builds and
+software installation/update/removal inside Ginux. Recab MUST coordinate that
+existing engine for system updates rather than introduce another package
+manager. Delegation of software work does not remove updates or filesystem
+preparation from recab's responsibility.
 
 ---
 
@@ -65,6 +79,10 @@ This specification does not cover:
 | Slot A / Slot B | Two independent bootable system roots. Exactly one is active (booted) at a time. |
 | Active slot | The slot that is currently booted and mounted as `/`. |
 | Inactive slot | The non-booted slot (the target for composing the next system). |
+| Continuation | The active system reproduced in the inactive slot, with destination-specific identity, ready for further system changes. |
+| Preparation | A writable inactive system receiving changes and updates before finalization. It is not eligible for trial boot while incomplete. |
+| Candidate | A finalized system generation with its matching kernel, initramfs and boot configuration. |
+| Generation | An identity for particular system contents and boot artifacts, independent of the reusable slot letter. |
 | Trial boot | Booting the inactive slot with automatic fallback if it is not committed as "good". |
 | Commit | Mark the currently booted slot as "good" and make it the default boot target. |
 | Rollback | Switch boot target back to the previously known-good slot. |
@@ -76,13 +94,18 @@ This specification does not cover:
 
 ### 3.1 Small and Explicit
 
-**REQ-DESIGN-001**: `recab` MUST remain a small tool/library focused only on
-A/B slot selection and commit/rollback semantics.
+**REQ-DESIGN-001**: `recab` MUST own the system update and continuation lifecycle,
+with explicit operations reusable by people, installers, Recipe and frontends.
+Boot selection is one part of that responsibility.
 
-**REQ-DESIGN-002**: `recab` MUST NOT perform package management actions (install,
-remove, upgrade) and MUST NOT compose filesystem trees. It MAY write a prebuilt
-rootfs image into the inactive slot (`stage`), carrying the machine's own
-configuration over.
+**REQ-DESIGN-002**: `recab` MUST prepare and maintain the inactive system tree
+and coordinate software changes through Recipe. Release-image installation is
+one update input, not the only supported form of system change. Existing
+preparation work MUST NOT be discarded merely to apply a release update.
+
+**REQ-DESIGN-003**: Every continuation, update, trial and recovery operation
+MUST work symmetrically A→B and B→A. Slot letters identify destinations; they
+MUST NOT confer different capabilities.
 
 ### 3.2 Conservative Boot Changes
 
@@ -116,13 +139,22 @@ states:
 
 - `Stable(A)` or `Stable(B)`: a known-good active slot is booted; no uncommitted
   trial is pending.
+- `Preparing(A->B)` or `Preparing(B->A)`: the inactive system is writable and
+  accepts changes and updates; incomplete contents cannot be selected for trial.
+- `Ready(A->B)` or `Ready(B->A)`: preparation is finalized with matching boot
+  artifacts and can be scheduled for a trial.
 - `TrialPending(A->B)` or `TrialPending(B->A)`: the next boot is configured as a
   trial boot of the inactive slot.
+- `TrialRunning(A->B)` or `TrialRunning(B->A)`: the candidate is running
+  uncommitted; the other slot remains the protected fallback.
+- Interrupted or failed preparation: its generation and completion state remain
+  identifiable, with safe recovery or explicit discard available.
 
 ### 4.2 Required Transitions
 
-**REQ-SM-010**: A `set-next` operation MUST transition the system into
-`TrialPending(active->inactive)` (unless already pending for that slot).
+**REQ-SM-010**: A `set-next` operation MUST select only a finalized candidate and
+transition to `TrialPending(active->inactive)` (unless already pending for that
+same generation). The presence of ESP files alone is insufficient.
 
 **REQ-SM-011**: A `commit` operation MUST transition the system into
 `Stable(active)` and clear any trial-pending metadata.
@@ -132,15 +164,14 @@ previously known-good slot: the known-good slot when the running slot is
 uncommitted or a trial is pending, else the slot that was known-good before the
 running slot was committed, while that slot still holds its system.
 
-**REQ-SM-013**: A `stage` operation MUST write only the inactive slot, MUST
-leave that slot unbootable until it is complete, MUST refuse while the running
-slot is uncommitted (the inactive slot is then the only fallback) or while the
-inactive slot is the next boot or the default, and MUST stop treating the slot
-as a rollback target before it changes anything on it. Before it removes or
-formats anything it MUST refuse inputs that would destroy the slot or
-themselves: a rootfs that is not an EROFS image, is the slot's partition or a
-mounted partition, or is larger than the slot's partition, and a rootfs, kernel
-or initrd inside the slot's kernel directory.
+**REQ-SM-013**: Preparation and update application MUST write only the inactive
+system, keep it ineligible for trial until complete, refuse to overwrite the
+fallback of an uncommitted running slot, and prevent boot selection into a slot
+being changed. Before the first write, recab MUST validate source/destination
+identity, paths, capacity and required boot support. It MUST remove the old
+generation's rollback eligibility before changing it. Ordinary continuation
+MUST reuse the inactive filesystem; formatting and full replacement MUST NOT be
+the default continuation or a way to silently discard pending changes.
 
 **REQ-SM-014**: recab MUST NOT select (as default or one-shot) a slot whose
 entry names files missing from the ESP, and MUST NOT count such an entry as the
@@ -150,11 +181,42 @@ first point a `LoaderEntryDefault` naming another entry than the known-good
 default at it, and `stage` MUST remove a `LoaderEntryOneShot` naming its slot
 while no trial is pending, refusing when it cannot.
 
-**REQ-SM-015**: `recab init` MUST set up the boot layout an installed system's
-recab reads (slot entries, slot A's kernel, loader.conf, state with slot A
-known-good, the trial service) and MUST point systemd-boot's firmware variables
-at slot A, so variables left by an earlier install cannot select another slot;
-where efivars are not available it MUST warn that they were not reset.
+**REQ-SM-015**: Installation through recab MUST populate A and B with equivalent
+system contents and final machine configuration, matching kernels and
+initramfs images, and valid slot-specific partition references and boot entries.
+Both slots MUST be bootable at first use. A initially runs as the committed
+default; B is its matching inactive copy. Final personalization, including
+machine identity and services, MUST reach both before installation completes.
+Recab MUST set up the bootloader, state and trial service. It MUST reset stale
+firmware selection when installing onto the boot target from live media, warn
+when unavailable, and leave a separate running installation's firmware alone.
+
+**REQ-SM-016**: A continuation MUST synchronize inactive contents to the committed
+active generation before applying the next change. After B contains X and an
+update, preparing A for Y MUST retain both X and that update. Reopening the same
+preparation MUST retain its pending work instead of reseeding from the active
+system. Beginning a new preparation over the previous system ends that older
+rollback; the committed active system remains protected.
+
+**REQ-SM-017**: Incremental synchronization MUST account for additions, removals,
+content changes, file types, ownership, modes, links and extended attributes,
+including ACLs and capabilities. It MUST avoid copying unchanged system data,
+exclude shared user data and runtime mounts, preserve destination-specific slot
+identity, and use a consistent source view. Both destinations MUST be able to
+hold the resulting system. A configuration carry allowlist is not a system delta.
+
+**REQ-SM-018**: Recab MUST coordinate update discovery, download and application
+through the existing Recipe/Ginux software machinery. A user MUST be able to
+apply an update to a preparation that already contains X. Local changes,
+including deliberate removals, MUST be preserved or produce actionable conflicts.
+Recab MUST NOT silently overwrite X or ignore a conflicting release change.
+
+**REQ-SM-019**: Finalization MUST validate a complete candidate generation and
+its matching kernel, initramfs and boot configuration, end writable preparation
+and protect the system root for boot. Failure or interruption MUST leave the
+candidate unavailable for trial. The running root remains immutable; writable
+configuration and shared-data policy MUST be explicit and MUST NOT substitute
+for the required system-change lifecycle.
 
 ### 4.3 Trial Boot Safety
 
@@ -177,13 +239,14 @@ startups without a verdict (a shutdown) MUST be left alone.
 
 **REQ-SM-022**: A failed trial MUST reboot into the known-good slot, unless that
 slot cannot boot: a trial `recab trial` judges failed (REQ-SM-021) is rebooted by
-it, also when the ESP or /var cannot be read (the firmware's selected and
+it, also when health collection fails or the ESP or /var cannot be read (the firmware's selected and
 default entries tell a one-shot trial); slot entries carry `panic=` so a
 panicking kernel reboots; and a trial's entry carries the initramfs's
 fail-reboot word when it boots through one, and the init's crash option where
 it has one, which it loses when it becomes the default. A kernel or PID 1 that hangs without
 crashing is outside this requirement: it needs a hardware watchdog, which
-recab does not configure.
+the current implementation does not configure. Until a watchdog is provided,
+hard-hang recovery is a documented limit, not a guaranteed automatic reboot.
 
 **REQ-SM-023**: A judged trial MUST be recorded (slot, outcome, how startup
 ended, failed units), shown by `recab status`, and audited.
@@ -197,13 +260,20 @@ ended, failed units), shown by `recab status`, and audited.
 **REQ-CLI-001**: The CLI MUST provide these subcommands:
 
 - `recab status`
-- `recab stage --rootfs <image> --kernel <file> [--initrd <file>]`
+- `recab stage --from-media <device|dir>` or `recab stage --rootfs <image> --kernel <file> --initrd <file>`
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
-- `recab init` (sets up the A/B boot layout of a freshly installed system)
+- `recab init` (installation entry point; matching initial population is required)
 - `recab trial` (decides a trial boot; run by `recab-trial.service`)
-- `recab install-unit [--root DIR]` (installs and enables that service)
+- `recab install-unit [--root DIR] --init <systemd|openrc> [--bin PATH]`
+- `recab baseline --root DIR` (the current carried-configuration baseline)
+
+The CLI/library MUST additionally expose preparation, reopening, finalization,
+safe recovery/discard and update acquisition/application. Exact command names
+are not specified here; this list MUST NOT imply nonexistent commands work.
+Current `stage` formats and replaces the inactive system and does not meet the
+continuation requirements.
 
 **REQ-CLI-002**: `recab status` MUST report, at minimum:
 
@@ -211,6 +281,9 @@ ended, failed units), shown by `recab status`, and audited.
 - inactive slot (A/B)
 - whether a trial boot is pending
 - the configured "next boot" target if one exists
+- each slot's generation, preparation/completion state and source generation
+- pending changes, update progress or failure, conflicts and candidate readiness
+- available actions and their effect on fallback and rollback eligibility
 
 **REQ-CLI-003**: `recab set-next <A|B>` MUST configure the specified slot as the
 next boot target using trial boot semantics.
@@ -223,8 +296,9 @@ good slot on next reboot.
 
 ### 5.2 Output Rules
 
-**REQ-CLI-010**: Commands MUST be quiet on success (no extraneous logs), and MUST
-print actionable errors to stderr on failure. `recab trial` prints one line when
+**REQ-CLI-010**: Commands MUST provide concise outcomes and useful progress for
+long operations, with machine-readable output for frontends, and MUST print
+actionable errors to stderr on failure. `recab trial` prints one line when
 it commits, the record of the decision (the journal on systemd, the kernel log
 on OpenRC).
 
@@ -246,6 +320,8 @@ can call without invoking the CLI.
 - A `Status`-like structure that represents the same information as `recab status`
 - Functions to `set_next(slot)`, `commit()`, and `rollback()`, and `init()`,
   `stage()` and `trial()`
+- System preparation, continuation, finalization and update operations with
+  explicit target and generation identity, coordinated with Recipe
 
 **REQ-LIB-003**: The library MUST separate pure state representation from the
 backend implementation used to read/write boot metadata. (`src/state.rs` plans
@@ -298,13 +374,17 @@ semantics in a way that satisfies `REQ-SM-020` (automatic fallback).
 
 - determining the previously known-good slot for rollback
 - recording the last requested transition (set-next/commit/rollback)
+- identifying active and prepared generations and their relationship
+- detecting incomplete preparation after interruption and supporting safe recovery
+- preserving pending changes and update state across separate commands
 
 **REQ-PERSIST-003**: Runs that change anything MUST hold an exclusive lock for
 their whole duration, so their reads and writes never interleave.
 
-**REQ-PERSIST-004**: Both slots' recab read one state file. A newer schema MUST
-only add fields; recab MUST read a newer schema, keep the fields it does not
-know, and never lower the schema number.
+**REQ-PERSIST-004**: Both slots' recab read shared state. Compatible unknown
+fields MUST be preserved, but a reader MUST refuse mutations when it cannot
+enforce the state's safety semantics. Accepting every future schema and keeping
+unknown fields does not establish compatibility with preparation restrictions.
 
 **REQ-PERSIST-005**: A boot-selection change MUST write the boot selection
 before recab's state, so a crash between the two leaves the machine booting
@@ -315,6 +395,13 @@ file flushed to disk, renamed over the target, and the directory flushed. The
 same applies to `loader.conf` and to the entries and kernels `stage` writes
 (where the FAT ESP allows: its renames are not guaranteed atomic).
 
+**REQ-PERSIST-006**: Shared user data, build caches and stored package payloads
+MAY remain on `/var`. System package selection and configuration MUST belong to
+their system generation so preparation does not change the running system's
+selection. Rollback scope MUST identify shared state it does not restore,
+including application data migrations. Recab MUST NOT copy shared data as part
+of the system delta or claim that a boot rollback reverses all `/var` changes.
+
 ### 8.2 Audit Metadata
 
 **REQ-AUDIT-001**: `recab` SHOULD record minimal audit metadata for transitions,
@@ -322,7 +409,7 @@ such as:
 
 - timestamp
 - previous slot, next slot
-- operation type (set-next/commit/rollback)
+- operation type and affected system generation, including preparation and update
 
 ---
 
@@ -339,8 +426,11 @@ automation to determine whether the failure is actionable vs a hard stop.
 
 ### 9.2 Failure Safety
 
-**REQ-ERR-010**: Failed operations MUST NOT leave boot configuration in a
-partially updated state.
+**REQ-ERR-010**: Failed operations MUST preserve the protected fallback and keep
+incomplete candidates unavailable for trial. Partial boot/state writes MUST be
+reported accurately with recovery information. Predictable input/path/layout
+refusals MUST happen before destructive changes. External helper calls used for
+trial health MUST be bounded so the deadline covers the full assessment.
 
 ---
 
@@ -372,9 +462,19 @@ document:
 
 Primary sources for these requirements:
 
-- `tools/recab/README.md` and `tools/recab/CLAUDE.md` (tool scope and intent)
-- `architecture.md` (A/B update and rollback validation)
+- The user's 2026-11-10 lifecycle: identical initial A/B systems; change X and
+  a downloaded update in one continuation; healthy trial or fallback; change Y
+  in the reverse continuation using only differences
+- `README.md` and `CLAUDE.md` (tool scope and intent)
+- `../../architecture.md` (system ownership and A/B update lifecycle)
 
 ### 11.3 Validation
 
-Unit tests are prohibited. Use `cargo check -p recab` or the scratch-tree lifecycle checks in `tests/lifecycle.rs` (`cargo test -p recab`, unprivileged through a user namespace). No maintained traceability matrix or minimum coverage gate is required during development.
+Follow the superproject's validation rules. Focused CLI and real install/boot
+checks must distinguish existing release-image staging from the required full
+lifecycle. Coverage must include equivalent initial slots, X plus an update in
+one preparation, reversal with Y retaining both, interrupted preparation,
+conflicts and deletions, unchanged-data write avoidance, and trial/fallback on
+both init systems. Historical A/B scenario passes do not establish these missing
+capabilities. No maintained traceability matrix or minimum coverage gate is
+required during development.
