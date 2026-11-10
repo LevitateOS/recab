@@ -68,9 +68,7 @@ enum Command {
         root: Option<PathBuf>,
     },
 
-    /// Set up the boot layout of a freshly installed system: systemd-boot,
-    /// the boot entries (both A/B slots, or the one mutable root) and the
-    /// installed kernel.
+    /// Populate and seal both personalized A/B systems, or set up one mutable root.
     Init {
         /// The installed system's root, with its ESP at boot/ and state at var/.
         #[arg(long)]
@@ -81,7 +79,7 @@ enum Command {
         /// A/B: slot A's partition, holding the installed system.
         #[arg(long)]
         slot_a: Option<PathBuf>,
-        /// A/B: slot B's partition.
+        /// A/B: the unmounted, formatted ext4 destination for the matching copy.
         #[arg(long)]
         slot_b: Option<PathBuf>,
         /// Mutable: the root partition.

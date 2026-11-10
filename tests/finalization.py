@@ -6,7 +6,7 @@ an actual VM boot can establish PID 1, hardware-driver and service behavior.
 """
 import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--stage-recstrap',type=Path,help='also exercise destructive staging through the shared finalizer');args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--stage-recstrap',type=Path,help='also exercise destructive staging through the shared finalizer');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);args=p.parse_args()
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
 BIN=str(args.binary.resolve(strict=True));KERNEL=args.kernel.resolve(strict=True);MODULE=args.module.resolve(strict=True)
 GUID='4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
@@ -42,7 +42,119 @@ def install_elf(root,source,target):
         src=Path(name)
         if src.is_file():
             dest=root/name.lstrip('/');dest.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dest);dest.chmod(0o755)
-base=Path(tempfile.mkdtemp(prefix='recab-p04-ext4-'));loop=None;mounts=set();child=None;success=False
+def installation():
+    """Actual recsetup/recab install on a temporary disk, without a kernel boot."""
+    check(args.recsetup is not None and args.busybox is not None,'--installation needs --recsetup and --busybox')
+    root=roots['A'];state_root=roots['state'];boot=roots['esp']
+    (root/'home').rmdir();(root/'home').symlink_to('var/home');(state_root/'home').mkdir()
+    (root/'root/personal').write_text('root home is shared from either first boot\n')
+    # Real native busybox provides the chroot's shell/account tools; native
+    # recab/ELF fixtures still describe a glibc target on this x86_64 host.
+    busybox=args.busybox.resolve(strict=True)
+    shutil.copyfile(busybox,root/'usr/bin/busybox');(root/'usr/bin/busybox').chmod(0o755)
+    for applet in run(str(busybox),'--list').stdout.decode().splitlines():
+        path=root/'usr/bin'/applet
+        if not path.exists():path.symlink_to('busybox')
+    (root/'usr/bin/sh').unlink();(root/'usr/bin/sh').symlink_to('busybox')
+    (root/'etc/os-release').write_text((root/'etc/os-release').read_text().replace('REC_PACKAGES=rpm','REC_PACKAGES=apk'))
+    setup=root/'usr/libexec/recipe-system-setup';setup.parent.mkdir(parents=True);shutil.copyfile(Path(__file__).resolve().parents[3]/'distro/builder/guest/installed/system-setup.sh',setup);setup.chmod(0o755)
+    install_elf(root,Path('/usr/bin/ssh-keygen'),'usr/bin/ssh-keygen')
+    (root/'etc/ssh').mkdir();run('ssh-keygen','-q','-t','ed25519','-N','','-f',str(root/'etc/ssh/ssh_host_ed25519_key'))
+    if args.init=='systemd':
+        unit=root/'usr/lib/systemd/system/sshd.service';unit.parent.mkdir(parents=True,exist_ok=True);unit.write_text('[Service]\nExecStart=/usr/bin/true\n')
+        enabled=root/'etc/systemd/system/multi-user.target.wants';enabled.mkdir(parents=True,exist_ok=True);(enabled/'sshd.service').symlink_to('/usr/lib/systemd/system/sshd.service')
+    else:
+        (root/'etc/init.d/sshd').write_text('#!/bin/sh\nexit 0\n');(root/'etc/init.d/sshd').chmod(0o755)
+        enabled=root/'etc/runlevels/default';enabled.mkdir(parents=True,exist_ok=True);(enabled/'sshd').symlink_to('/etc/init.d/sshd')
+    loader=root/'usr/lib/systemd/boot/efi/systemd-bootx64.efi';loader.parent.mkdir(parents=True);shutil.copyfile('/usr/lib/systemd/boot/efi/systemd-bootx64.efi',loader)
+    # Producer-style binding of this fixture's genuine cached kernel/module.
+    module_root=root/f'usr/lib/modules/{release}';h=hashlib.sha256()
+    def module_tree(directory,relative=Path()):
+        for item in sorted(directory.iterdir()):
+            path=relative/item.name;name=os.fsencode(path);h.update(len(name).to_bytes(8,'little'));h.update(name)
+            if item.is_dir():h.update(b'd');module_tree(item,path)
+            else:h.update(b'f');h.update(hashlib.sha256(item.read_bytes()).digest())
+    module_tree(module_root)
+    (root/'usr/lib/recab/kernel.json').write_bytes(packed({'version':1,'release':release,'kernel_digest':kernel_hash,'modules_digest':h.hexdigest()}))
+    (root/'etc/NetworkManager/system-connections').mkdir(parents=True)
+    network=root/'etc/NetworkManager/system-connections/personal.nmconnection';network.write_text('[connection]\nid=personal\n');network.chmod(0o600)
+    with (root/'usr/share/personal-payload').open('wb') as output:
+        for _ in range(16):output.write(b'personal X\0'*(1024*1024//11)+b'x'*(1024*1024%11))
+    run('umount',str(roots['B']));mounts.remove('B')
+    run('mount','--bind',str(state_root),str(root/'var'));mounts.add('A/var')
+    run('mount','--bind',str(boot),str(root/'boot'));mounts.add('A/boot')
+    os_release=base/'live-os-release';os_release.write_text('ID=recab-install-fixture\n')
+    env.update(RECAB_ROOT='/',RECAB_OS_RELEASE_PATH=str(os_release),PATH=str(Path(BIN).parent)+':'+os.environ['PATH'])
+    record=root/'var/lib/recab/installation.json';progress=root/'var/lib/recsetup/apply.json'
+    request=base/'request.json';request.write_bytes(packed({'hostname':'original','root_password':True,'users':[{'name':'alice','admin':False,'password':True}],'boot':{'mode':'ab','slot_a':dev['A'],'slot_b':dev['B'],'kernel':str(KERNEL),'initrd':str(initrd)}}))
+    command=[str(args.recsetup.resolve()),'--json','apply','--root',str(root),'--request',str(request)]
+    def refresh(): (proc/'self/mountinfo').write_text(Path('/proc/self/mountinfo').read_text())
+    def setup_run(passwords=False):
+        refresh();return subprocess.run(command+(['--passwords-stdin'] if passwords else []),env=env,input='root:fixture-password\nalice:fixture-password\n' if passwords else None,text=True,capture_output=True,timeout=120)
+    original_initrd=initrd.read_bytes();initrd.write_bytes(original_initrd[:-9])
+    first=setup_run(True);check(first.returncode!=0,'truncated initrd was accepted')
+    check(record.exists() and progress.exists(),'installation/personalization progress was not durable: '+first.stderr+first.stdout)
+    check('fixture-password' not in progress.read_text(),'password leaked into installation progress')
+    check((root/'etc/hostname').read_text().strip()=='original' and 'alice:' in (root/'etc/passwd').read_text(),'real personalization did not finish before init: '+first.stderr+first.stdout)
+    shadow=(root/'etc/shadow').read_bytes();host_key=(root/'etc/ssh/ssh_host_ed25519_key').read_bytes();machine_id=(root/'etc/machine-id').read_bytes()
+    (root/'etc/hostname').write_text('changed-after-failure\n');initrd.write_bytes(original_initrd)
+    child=None
+    try:
+        refresh();child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+        deadline=time.monotonic()+60
+        journal=root/f'var/lib/recab/synchronize-install-{uuid["B"]}.json'
+        while time.monotonic()<deadline:
+            if journal.exists():os.killpg(child.pid,signal.SIGKILL);child.communicate(timeout=10);break
+            if child.poll() is not None:raise RuntimeError('install ended before interruption: '+str(child.communicate()))
+            time.sleep(.001)
+        else:raise RuntimeError('copy intent not observed')
+        check(not (boot/'loader/entries/lev-a.conf').exists() and not (boot/'loader/entries/lev-b.conf').exists(),'interrupted copy exposed entries')
+        check(run('blockdev','--getro',dev['A']).stdout.strip()==b'1','source A was not protected during copy')
+        # Fail publication using a real read-only bind inside recab's namespace.
+        refresh();child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+        deadline=time.monotonic()+60;injected=False
+        while time.monotonic()<deadline:
+            if record.exists() and json.loads(record.read_text()).get('synchronization'):
+                children=Path(f'/proc/{child.pid}/task/{child.pid}/children').read_text().split()
+                if children:
+                    pid=children[0];entries=str(root/'boot/loader/entries')
+                    run('nsenter','-t',pid,'-m','mount','--bind',entries,entries);run('nsenter','-t',pid,'-m','mount','-o','remount,bind,ro',entries);injected=True;break
+            if child.poll() is not None:raise RuntimeError('install ended before publication failure: '+str(child.communicate()))
+            time.sleep(.001)
+        check(injected,'publication fault was not injected');out,err=child.communicate(timeout=120);check(child.returncode!=0 and not json.loads(record.read_text())['complete'],'failed publication reported installation complete: '+out+err)
+        check(all(run('blockdev','--getro',dev[s]).stdout.strip()==b'1' for s in ['A','B']),'failed publication left an unsealed root')
+        recovered=setup_run();check(recovered.returncode==0,'installation recovery failed: '+recovered.stderr+recovered.stdout)
+        complete=json.loads(record.read_text());check(complete['complete'],'successful installation did not mark completion')
+        check(complete['synchronization']['payload_bytes_written']==0,'publication recovery recopied payloads')
+        wrong=base/'wrong-kernel';wrong.write_bytes(b'wrong kernel')
+        cli(env,'init','--root',str(root),'--slot-a',dev['A'],'--slot-b',dev['B'],'--kernel',str(wrong),'--initrd',str(initrd),code=21,contains='boot inputs')
+        again=setup_run();check(again.returncode==0,'completed installer retry failed: '+again.stderr+again.stdout)
+        check((root/'etc/shadow').read_bytes()==shadow and (root/'etc/machine-id').read_bytes()==machine_id and (root/'etc/ssh/ssh_host_ed25519_key').read_bytes()==host_key,'retry regenerated passwords/machine identity/host keys')
+        check((state_root/'roothome/personal').read_text().startswith('root home is shared'),'initial root home was not seeded for B-first boot')
+        run('mount','-o','ro',dev['B'],str(roots['B']));mounts.add('B')
+        for path in ['etc/hostname','etc/passwd','etc/group','etc/shadow','etc/machine-id','etc/ssh/ssh_host_ed25519_key','etc/NetworkManager/system-connections/personal.nmconnection']:
+            check((root/path).read_bytes()==(roots['B']/path).read_bytes(),f'personalized A/B differ at {path}')
+        check((roots['B']/'etc/hostname').read_text().strip()=='changed-after-failure','retry lost work made after first attempt')
+        check(uuid['B'] in (roots['B']/'etc/fstab').read_text(),'B retained A root identity')
+        run('umount',str(roots['B']));mounts.remove('B')
+        try:(root/'etc/forbidden-after-sealing').write_text('must fail')
+        except OSError:pass
+        else:raise RuntimeError('sealed A accepted a system write')
+        # Observe A as a read-only boot mount (no VM/kernel boot is claimed).
+        run('mount','-o','remount,ro',str(root))
+        active=dict(env,RECAB_ROOT=str(root),RECAB_BOOT_ROOT=str(root/'boot'),RECAB_STATE_DIR=str(root/'var/lib/recab'));active.pop('RECAB_OS_RELEASE_PATH')
+        generation=complete['generation'];(proc/'cmdline').write_text(f'root=PARTUUID={uuid["A"]} ro recab.immutable recab.slot=A recab.generation={generation["id"]}\n');refresh()
+        status=cli(active,'status');check(all(s['generation_ready'] and s['bootable'] and s['generation']['id']==generation['id'] for s in status['slots']),'both initial systems are not ready/bootable')
+        check(status['slots'][0]['readiness']=='committed' and status['slots'][1]['readiness']=='ready' and status['last_trial'] is None,'initial B was falsely trial-committed')
+        cli(active,'set-next','B');cli(active,'rollback')
+        prepared=cli(active,'prepare');check(prepared['synchronization']['payload_bytes_written']==0,'first continuation rewrote the installed system')
+        # A completed init must never reset a preparation or resurrect its entry.
+        refused=setup_run();check(refused.returncode!=0 and not (boot/'loader/entries/lev-b.conf').exists(),'installer retry reset a live preparation')
+        return {'result':'PASS','init':args.init,'personalized_equivalent_slots':True,'first_prepare_payload_bytes':prepared['synchronization']['payload_bytes_written'],'checks':['real GPT/ext4/vfat','real recsetup chroot personalization','passwords/users/hostname/network/services/keys preserved','shared home seeding','durable copy interruption/recovery','publication failure/recovery','idempotent installer retry','both initial generation-bound entries','initial B ready without fabricated trial','first continuation writes no payload','live ledger reset refusal']}
+    finally:
+        if child is not None and child.poll() is None:os.killpg(child.pid,signal.SIGKILL);child.communicate(timeout=10)
+
+base=Path(tempfile.mkdtemp(prefix='recab-p05-ext4-' if args.installation else 'recab-p04-ext4-'));loop=None;mounts=set();child=None;success=False
 try:
     image=base/'scratch.img'
     root_mib=2560 if args.stage_recstrap else 128
@@ -70,9 +182,9 @@ try:
     esp=roots['esp'];state=roots['state']/'recab';state.mkdir();proc=base/'proc';(proc/'self').mkdir(parents=True);(proc/'filesystems').write_text(Path('/proc/filesystems').read_text());efi=base/'efi';(efi/'efivars').mkdir(parents=True)
     (esp/'loader/entries').mkdir(parents=True);(esp/'legacy').mkdir();shutil.copyfile(KERNEL,esp/'legacy/vmlinuz');shutil.copyfile(initrd,esp/'legacy/initrd.img')
     env=dict(os.environ,RECAB_BOOT_ROOT=str(esp),RECAB_STATE_DIR=str(state),RECAB_PROC_PATH=str(proc),RECAB_SYS_FIRMWARE_EFI_PATH=str(efi),RECAB_EFIVARS_PATH=str(efi/'efivars'),RECAB_LOCK_PATH=str(base/'lock'),RECAB_STAGE_DIR=str(base/'staging'))
-    for slot in ['A','B']:
+    for slot in (['A'] if args.installation else ['A','B']):
         root=roots[slot]
-        for directory in ['etc','usr/lib/recab','usr/lib64','usr/bin','usr/lib/systemd','sbin','var','root','run','tmp','dev','proc','sys','boot','home']:(root/directory).mkdir(parents=True,exist_ok=True)
+        for directory in ['etc','usr/lib/recab','usr/lib64','usr/bin','usr/share','usr/lib/systemd','sbin','var','root','run','tmp','dev','proc','sys','boot','home']:(root/directory).mkdir(parents=True,exist_ok=True)
         (root/'tmp').chmod(0o1777);(root/'root').chmod(0o700)
         for link,target in [('lib','usr/lib'),('lib64','usr/lib64'),('bin','usr/bin')]: (root/link).symlink_to(target)
         install_elf(root,Path('/usr/bin/true'),'usr/lib/systemd/systemd' if args.init=='systemd' else 'sbin/openrc-init')
@@ -103,6 +215,8 @@ try:
         if error.errno not in (errno.ENODATA,errno.ENOTSUP):raise
     else:
         for s in ['A','B']:os.setxattr(roots[s],'security.selinux',label)
+    if args.installation:
+        result=installation();success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     ga=generation('A');gb=generation('B')
     if args.stage_recstrap:
         release_image=base/'fixture.erofs';run('mkfs.erofs',str(release_image),str(roots['A']))

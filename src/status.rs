@@ -295,7 +295,15 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
             state,
         ));
     }
+    let installation_error = crate::installation::require_complete(&sys.target)
+        .err()
+        .map(|e| format!("{e:#}"));
     for action in &mut actions {
+        if let Some(reason) = &installation_error {
+            action.verdict = Verdict::Refused;
+            action.reason = Some(reason.clone());
+            action.after = None;
+        }
         if matches!(
             action.action,
             Action::SetNext | Action::Commit | Action::Rollback
@@ -311,10 +319,12 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
     Ok(Status {
         schema_version: STATUS_SCHEMA_VERSION,
         preparation: state.preparation.clone(),
-        recovery_reason: state
-            .check_mutable()
-            .err()
-            .map(|error| format!("{error:#}")),
+        recovery_reason: installation_error.or_else(|| {
+            state
+                .check_mutable()
+                .err()
+                .map(|error| format!("{error:#}"))
+        }),
         scheduled_trial: state.pending_trial_slot,
         actions,
         active_slot: sel.active,

@@ -46,8 +46,9 @@ trial. Requirements: [REQUIREMENTS.md](REQUIREMENTS.md).
 The current implementation has release-image staging, trial boot, commit and
 rollback. It does **not yet implement the full lifecycle above**:
 
-- `init` prepares A and writes both boot entries, but leaves B unpopulated and
-  without its own kernel. Identical initial slots are still required.
+- `init` now populates B from the personalized A, verifies normalized equivalence,
+  seals both roots and publishes both generation-bound entries. A starts
+  committed/default; B is ready without a fabricated successful trial.
 - `stage` reformats the inactive slot and carries selected configuration from
   the running slot, then uses the same validating/sealing finalizer. It cannot continue a system incrementally or preserve X
   already prepared in the inactive slot when applying an update.
@@ -174,21 +175,29 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   marker; it never includes regular file bodies. Only recab-owned slot fields
   and their publication timestamps are normalized in generation identity.
 
-- `init` sets up a freshly installed system's ESP (recab is the only writer of
-  it, for both layouts): it copies the target's own systemd-boot
-  (`usr/lib/systemd/boot/efi/systemd-boot<arch>.efi`) to `EFI/systemd/` and
-  `EFI/BOOT/`, writes an entry per root naming its partition by
-  `root=PARTUUID=` with `ro rootwait panic=10` and any `--options`, the kernel
-  in `/boot/<id>-a/` (A/B) or `/boot/<id>/` (mutable, entry `<id>.conf`), and
-  `loader.conf` defaulting to it (`timeout 5`, `editor 0` when recab creates
-  it). For A/B it also prepares A's immutable boot configuration and writes
-  recab's state with slot A known-good; it does not yet populate B. It points
-  systemd-boot's firmware variables at the installed entry, so a default left
-  by an earlier install cannot win; where efivars are not available it warns
-  on stderr that they could not be reset (`stage` resets them before writing
-  the inactive slot). When installing from a running recab A/B system, its
-  host firmware variables are left alone. The prefix and titles come from the target's os-release (`ID`,
-  `NAME`); the reader finds the entries by the same rule.
+- A/B `init` requires the personalized A mounted at `--root`, separate ext4
+  state at `var/`, a vfat ESP at `boot/`, and an unmounted ext4 B. It never
+  formats B. It preserves the original image baseline, requires seeded machine
+  identity and enabled SSH keys, and copies the completed system with the same
+  inventory/range synchronizer used by `prepare`. Shared homes/state and nested
+  runtime/ESP contents are excluded. Root's initial home is published into shared
+  state before either system can boot.
+
+  A and B receive their own fstab/slot/root markers and the same normalized
+  generation. Matching kernel/initramfs objects are stored once on the ESP.
+  Both roots are flushed and protected read-only before entries are published.
+  A is committed/default; B is ready and trial-capable at first use. `init`
+  reports success only after both entries, the ledger and completion record are
+  durable. Mutable initialization retains its single-root layout.
+
+  `/var/lib/recab/installation.json` pins partition identities, boot inputs,
+  options and the frozen personalized generation. Retry the same initialization
+  after interruption; it checks actual data and reuses completed ranges and
+  boot objects. A changed source or live generation ledger is refused, never
+  reseeded. Incomplete installation blocks ordinary mutating recab commands.
+  A completed retry revalidates both roots and entries. Installing from an
+  existing A/B host preserves that host's firmware selection; unavailable EFI
+  variables produce an explicit warning. Entry names come from os-release ID.
 - `status` reports the active and inactive slot, the default, the known-good
   slot, whether the running slot is committed, the rollback target, whether a
   trial is pending, the next boot, and how the last trial ended. It only reads,
@@ -386,7 +395,7 @@ Every operation that writes (`init`, `stage`, `set-next`, `commit`, `rollback`,
 | `src/state.rs` | The state machine without I/O: what each request changes or why it is refused, and how a trial is judged |
 | `src/systemd_boot.rs` | The boot selection: entries, `loader.conf`, EFI variables, slot kernels, trial options on entries |
 | `src/store.rs` | The state file, audit log, lock and durable file replacement |
-| `src/init.rs` | The current install-time boot layout; matching initial slot population is missing |
+| `src/init.rs`, `src/installation.rs` | Single-root boot setup and recoverable equivalent A/B installation |
 | `src/stage.rs` | The current destructive release-image update path |
 | `src/immutable.rs` | Read-only system configuration and immutable-initramfs compatibility |
 | `src/filesystem.rs` | Directory-FD-confined filesystem access and complete xattrs |
@@ -510,3 +519,11 @@ record/artifact tampering refusal, preservation of local X, safe collection with
 foreign boot references, and zero repeated boot payload writes. Its native ELF
 programs, initramfs and observed boot records are structural fixtures; this is
 not evidence of a kernel/PID 1 boot.
+
+P05 installation integration uses `tests/finalization.py --installation --recsetup
+<recsetup> --busybox <native-static-busybox> --binary <recab>
+--kernel <existing-kernel> --module <matching-ko> --init <systemd|openrc>`. It runs real chroot personalization and real ext4/FAT
+copy/sealing/publication checks, including failed initialization, copy termination,
+publication failure, retry without repeating passwords/settings, and zero payload
+writes on the first continuation. Boot observations remain structural fixtures;
+this does not establish a kernel/PID 1 or distro-service boot.

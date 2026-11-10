@@ -76,8 +76,8 @@ At the P03 checkpoint, writes promoted state 2.0 to 2.1; P02's reader refuses
 dropping synchronization progress and reseeding pending changes. P03's status schema 4
 and generated schemas/TypeScript expose the saved synchronization report.
 Focused Rust compilation and TUI/docs typechecks pass. No full builds, unit
-suites or VM runs were performed. P05 initial equivalent B and Recipe/update
-integration remain outstanding.
+suites or VM runs were performed. The later P05 checkpoint below adds initial
+A/B equivalence; Recipe/update integration remains outstanding.
 
 P04 now implements `finalize` in both directions. Read-only preflight validates
 identity/profile, ELF init and libraries, accounts, fstab, runtime directories,
@@ -122,6 +122,43 @@ recinit producer run using cached Alpine tools, static busybox and the existing
 whole-stream inspector. Rust compilation and documentation/TUI typechecks pass.
 This does not establish a kernel, PID 1 or distro-service boot. Full installed boot/hardware and aarch64 validation
 remain pending; no full system builds or VM runs were requested or performed.
+
+P05 now initializes both personalized systems. Recsetup captures the image
+baseline once and finishes requested accounts/passwords, service/network settings,
+machine identity and enabled SSH host keys before recab initialization. Its
+request/filesystem-bound apply receipt stores completed commands without passwords;
+retries skip those commands, revalidate the boot step, and refuse changed unfinished
+personalization. Media/device paths may change, with actual identity validation
+remaining in recab. A fresh state filesystem retains ordinary /var/lib permissions.
+
+Recab records installation intent and freezes the personalized generation under
+/var/lib/recab/installation.json. It copies A into the existing ext4 B with the
+P03 synchronizer, including full metadata and destination-specific root/slot
+records, excluding shared/runtime/ESP contents. Initial root-home contents are
+published durably into shared state for either first boot. It validates normalized
+A/B equivalence and P04 boot/runtime bindings, flushes/seals both roots, installs
+one reusable boot object set, then publishes both entries and the default. A is
+committed/default; B is ready without an invented successful trial. Completion
+requires both roots, entries, ledger and installation record to be durable.
+Incomplete installation blocks ordinary mutations and automatic commitment.
+
+Initialization retries reconcile the same frozen source, actual ranges, objects
+and publication. A matching completed retry revalidates both systems; a changed
+source, preparation or live ledger refuses reset. The install guide now places
+service/network choices before sealing; the finish action remains dependent on
+successful recsetup completion. The existing VM install evidence checks now read
+both generation-bound entries instead of expecting A-only legacy kernel paths.
+
+Focused validation uses the existing filesystem integration harness with
+`--installation --recsetup <recsetup> --busybox <native-static-busybox>`. It performs actual chroot account/password
+and hostname changes, seeds identity/SSH keys, then exercises invalid initramfs,
+copy termination, publication failure and retries. It checks preserved settings
+edited after the failed attempt, unchanged password hashes/keys/machine identity,
+shared homes, equivalent A/B generations and destination identities, two bootable
+entries, initial B readiness, live-ledger reset refusal and a first continuation
+with zero system payload writes. Boot observations are structural fixtures;
+actual kernel/PID 1/distro boots remain unverified. No full builds or VM scenarios
+were run. Recipe system targeting and downloaded-update merging remain later work.
 
 The starting-point description below records the pre-implementation audit.
 

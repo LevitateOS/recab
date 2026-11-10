@@ -21,6 +21,10 @@ impl SlotMount {
             return Err(refuse("cannot mount the active slot writable"));
         }
         let uuid = sys.backend.slot_partuuid(&sys.boot, slot)?;
+        Self::installed(&sys.target, &uuid, id)
+    }
+    /// Mount a separately checked installation destination without a boot ledger.
+    pub fn installed(target: &crate::target::Target, uuid: &str, id: &str) -> Result<Self> {
         let output = std::process::Command::new("blkid")
             .args([
                 "-c",
@@ -49,7 +53,7 @@ impl SlotMount {
         if !meta.file_type().is_block_device() || crate::target::partuuid(&device)? != uuid {
             return Err(refuse("inactive partition identity changed"));
         }
-        if meta.rdev() == fs::metadata(&sys.target.root)?.dev() {
+        if meta.rdev() == fs::metadata(&target.root)?.dev() {
             return Err(refuse("inactive partition is the active filesystem"));
         }
         // Check kernel device numbers, including bind mounts and aliases whose
@@ -63,10 +67,10 @@ impl SlotMount {
                 "inactive partition is already mounted; unmount it before preparation",
             ));
         }
-        fs::create_dir_all(&sys.target.stage_dir)?;
-        let directory = crate::filesystem::Root::open(&sys.target.stage_dir)?;
+        fs::create_dir_all(&target.stage_dir)?;
+        let directory = crate::filesystem::Root::open(&target.stage_dir)?;
         let name = format!("prepare-{id}");
-        let point = sys.target.stage_dir.join(&name);
+        let point = target.stage_dir.join(&name);
         let entry = directory.entry(std::path::Path::new(&name), false)?;
         if entry.metadata()?.is_none() {
             fs::create_dir(entry.path())?;
@@ -97,7 +101,7 @@ impl SlotMount {
             result.device.as_raw_fd()
         ));
         result.mounted = Some(Mounted::new(
-            &sys.target,
+            target,
             &["-t", "ext4", "-o", "ro,noload,nosuid,nodev,noexec"],
             &pinned,
             &result.point,
@@ -110,6 +114,9 @@ impl SlotMount {
         Ok(result)
     }
     pub fn writable(&mut self, sys: &System) -> Result<()> {
+        self.writable_target(&sys.target)
+    }
+    pub fn writable_target(&mut self, target: &crate::target::Target) -> Result<()> {
         if let Some(mounted) = self.mounted.take() {
             mounted.unmount()?;
         }
@@ -122,7 +129,7 @@ impl SlotMount {
             self.device.as_raw_fd()
         ));
         self.mounted = Some(Mounted::new(
-            &sys.target,
+            target,
             &["-t", "ext4", "-o", "rw,nosuid,nodev,noexec"],
             &pinned,
             &self.point,

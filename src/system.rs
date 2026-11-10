@@ -43,6 +43,7 @@ impl System {
         let lock = lock(&target, command)?;
         let system = Self::read_with(target, Some(lock))?;
         system.state.check_mutable()?;
+        crate::installation::require_complete(&system.target)?;
         Ok(system)
     }
 
@@ -105,6 +106,7 @@ impl System {
     /// Apply `transition`: its boot selection, then recab's state, stamped
     /// with the operation and time, then the audit record.
     pub fn apply(&self, transition: &Transition) -> Result<PersistentState> {
+        crate::installation::require_complete(&self.target)?;
         self.state.check_mutable()?;
         transition.next.check_mutable()?;
         if matches!(transition.operation, crate::state::Operation::Commit(_)) {

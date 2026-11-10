@@ -25,6 +25,7 @@ mod finalize;
 mod generation;
 mod immutable;
 mod init;
+mod installation;
 mod init_system;
 mod package;
 mod prepare;
@@ -70,10 +71,10 @@ pub use sync::SyncReport;
 use system::{require_root, System};
 use target::Target;
 
-/// Set up the boot layout of a freshly installed system: the target's
-/// systemd-boot, the entries (both slots', or the one root's), the installed
-/// kernel, loader.conf, this machine's firmware variables and, for A/B,
-/// recab's state.
+/// Populate and seal equivalent personalized A/B roots, then publish both
+/// boot entries and durable installation state. A matching initialization
+/// retries its own saved generation; it never resets a live ledger.
+/// Mutable installs retain their single-root boot layout.
 pub fn init(request: &InitRequest) -> Result<()> {
     require_root("init")?;
     let target = Target::installed(&request.root)?;
@@ -209,6 +210,7 @@ pub fn health(timeout: Duration) -> Result<Health> {
 /// Record the baseline of the image tree `root`: what it ships at the paths
 /// its carried list names.
 pub fn baseline(root: &Path) -> Result<()> {
+    if carry::Baseline::read(root)?.is_some() { return Ok(()); }
     let list = carry::read_list(root)?;
     carry::Baseline::write(root, &list)
 }

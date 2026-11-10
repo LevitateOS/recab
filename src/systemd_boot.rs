@@ -399,10 +399,6 @@ impl SystemdBoot {
         Ok(())
     }
 
-    pub fn stamp_generation(&self, prefix: &str, slot: Slot, generation: &str) -> Result<()> {
-        self.rewrite_entry(prefix, slot, |entry| entry.set_generation(generation))
-    }
-
     /// The slot's kernel directory on the ESP.
     pub fn kernel_dir(&self, boot: &Boot, slot: Slot) -> PathBuf {
         self.target.esp.join(layout_name(&boot.prefix, Some(slot)))
@@ -532,6 +528,89 @@ impl SystemdBoot {
         Ok(id)
     }
 
+    pub(crate) fn withdraw_installed(&self) -> Result<()> {
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        if root.metadata(Path::new(ENTRIES_DIR))?.is_none() {
+            return Ok(());
+        }
+        for slot in Slot::ALL {
+            let entry = root.entry(
+                Path::new(&format!(
+                    "{ENTRIES_DIR}/{}",
+                    entry_name(&self.target.entry_prefix()?, slot)
+                )),
+                false,
+            )?;
+            if entry.metadata()?.is_some() {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        target_root::sync_dir(&root.entry(Path::new(ENTRIES_DIR), false)?.path())?;
+        Ok(())
+    }
+    pub(crate) fn install_bootloader(&self) -> Result<()> {
+        install_loader(&self.target.root, &self.target.esp)
+    }
+    pub(crate) fn publish_installed(
+        &self,
+        slot: Slot,
+        uuid: &str,
+        g: &crate::Generation,
+        seal: &crate::BootSeal,
+        init: InitSystem,
+        options: &str,
+    ) -> Result<()> {
+        self.verify_manifest(g, seal)?;
+        let (kernel, initrd) = object_paths(g)?;
+        let mut entry = Entry::new(
+            &format!("{} (Slot {slot})", self.target.os_name()?),
+            "unused",
+            true,
+            uuid,
+            &immutable_options(options),
+        );
+        entry.set_artifacts(&kernel, &initrd);
+        entry.make_immutable();
+        entry.set_slot(slot);
+        entry.set_generation(&g.id);
+        if slot == Slot::A {
+            make_default(&mut entry);
+        } else {
+            make_trial(&mut entry, init);
+        }
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        let path = root.entry(
+            Path::new(&format!(
+                "{ENTRIES_DIR}/{}",
+                entry_name(&self.target.entry_prefix()?, slot)
+            )),
+            true,
+        )?;
+        let text = entry.render();
+        if root
+            .optional_text(Path::new(&format!(
+                "{ENTRIES_DIR}/{}",
+                entry_name(&self.target.entry_prefix()?, slot)
+            )))?
+            .as_deref()
+            != Some(&text)
+        {
+            target_root::write_durable(&path.path(), text.as_bytes(), Some(0o644))?;
+        }
+        Ok(())
+    }
+    pub(crate) fn installed_default(&self) -> Result<String> {
+        let id = entry_name(&self.target.entry_prefix()?, Slot::A);
+        let file = self.loader_conf();
+        let before = target_root::read_optional(&file)?;
+        target_root::write_durable(
+            &file,
+            loader_with_default(before.as_deref(), &id).as_bytes(),
+            None,
+        )?;
+        Ok(id)
+    }
+
     /// Point this machine's firmware at entry `id`: the default variable
     /// names it and no one-shot is left.
     pub fn point_firmware_at(&self, id: &str) -> Result<()> {
@@ -656,6 +735,29 @@ fn install_loader(root: &Path, esp: &Path) -> Result<()> {
         target_root::copy_durable(&source, &dest)?;
     }
     Ok(())
+}
+
+fn immutable_options(options: &str) -> String {
+    options
+        .split_whitespace()
+        .filter(|o| {
+            !matches!(*o, "ro" | "rw" | "rootwait")
+                && ![
+                    "root=",
+                    "rootflags=",
+                    "rootfstype=",
+                    "init=",
+                    "rdinit=",
+                    "resume=",
+                    "recab.",
+                    "systemd.volatile",
+                    "systemd.mount-extra",
+                ]
+                .iter()
+                .any(|prefix| o.starts_with(prefix))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Content-addressed boot payloads shared by generations and slots on the ESP.
@@ -848,27 +950,7 @@ impl SystemdBoot {
         let source = self
             .entry(&boot.prefix, Some(boot.selection.active))?
             .context("active entry missing")?;
-        let extra = source
-            .options()
-            .into_iter()
-            .filter(|o| {
-                !matches!(o.as_str(), "ro" | "rw" | "rootwait")
-                    && ![
-                        "root=",
-                        "rootflags=",
-                        "rootfstype=",
-                        "init=",
-                        "rdinit=",
-                        "resume=",
-                        "recab.",
-                        "systemd.volatile",
-                        "systemd.mount-extra",
-                    ]
-                    .iter()
-                    .any(|prefix| o.starts_with(prefix))
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        let extra = immutable_options(&source.options().join(" "));
         let mut entry = Entry::new(
             &format!("{} (Slot {slot})", self.target.os_name()?),
             "unused",

@@ -183,6 +183,15 @@ impl Entry {
     pub fn path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}", self.parent.as_raw_fd())).join(&self.name)
     }
+    /// Keep the parent pinned while a child process resolves this path.
+    pub fn child_path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.parent.as_raw_fd()
+        ))
+        .join(&self.name)
+    }
     pub fn metadata(&self) -> Result<Option<fs::Metadata>> {
         Ok(target_root::metadata(&self.path())?)
     }
