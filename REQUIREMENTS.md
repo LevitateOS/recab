@@ -18,6 +18,9 @@ incremental continuation, preservation of pending changes through updates, or
 Recipe operations directed at an inactive system. Requirements below describe
 the intended behavior; they are not claims that these features already work.
 
+[IMPLEMENTATION.md](IMPLEMENTATION.md) defines the implementation decisions,
+ordered work, deployment constraints and runtime acceptance for this contract.
+
 ---
 
 ## Table of Contents

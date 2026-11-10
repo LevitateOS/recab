@@ -4,6 +4,10 @@ Purpose: own system updates and symmetric A/B continuation for LevitateOS and
 AcornOS. Follow `REQUIREMENTS.md` for the product contract and `README.md` for
 the intended lifecycle and current implementation gaps.
 
+Use `IMPLEMENTATION.md` as the active implementation plan. It covers this tool
+and its Recipe, installer, boot and frontend callers. Earlier untangling logs
+are historical evidence, not the product plan.
+
 Installation must populate A and B with equivalent personalized systems and
 boot artifacts. The running system root stays immutable; recab prepares the
 inactive system using only differences, coordinates changes and downloaded

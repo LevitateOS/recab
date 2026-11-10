@@ -6,6 +6,10 @@ and downloaded updates through Recipe, trial-boots the result, commits a healthy
 system and returns to the previous system when the trial fails. It uses
 systemd-boot with systemd (LevitateOS) or OpenRC (AcornOS).
 
+The [implementation plan](IMPLEMENTATION.md) defines the storage, preparation,
+Recipe integration, update merge, installation and recovery work needed to
+deliver this lifecycle.
+
 ## Required update lifecycle
 
 1. Installation populates A and B with the same system and machine configuration,
