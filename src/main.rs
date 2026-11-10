@@ -10,8 +10,9 @@ use recpart::types::InstallMode;
 
 #[derive(Parser)]
 #[command(name = "recab")]
-#[command(about = "A/B slot + boot-selection manager")]
+#[command(about = "Manage system updates and rollback with two root slots (A/B)")]
 #[command(version)]
+#[command(after_help = "Common tasks:\n  recab status                    Show the running slot and next boot\n  recab status --root /mnt         Inspect an installed target\n  recab stage --from-media /media  Write an update to the inactive slot\n  recab set-next B                 Schedule one trial boot of slot B\n  recab rollback                  Select the known-good slot for next boot\n\nA/B keeps two system copies. stage formats the inactive slot; set-next selects\na trial boot. The trial service commits a healthy boot automatically.\nRead 'recab status' before choosing a slot. Add --json for structured status.")]
 struct Cli {
     /// Machine-readable output: `status` and `health` print JSON, and any
     /// command that fails prints its error as one JSON object on stderr.
@@ -166,6 +167,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 _ => usage("stage takes --from-media, or --rootfs and --kernel (and --initrd)"),
             };
             recab::stage(&source, change_flavour)?;
+            if !cli.json {
+                println!("Update staged in the inactive slot. Run 'recab status' to review it before scheduling a trial boot.");
+            }
         }
         Command::Init { root, mode, slot_a, slot_b, root_device, kernel, initrd, options } => {
             let layout = match (mode, slot_a, slot_b, root_device) {
@@ -175,9 +179,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             };
             recab::init(&InitRequest { root, layout, kernel, initrd, options })?
         }
-        Command::SetNext { slot } => recab::set_next(slot)?,
-        Command::Commit => recab::commit()?,
-        Command::Rollback => recab::rollback()?,
+        Command::SetNext { slot } => {
+            recab::set_next(slot)?;
+            if !cli.json {
+                println!("Slot {slot} selected for one trial boot. Reboot when ready.");
+            }
+        }
+        Command::Commit => {
+            recab::commit()?;
+            if !cli.json {
+                println!("The running slot is now known-good and the default for future boots.");
+            }
+        }
+        Command::Rollback => {
+            recab::rollback()?;
+            if !cli.json {
+                println!("The known-good slot is selected for the next boot. Reboot when ready.");
+            }
+        }
         Command::Trial { timeout } => {
             if let TrialOutcome::Committed(slot) = recab::trial(Duration::from_secs(timeout))? {
                 // The record of the decision (the journal, or the kernel log on OpenRC).
@@ -234,20 +253,20 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
         entry_prefix,
         slots,
     } = st;
-    println!("active: {active_slot}");
-    println!("inactive: {inactive_slot}");
-    println!("known_good: {}", slot_text(*known_good_slot));
-    println!("default: {}", slot_text(*default_slot));
-    println!("committed: {}", yes_no(*committed));
-    println!("rollback: {}", slot_text(*rollback_slot));
-    println!("trial_pending: {}", yes_no(*trial_pending));
-    println!("next_boot: {}", slot_text(*next_boot));
-    println!("scheduled_trial: {}", slot_text(*scheduled_trial));
+    println!("Running slot: {active_slot}");
+    println!("Inactive slot (update target): {inactive_slot}");
+    println!("Known-good slot: {}", slot_text(*known_good_slot));
+    println!("Default boot slot: {}", slot_text(*default_slot));
+    println!("Running slot committed: {}", yes_no(*committed));
+    println!("Rollback slot: {}", slot_text(*rollback_slot));
+    println!("Trial pending: {}", yes_no(*trial_pending));
+    println!("Next boot slot: {}", slot_text(*next_boot));
+    println!("Scheduled trial slot: {}", slot_text(*scheduled_trial));
     if let Some(trial) = last_trial {
         let outcome = if trial.committed { "committed" } else { "abandoned" };
-        println!("last_trial: slot {} {outcome} ({})", trial.slot, trial.detail);
+        println!("Last trial: slot {} {outcome} ({})", trial.slot, trial.detail);
     }
-    println!("entry_prefix: {entry_prefix}");
+    println!("Boot entry prefix: {entry_prefix}");
     for SlotView { slot, entry, boot_dir, root, device, bootable, trial } in slots {
         println!(
             "slot {slot}: entry {entry}, kernel /{boot_dir}, root {}, device {}, bootable {}, trial options {}",
