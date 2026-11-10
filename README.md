@@ -83,6 +83,7 @@ from its purpose. The commands below describe the existing implementation.
 - `recab finalize [--preparation <id> --revision <n>] [--kernel <vmlinuz> --initrd <img>] [--change-flavour] [--json]`
 - `recab discard --preparation <id> --revision <n>`
 - `recab inventory --root <dir> [--json]`
+- `recab compare [--json] [--machine-events | --roots <running> <other>]`
 - `recab release import <release.json> [--trusted-local] [--root <dir>]`
 - `recab stage --manifest <release.json> [--trusted-local]`
 - `recab stage --from-media <device|dir> [--trusted-local]`, or `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> --initrd <img> [--change-flavour]`
@@ -184,6 +185,20 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   The label is for the person reading; it identifies nobody and grants nothing.
 - `discard` explicitly abandons the matching ID/revision and removes its entry.
   It does not restore an older rollback or claim the remaining payload is ready.
+- `compare` reads the running system and the other slot and sets them side by
+  side: files and bytes on each side, what is the same, every folder down to
+  three names below `/` with all it holds, and each difference as
+  `only-running`, `only-other`, `content` or `metadata` (a one-sided folder
+  stands for all it holds; at most 5000 are listed, the rest counted in
+  `more`). `etc/fstab` and `usr/lib/recab/immutable` name their own slot and
+  are reported under `own`, not as differences. It changes neither system: it
+  takes the run lock, mounts the other slot read-only without replaying its
+  journal, and unmounts it. `--machine-events` reports `plan`, `step` and
+  `done` as JSON lines on stderr; there is no byte progress yet. It uses the
+  same inventory as `prepare`, so it refuses what that refuses (an unexpected
+  mount inside a system, a special file). `--roots` compares two trees that
+  are mounted already and takes no lock; this is the only form that has been
+  run. The two-slot form has never run on an A/B system.
 - `inventory` reads the complete system tree using path bytes, content digests,
   ownership/mode, xattrs, link relationships, modification times and sparse
   extents. It excludes shared/runtime mount contents and its own generation

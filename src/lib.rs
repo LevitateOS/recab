@@ -15,6 +15,7 @@
 mod candidate;
 mod carry;
 mod change;
+mod compare;
 #[cfg(feature = "contracts")]
 pub mod contract;
 mod efivars;
@@ -65,6 +66,10 @@ pub use target::state_file;
 pub use trial::{trial, TrialOutcome};
 
 pub use change::{change, changes, edit, ChangeProgress, ChangeRequest};
+pub use compare::{
+    compare, compare_roots, ComparedSystem, Comparison, Difference, DifferenceKind, FolderSize, Same,
+    COMPARISON_SCHEMA_VERSION,
+};
 pub use finalize::{finalize, BootSeal, Finalization, FinalizeRequest};
 pub use generation::{Generation, Inventory};
 pub use prepare::{discard, prepare};

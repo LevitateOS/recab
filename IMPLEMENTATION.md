@@ -248,6 +248,10 @@ the library; not run on an A/B system. The generated schemas and the TUI's
 TypeScript were not regenerated then, because P08's unfinished `updates` field
 was open in the same files: run `cargo xtask gen` when that lands.
 
+Also for the front ends, the same day: `recab compare` (`src/compare.rs`), a
+read-only comparison of the two systems from the inventory `prepare` already
+uses. Its types are not registered in `contract.rs` yet, for the same reason.
+
 ## Starting point
 
 The documentation baseline is recab `d5da60b`, with superproject `cceed07` and

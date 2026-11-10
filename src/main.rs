@@ -91,6 +91,17 @@ enum Command {
         #[arg(long)]
         revision: u64,
     },
+    /// Read the running system and the other one and say how alike they are;
+    /// changes neither.
+    Compare {
+        /// Report each step as a JSON line on stderr while reading.
+        #[arg(long)]
+        machine_events: bool,
+        /// Compare two system trees mounted at these paths instead of this
+        /// computer's two slots: the one taken as running, then the other.
+        #[arg(long, num_args = 2, value_names = ["RUNNING", "OTHER"], conflicts_with = "machine_events")]
+        roots: Option<Vec<PathBuf>>,
+    },
     /// Read a complete system inventory without changing it.
     Inventory {
         #[arg(long)]
@@ -374,6 +385,20 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 );
             }
         }
+        Command::Compare {
+            machine_events,
+            roots,
+        } => {
+            let comparison = match roots.as_deref() {
+                Some([running, other]) => recab::compare_roots(running, other)?,
+                _ => recab::compare(machine_events)?,
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string(&comparison)?);
+            } else {
+                print_comparison(&comparison);
+            }
+        }
         Command::Inventory { root } => {
             println!("{}", serde_json::to_string(&recab::inventory(&root)?)?);
         }
@@ -504,6 +529,42 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 /// `Status` as text: every field (no `..`, so a new field cannot be left out).
+fn print_comparison(comparison: &recab::Comparison) {
+    let differing = comparison.differences.len() as u64 + comparison.more;
+    println!(
+        "Running system: {} files, {} bytes",
+        comparison.running.files, comparison.running.bytes
+    );
+    println!(
+        "Other system:   {} files, {} bytes",
+        comparison.other.files, comparison.other.bytes
+    );
+    println!(
+        "The same in both: {} files, {} bytes",
+        comparison.same.files, comparison.same.bytes
+    );
+    if differing == 0 {
+        println!("Nothing differs.");
+        return;
+    }
+    println!("Differences: {differing}");
+    for difference in &comparison.differences {
+        let change = match difference.change {
+            recab::DifferenceKind::OnlyRunning => "only in the running system",
+            recab::DifferenceKind::OnlyOther => "only in the other system",
+            recab::DifferenceKind::Content => "content differs",
+            recab::DifferenceKind::Metadata => "same content",
+        };
+        match &difference.detail {
+            Some(detail) => println!("  {}: {change}; {detail}", difference.path),
+            None => println!("  {}: {change}", difference.path),
+        }
+    }
+    if comparison.more > 0 {
+        println!("  and {} more", comparison.more);
+    }
+}
+
 fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(st)?);
