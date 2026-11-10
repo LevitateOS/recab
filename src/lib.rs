@@ -58,7 +58,8 @@ pub use stage::{StageRequest, StageSource};
 pub use state::Startup;
 pub use state::{Slot, TrialRecord};
 pub use status::{
-    status, Action, ActionView, After, SlotView, Status, Verdict, STATUS_SCHEMA_VERSION,
+    status, Action, ActionView, After, Lifecycle, LifecycleState, OtherSystem, SlotView, Status,
+    Verdict, STATUS_SCHEMA_VERSION,
 };
 pub use target::state_file;
 pub use trial::{trial, TrialOutcome};
@@ -68,7 +69,25 @@ pub use finalize::{finalize, BootSeal, Finalization, FinalizeRequest};
 pub use generation::{Generation, Inventory};
 pub use prepare::{discard, prepare};
 use state::{plan, Request};
-pub use state::{Preparation, PreparationPhase, Readiness, SlotState};
+pub use state::{ChangeRecord, Preparation, PreparationPhase, Readiness, SlotState};
+
+static ACTOR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Names who asked for this run (`--actor`), for the record of changes: a
+/// front end says "person" or names the agent it started. Kept only when it
+/// is a short plain label; it identifies nobody and grants nothing.
+pub fn set_actor(actor: Option<String>) {
+    let plain = actor.filter(|name| {
+        !name.is_empty()
+            && name.len() <= 64
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.: ".contains(&b))
+    });
+    let _ = ACTOR.set(plain);
+}
+
+pub(crate) fn actor() -> Option<String> {
+    ACTOR.get().cloned().flatten()
+}
 use store::Store;
 pub use sync::SyncReport;
 use system::{require_root, System};

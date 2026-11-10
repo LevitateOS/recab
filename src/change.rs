@@ -597,6 +597,13 @@ fn recover(id: Option<&str>, revision: Option<u64>, fresh: bool) -> Result<Chang
         let p = next.preparation.as_mut().unwrap();
         p.change = None;
         p.last_change = Some(progress.clone());
+        p.changes.push(crate::state::ChangeRecord {
+            id: progress.id.clone(),
+            action: progress.action.clone(),
+            package: progress.package.clone(),
+            unix_time: crate::store::now()?,
+            actor: crate::actor(),
+        });
         p.operation = "prepare".into();
         p.phase = PreparationPhase::Prepared;
         p.failure = None;

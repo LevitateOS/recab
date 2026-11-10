@@ -47,7 +47,122 @@ pub struct SlotView {
 }
 
 /// The schema of [`Status`].
-pub const STATUS_SCHEMA_VERSION: u32 = 6;
+pub const STATUS_SCHEMA_VERSION: u32 = 7;
+
+/// Where the two systems stand, in the terms a person is told. recab works
+/// it out here, once, from its own state, so that no front end rebuilds it
+/// from slots and phases and gets it wrong.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    /// The running system is kept; nothing is prepared and no restart is set.
+    #[default]
+    Stable,
+    /// A preparation is open and takes changes. It cannot be started yet.
+    Open,
+    /// A recab command is working on the preparation right now.
+    Working,
+    /// The preparation was left in the middle of an operation and no command
+    /// is running: it must be continued or discarded.
+    Interrupted,
+    /// The candidate is finalized; no restart into it is set.
+    Ready,
+    /// A restart into the other system is set: the next start takes it.
+    RestartSet,
+    /// The running system is a trial that is not kept yet; a restart goes
+    /// back to the one before.
+    OnTrial,
+    /// The candidate was tried, did not start properly, and the computer
+    /// came back. The candidate is still there. Told from the last judged
+    /// trial, which names a slot and not a generation: a candidate finalized
+    /// again since then is still reported this way until it is tried.
+    TrialFailed,
+    /// The installation is incomplete or the state needs recovery; see
+    /// `recovery_reason`.
+    Unusable,
+}
+
+/// What the other system is to the running one.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OtherSystem {
+    /// It holds the same generation: a second copy of the running system.
+    Copy,
+    /// It is the known-good system from before, which rollback returns to.
+    Previous,
+    /// It is being prepared, is finalized, or is set for the next start.
+    Next,
+    /// None of these can be said.
+    #[default]
+    Unknown,
+}
+
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Lifecycle {
+    pub state: LifecycleState,
+    pub other: OtherSystem,
+    /// A recab command holds the run lock right now. `None` when this reader
+    /// may not open the lock file.
+    pub working: Option<bool>,
+}
+
+/// The lifecycle of `state` under `sel`. `working` is whether a command runs
+/// now; `unusable` whether recovery is required; `same_generation` whether
+/// both slots record the same generation.
+fn lifecycle(
+    sel: &Selection,
+    state: &PersistentState,
+    working: Option<bool>,
+    unusable: bool,
+    same_generation: bool,
+) -> Lifecycle {
+    let inactive = sel.active.other();
+    let preparation = state.preparation.as_ref();
+    let other = if preparation.is_some() || sel.oneshot == Some(inactive) {
+        OtherSystem::Next
+    } else if rollback_target(state, sel) == Some(inactive) {
+        OtherSystem::Previous
+    } else if same_generation {
+        OtherSystem::Copy
+    } else {
+        OtherSystem::Unknown
+    };
+    // The last judged trial was of the other slot and was not kept.
+    let trial_failed = state
+        .last_trial
+        .as_ref()
+        .is_some_and(|trial| !trial.committed && trial.slot == inactive);
+    let state = if unusable {
+        LifecycleState::Unusable
+    } else if !committed(state, sel) {
+        LifecycleState::OnTrial
+    } else if let Some(preparation) = preparation {
+        use crate::PreparationPhase::{Prepared, Ready};
+        if working == Some(true) {
+            LifecycleState::Working
+        } else {
+            match preparation.phase {
+                Ready if sel.oneshot.is_some() => LifecycleState::RestartSet,
+                Ready if trial_failed => LifecycleState::TrialFailed,
+                Ready => LifecycleState::Ready,
+                Prepared if preparation.failure.is_none() => LifecycleState::Open,
+                _ => LifecycleState::Interrupted,
+            }
+        }
+    } else if sel.oneshot.is_some() {
+        LifecycleState::RestartSet
+    } else {
+        LifecycleState::Stable
+    };
+    Lifecycle {
+        state,
+        other,
+        working,
+    }
+}
 
 /// A change a person or front end can ask recab for.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
@@ -130,6 +245,9 @@ pub struct Status {
     pub actions: Vec<ActionView>,
     #[serde(default)]
     pub preparation: Option<Preparation>,
+    /// The same facts as one state a person can be told; see [`Lifecycle`].
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
     #[serde(default)]
     pub recovery_reason: Option<String>,
 }
@@ -316,15 +434,22 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
             }
         }
     }
+    let recovery_reason = installation_error.or_else(|| {
+        state
+            .check_mutable()
+            .err()
+            .map(|error| format!("{error:#}"))
+    });
+    let generation_of =
+        |slot: Slot| state.slot(slot).and_then(|record| record.generation.as_ref().map(|g| &g.id));
+    let same_generation =
+        generation_of(sel.active).is_some() && generation_of(sel.active) == generation_of(inactive);
+    let lifecycle = lifecycle(sel, state, sys.store.busy(), recovery_reason.is_some(), same_generation);
     Ok(Status {
+        lifecycle,
         schema_version: STATUS_SCHEMA_VERSION,
         preparation: state.preparation.clone(),
-        recovery_reason: installation_error.or_else(|| {
-            state
-                .check_mutable()
-                .err()
-                .map(|error| format!("{error:#}"))
-        }),
+        recovery_reason,
         scheduled_trial: state.pending_trial_slot,
         actions,
         active_slot: sel.active,

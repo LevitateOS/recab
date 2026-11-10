@@ -22,6 +22,10 @@ struct Cli {
     /// any command that fails prints one JSON error on stderr.
     #[arg(long, global = true)]
     json: bool,
+    /// Who asked for this, recorded with a change: a short label such as
+    /// "person" or "agent:codex". Front ends set it; it grants nothing.
+    #[arg(long, global = true, value_name = "LABEL")]
+    actor: Option<String>,
     #[command(subcommand)]
     cmd: Command,
 }
@@ -223,8 +227,9 @@ enum ReleaseCommand {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let json = cli.json;
+    recab::set_actor(cli.actor.take());
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -521,7 +526,14 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
         slots,
         preparation,
         recovery_reason,
+        lifecycle,
     } = st;
+    println!(
+        "State: {:?}; the other system: {:?}; a command is running: {}",
+        lifecycle.state,
+        lifecycle.other,
+        lifecycle.working.map(yes_no).unwrap_or("not known")
+    );
     if let Some(reason) = recovery_reason {
         println!("Recovery required: {reason}");
     }
@@ -530,6 +542,14 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
             "Preparation: {} slot {} revision {} {:?}",
             preparation.id, preparation.slot, preparation.revision, preparation.phase
         );
+        for change in &preparation.changes {
+            println!(
+                "  change: {} {}{}",
+                change.action,
+                change.package,
+                change.actor.as_ref().map(|actor| format!(" (by {actor})")).unwrap_or_default()
+            );
+        }
     }
     println!("Running slot: {active_slot}");
     println!("Inactive slot (update target): {inactive_slot}");

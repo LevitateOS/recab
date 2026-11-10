@@ -67,6 +67,30 @@ impl Store {
         Ok(Lock { _file: file })
     }
 
+    /// Whether a recab command holds the lock right now. `None` when that
+    /// cannot be told (the lock file cannot be opened by this user). A reader
+    /// uses it to tell work in progress from work that was interrupted.
+    pub fn busy(&self) -> Option<bool> {
+        use std::os::fd::AsRawFd;
+        let file = match fs::File::open(&self.lock_path) {
+            Ok(file) => file,
+            // No lock file: no command has run here, so none runs now.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(false),
+            Err(_) => return None,
+        };
+        // SAFETY: flock on a file descriptor this function owns. A shared,
+        // non-blocking request fails at once while a command holds the
+        // exclusive lock, and is given back at once otherwise.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            return Some(false);
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EWOULDBLOCK) => Some(true),
+            _ => None,
+        }
+    }
+
     /// recab's state, `None` when it has written none here.
     pub fn load(&self) -> Result<Option<PersistentState>> {
         let path = &self.state_path;

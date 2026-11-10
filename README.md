@@ -169,6 +169,19 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   boot record, manifest and artifacts before changing selection. The initramfs
   checks `recab.slot`, root PARTUUID and `recab.generation` against the sealed
   root before starting init, and protects both root devices.
+- `status --json` (schema 7) also says where the two systems stand in one
+  word, so front ends need not work it out from slots and phases:
+  `lifecycle.state` is `stable`, `open`, `working`, `interrupted`, `ready`,
+  `restart_set`, `on_trial`, `trial_failed` or `unusable`; `lifecycle.other`
+  says what the other system is (`copy`, `previous`, `next`, `unknown`);
+  `lifecycle.working` is whether a recab command holds the run lock right now
+  (null when the reader may not open the lock file), which tells work in
+  progress from an interruption. `trial_failed` comes from the last judged
+  trial, which names a slot and not a generation.
+- `preparation.changes` lists every change finished in the preparation, oldest
+  first: its action, package or path, time, and `actor`, the label the caller
+  gave with the global `--actor LABEL` (for example `person` or `agent:codex`).
+  The label is for the person reading; it identifies nobody and grants nothing.
 - `discard` explicitly abandons the matching ID/revision and removes its entry.
   It does not restore an older rollback or claim the remaining payload is ready.
 - `inventory` reads the complete system tree using path bytes, content digests,

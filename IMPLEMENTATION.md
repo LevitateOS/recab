@@ -239,6 +239,15 @@ publishing and P09 release merging remain outstanding.
 
 The starting-point description below records the pre-implementation audit.
 
+Part of P11 was brought forward on 2026-11-10 for the desktop front ends
+(`gui/`): `status --json` schema 7 adds `lifecycle` (one state, what the other
+system is, whether a command runs now), `preparation.changes` (every finished
+change, with the caller's `--actor` label), and the text status prints both.
+It is derived from existing state only and adds no operation. Compiled with
+the library; not run on an A/B system. The generated schemas and the TUI's
+TypeScript were not regenerated then, because P08's unfinished `updates` field
+was open in the same files: run `cargo xtask gen` when that lands.
+
 ## Starting point
 
 The documentation baseline is recab `d5da60b`, with superproject `cceed07` and

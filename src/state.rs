@@ -108,6 +108,23 @@ pub enum PreparationPhase {
     Ready,
     Interrupted,
 }
+/// One finished change of a preparation: what a person reads as "the next
+/// system holds these changes". The reports of a change stay in
+/// [`Preparation::last_change`]; this is the list.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangeRecord {
+    pub id: String,
+    /// `install`, `update`, `remove` or `edit`.
+    pub action: String,
+    /// The recipe's package, or the edited path.
+    pub package: String,
+    pub unix_time: u64,
+    /// Who asked for it, as the caller named itself (`--actor`): a label for
+    /// the person reading, not an authenticated identity.
+    #[serde(default)]
+    pub actor: Option<String>,
+}
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Preparation {
@@ -131,6 +148,9 @@ pub struct Preparation {
     pub change: Option<crate::ChangeProgress>,
     #[serde(default)]
     pub last_change: Option<crate::ChangeProgress>,
+    /// Every change finished in this preparation, oldest first.
+    #[serde(default)]
+    pub changes: Vec<ChangeRecord>,
 }
 
 /// What recab keeps in its state file.
@@ -644,6 +664,7 @@ pub(crate) fn plan(
                 finalization: None,
                 change: None,
                 last_change: None,
+                changes: Vec::new(),
             });
             Transition {
                 operation: Operation::Prepare(inactive),
@@ -749,6 +770,7 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {inactive}."
                 finalization: None,
                 change: None,
                 last_change: None,
+                changes: Vec::new(),
             });
             next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
             next.slot_mut(inactive)?.generation = None;
