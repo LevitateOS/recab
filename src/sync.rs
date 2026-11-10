@@ -738,93 +738,97 @@ impl Synchronization {
                 filesystem::flush(&self.destination)?;
                 removed = false;
             }
-            match op {
-                Operation::Remove(p) => {
-                    let e = entry(&self.destination, p)?;
-                    if let Some(m) = e.metadata()? {
-                        if m.is_dir() {
-                            fs::remove_dir(e.path())?;
-                        } else {
-                            fs::remove_file(e.path())?;
-                        }
-                        report.entries_removed += 1;
-                        removed = true;
-                    }
-                }
-                Operation::Directory(p) => {
-                    let e = entry(&self.destination, p)?;
-                    if e.metadata()?.is_none() {
-                        fs::create_dir(e.path())?;
-                        report.files_created += 1;
-                        if !wanted.contains_key(p.as_slice()) {
-                            let mode = self
-                                .source
-                                .metadata(path(p))?
-                                .context("mount root disappeared")?
-                                .mode()
-                                & 0o7777;
-                            fs::set_permissions(e.path(), fs::Permissions::from_mode(mode))?;
+            (|| -> Result<()> {
+                match op {
+                    Operation::Remove(p) => {
+                        let e = entry(&self.destination, p)?;
+                        if let Some(m) = e.metadata()? {
+                            if m.is_dir() {
+                                fs::remove_dir(e.path())?;
+                            } else {
+                                fs::remove_file(e.path())?;
+                            }
+                            report.entries_removed += 1;
+                            removed = true;
                         }
                     }
-                    let m = e.metadata()?.unwrap();
-                    if !m.is_dir() {
-                        return Err(refuse("directory target has an incompatible type"));
-                    }
-                }
-                Operation::File(p) => self.file(
-                    wanted[p.as_slice()],
-                    actual.get(p.as_slice()).copied(),
-                    &mut report,
-                )?,
-                Operation::Symlink(p) => {
-                    let node = wanted[p.as_slice()];
-                    let e = entry(&self.destination, p)?;
-                    let detach = match e.metadata()? {
-                        Some(m) if !self.safe_aliases(node, &m)? => {
-                            !metadata_matches(node, &e)?
-                                || actual
-                                    .get(p.as_slice())
-                                    .is_some_and(|old| old.hardlink != node.hardlink)
+                    Operation::Directory(p) => {
+                        let e = entry(&self.destination, p)?;
+                        if e.metadata()?.is_none() {
+                            fs::create_dir(e.path())?;
+                            report.files_created += 1;
+                            if !wanted.contains_key(p.as_slice()) {
+                                let mode = self
+                                    .source
+                                    .metadata(path(p))?
+                                    .context("mount root disappeared")?
+                                    .mode()
+                                    & 0o7777;
+                                fs::set_permissions(e.path(), fs::Permissions::from_mode(mode))?;
+                            }
                         }
-                        _ => false,
-                    };
-                    if detach
-                        || fs::read_link(e.path())
-                            .ok()
-                            .as_ref()
-                            .map(|p| p.as_os_str().as_bytes())
-                            != node.link.as_deref()
-                    {
-                        remove_leaf(&e)?;
-                        std::os::unix::fs::symlink(
-                            std::ffi::OsStr::from_bytes(
-                                node.link.as_deref().context("symlink target missing")?,
-                            ),
-                            e.path(),
-                        )?;
-                        report.links_created += 1;
+                        let m = e.metadata()?.unwrap();
+                        if !m.is_dir() {
+                            return Err(refuse("directory target has an incompatible type"));
+                        }
                     }
-                }
-                Operation::Link(p) => {
-                    let node = wanted[p.as_slice()];
-                    let target = entry(&self.destination, p)?;
-                    let leader = entry(&self.destination, node.hardlink.as_ref().unwrap())?;
-                    let a = leader.metadata()?.context("hardlink leader missing")?;
-                    if !target
-                        .metadata()?
-                        .is_some_and(|b| a.ino() == b.ino() && a.dev() == b.dev())
-                    {
-                        remove_leaf(&target)?;
-                        fs::hard_link(leader.path(), target.path())?;
-                        report.links_created += 1;
+                    Operation::File(p) => self.file(
+                        wanted[p.as_slice()],
+                        actual.get(p.as_slice()).copied(),
+                        &mut report,
+                    )?,
+                    Operation::Symlink(p) => {
+                        let node = wanted[p.as_slice()];
+                        let e = entry(&self.destination, p)?;
+                        let detach = match e.metadata()? {
+                            Some(m) if !self.safe_aliases(node, &m)? => {
+                                !metadata_matches(node, &e)?
+                                    || actual
+                                        .get(p.as_slice())
+                                        .is_some_and(|old| old.hardlink != node.hardlink)
+                            }
+                            _ => false,
+                        };
+                        if detach
+                            || fs::read_link(e.path())
+                                .ok()
+                                .as_ref()
+                                .map(|p| p.as_os_str().as_bytes())
+                                != node.link.as_deref()
+                        {
+                            remove_leaf(&e)?;
+                            std::os::unix::fs::symlink(
+                                std::ffi::OsStr::from_bytes(
+                                    node.link.as_deref().context("symlink target missing")?,
+                                ),
+                                e.path(),
+                            )?;
+                            report.links_created += 1;
+                        }
                     }
+                    Operation::Link(p) => {
+                        let node = wanted[p.as_slice()];
+                        let target = entry(&self.destination, p)?;
+                        let leader = entry(&self.destination, node.hardlink.as_ref().unwrap())?;
+                        let a = leader.metadata()?.context("hardlink leader missing")?;
+                        if !target
+                            .metadata()?
+                            .is_some_and(|b| a.ino() == b.ino() && a.dev() == b.dev())
+                        {
+                            remove_leaf(&target)?;
+                            fs::hard_link(leader.path(), target.path())?;
+                            report.links_created += 1;
+                        }
+                    }
+                    Operation::Metadata(p) => metadata(
+                        wanted[p.as_slice()],
+                        &entry(&self.destination, p)?,
+                        &mut report,
+                    )?,
                 }
-                Operation::Metadata(p) => metadata(
-                    wanted[p.as_slice()],
-                    &entry(&self.destination, p)?,
-                    &mut report,
-                )?,
-            }
+                Ok(())
+            })()
+            .with_context(|| format!("applying synchronization operation {op:?}"))?;
         }
         filesystem::flush(&self.destination)?;
         Ok(report)

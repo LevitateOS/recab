@@ -38,7 +38,9 @@ fn trial_service_path(init: InitSystem) -> &'static str {
 /// The link that enables the trial service, relative to the root.
 pub fn trial_service_link(init: InitSystem) -> String {
     match init {
-        InitSystem::Systemd => format!("etc/systemd/system/{SYSTEMD_WANTED_BY}.wants/recab-trial.service"),
+        InitSystem::Systemd => {
+            format!("etc/systemd/system/{SYSTEMD_WANTED_BY}.wants/recab-trial.service")
+        }
         InitSystem::Openrc => format!("etc/runlevels/{OPENRC_RUNLEVEL}/recab-trial"),
     }
 }
@@ -53,9 +55,15 @@ fn render(template: &str, values: &[(&str, &str)]) -> Result<String> {
     let mut rest = text.as_str();
     while let Some(start) = rest.find('@') {
         let after = &rest[start + 1..];
-        let name_len = after.bytes().take_while(|b| b.is_ascii_uppercase() || *b == b'_').count();
+        let name_len = after
+            .bytes()
+            .take_while(|b| b.is_ascii_uppercase() || *b == b'_')
+            .count();
         if name_len > 0 && after[name_len..].starts_with('@') {
-            return Err(refuse(format!("the trial service template has an unfilled @{}@", &after[..name_len])));
+            return Err(refuse(format!(
+                "the trial service template has an unfilled @{}@",
+                &after[..name_len]
+            )));
         }
         rest = after;
     }
@@ -69,10 +77,18 @@ pub(crate) fn write(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
         InitSystem::Systemd => (SYSTEMD_UNIT, 0o644),
         InitSystem::Openrc => (OPENRC_SERVICE, 0o755),
     };
-    let name = Path::new(bin).file_name().and_then(|n| n.to_str()).unwrap_or("recab");
+    let name = Path::new(bin)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recab");
     let text = render(
         template,
-        &[("RECAB", bin), ("NAME", name), ("DESCRIPTION", DESCRIPTION), ("WANTED_BY", SYSTEMD_WANTED_BY)],
+        &[
+            ("RECAB", bin),
+            ("NAME", name),
+            ("DESCRIPTION", DESCRIPTION),
+            ("WANTED_BY", SYSTEMD_WANTED_BY),
+        ],
     )?;
     let path = root.join(trial_service_path(init));
     target_root::write_durable(&path, text.as_bytes(), Some(mode))
@@ -90,5 +106,7 @@ pub(crate) fn write(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
 
     let list = root.join(CARRIED_LIST);
     target_root::write_durable(&list, CARRIED.as_bytes(), Some(0o644))
-        .with_context(|| format!("writing '{}'", list.display()))
+        .with_context(|| format!("writing '{}'", list.display()))?;
+    crate::runtime::Policy::check(root, init)?.apply(root)?;
+    crate::runtime::package_runtime(root, bin)
 }

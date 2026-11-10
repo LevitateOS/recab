@@ -110,7 +110,9 @@ fn os_release(root: &Path, file: Option<PathBuf>) -> Result<(String, PathBuf)> {
             let opened = crate::filesystem::Root::open(root)?;
             let text = match opened.optional_text(Path::new("etc/os-release"))? {
                 Some(text) => text,
-                None => opened.optional_text(Path::new("usr/lib/os-release"))?.ok_or_else(missing)?,
+                None => opened
+                    .optional_text(Path::new("usr/lib/os-release"))?
+                    .ok_or_else(missing)?,
             };
             Ok((text, under(root, "etc/os-release")))
         }
@@ -121,7 +123,8 @@ impl Target {
     /// The running system, with the `RECAB_*` overrides.
     pub fn running() -> Result<Self> {
         let root = path("RECAB_ROOT", "/");
-        let (os_release, os_release_path) = os_release(&root, var("RECAB_OS_RELEASE_PATH").map(PathBuf::from))?;
+        let (os_release, os_release_path) =
+            os_release(&root, var("RECAB_OS_RELEASE_PATH").map(PathBuf::from))?;
         let efi_dir = path("RECAB_SYS_FIRMWARE_EFI_PATH", "/sys/firmware/efi");
         let program = |name: &str, default: &str| var(name).unwrap_or_else(|| default.to_string());
         Ok(Self {
@@ -184,7 +187,9 @@ impl Target {
 
     /// This machine's mount table.
     pub fn mount_table(&self) -> Result<Vec<target_root::Mount>> {
-        Ok(target_root::mount_table_at(&self.proc_dir.join("self/mountinfo"))?)
+        Ok(target_root::mount_table_at(
+            &self.proc_dir.join("self/mountinfo"),
+        )?)
     }
 
     /// Where `stage` mounts `what` (`media`, `image`, `slot-a`).
@@ -196,8 +201,19 @@ impl Target {
     /// names the entries by it and every reader finds them by it.
     pub fn entry_prefix(&self) -> Result<String> {
         os_release_value(&self.os_release, "ID")
+            .filter(|id| {
+                !id.is_empty()
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            })
             .map(|id| id.to_ascii_lowercase())
-            .ok_or_else(|| refuse(format!("'{}' has no ID, which names the boot entries", self.os_release_path.display())))
+            .ok_or_else(|| {
+                refuse(format!(
+                    "'{}' has no ID, which names the boot entries",
+                    self.os_release_path.display()
+                ))
+            })
     }
 
     /// The os-release `NAME` (entry titles), else its `ID`.
@@ -230,5 +246,10 @@ impl Target {
 pub(crate) fn partuuid(device: &Path) -> Result<String> {
     target_root::partuuid(device)
         .with_context(|| format!("reading the PARTUUID of '{}'", device.display()))?
-        .ok_or_else(|| refuse(format!("'{}' has no PARTUUID; root partitions must be GPT partitions", device.display())))
+        .ok_or_else(|| {
+            refuse(format!(
+                "'{}' has no PARTUUID; root partitions must be GPT partitions",
+                device.display()
+            ))
+        })
 }

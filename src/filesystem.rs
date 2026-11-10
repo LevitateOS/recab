@@ -96,7 +96,7 @@ impl Root {
         Ok(names)
     }
 
-    pub fn optional_text(&self, relative: &Path) -> Result<Option<String>> {
+    pub fn open_resolved(&self, relative: &Path) -> Result<Option<File>> {
         #[repr(C)]
         struct How {
             flags: u64,
@@ -139,12 +139,32 @@ impl Root {
         if !file.metadata()?.is_file() {
             bail!("'{}' is not a regular system file", relative.display());
         }
+        Ok(Some(file))
+    }
+
+    pub fn optional_text(&self, relative: &Path) -> Result<Option<String>> {
+        let Some(file) = self.open_resolved(relative)? else {
+            return Ok(None);
+        };
         let mut text = String::new();
         file.take(64 * 1024 * 1024 + 1).read_to_string(&mut text)?;
         if text.len() > 64 * 1024 * 1024 {
             bail!("system text file exceeds 64 MiB");
         }
         Ok(Some(text))
+    }
+
+    pub fn resolved_path(&self, file: &File) -> Result<PathBuf> {
+        let base = fs::read_link(format!("/proc/self/fd/{}", self.0.as_raw_fd()))?;
+        let location = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+        Ok(location.strip_prefix(base)?.to_path_buf())
+    }
+
+    pub fn location(&self) -> Result<PathBuf> {
+        Ok(fs::read_link(format!(
+            "/proc/self/fd/{}",
+            self.0.as_raw_fd()
+        ))?)
     }
 
     pub fn device(&self) -> Result<u64> {

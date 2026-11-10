@@ -12,19 +12,23 @@
 //! installed ESP (writes and reads entries, loader.conf and the boot
 //! selection); `store` keeps recab's state and audit log.
 
+mod candidate;
 mod carry;
 #[cfg(feature = "contracts")]
 pub mod contract;
 mod efivars;
+mod elf;
 mod entry;
 mod error;
 mod filesystem;
+mod finalize;
 mod generation;
 mod immutable;
 mod init;
 mod init_system;
 mod package;
 mod prepare;
+mod runtime;
 mod slot_mount;
 mod stage;
 mod state;
@@ -56,6 +60,7 @@ pub use status::{
 pub use target::state_file;
 pub use trial::{trial, TrialOutcome};
 
+pub use finalize::{finalize, BootSeal, Finalization, FinalizeRequest};
 pub use generation::{Generation, Inventory};
 pub use prepare::{discard, prepare};
 use state::{plan, Request};
@@ -141,11 +146,15 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
         }
     };
     let record = next.slot_mut(slot)?;
+    let has_initrd = generation.initrd_digest.is_some();
     record.generation = Some(generation);
-    record.readiness = Readiness::Ready;
+    record.readiness = Readiness::Incomplete;
+    record.seal = None;
     if let Some(preparation) = &mut next.preparation {
-        preparation.phase = PreparationPhase::Ready;
-        preparation.completed_steps = 1;
+        preparation.phase = PreparationPhase::Prepared;
+        preparation.operation = "prepare".into();
+        preparation.synchronized = true;
+        preparation.completed_steps = 2;
         preparation.revision += 1;
     }
     sys.store.save(&next).map_err(|err| {
@@ -155,7 +164,25 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
                 "slot {slot} was written but its generation completion was not recorded: {err:#}"
             ),
         )
-    })
+    })?;
+    let preparation = next.preparation.as_ref().unwrap();
+    let request = FinalizeRequest {
+        preparation: Some(preparation.id.clone()),
+        revision: Some(preparation.revision),
+        kernel: Some(
+            sys.backend
+                .kernel_dir(&sys.boot, slot)
+                .join(entry::KERNEL_FILE),
+        ),
+        initrd: has_initrd.then(|| {
+            sys.backend
+                .kernel_dir(&sys.boot, slot)
+                .join(entry::INITRD_FILE)
+        }),
+        change_flavour,
+    };
+    drop(sys);
+    finalize(&request).map(|_| ())
 }
 
 /// Schedule one trial boot of the inactive `slot`.

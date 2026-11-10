@@ -21,8 +21,25 @@ impl SlotMount {
             return Err(refuse("cannot mount the active slot writable"));
         }
         let uuid = sys.backend.slot_partuuid(&sys.boot, slot)?;
-        let device = target_root::device_with_tag("PARTUUID", &uuid)?
-            .context("inactive partition is not present")?;
+        let output = std::process::Command::new("blkid")
+            .args([
+                "-c",
+                "/dev/null",
+                "-t",
+                &format!("PARTUUID={uuid}"),
+                "-o",
+                "device",
+            ])
+            .output()?;
+        let paths = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .collect::<Vec<_>>();
+        if paths.len() != 1 || !output.status.success() {
+            return Err(refuse(
+                "inactive PARTUUID must identify exactly one block device",
+            ));
+        }
+        let device = std::path::PathBuf::from(paths[0]);
         let device = fs::canonicalize(device)?;
         let file = OpenOptions::new()
             .read(true)
@@ -120,6 +137,13 @@ impl SlotMount {
         }
         Ok(())
     }
+    pub fn seal(mut self) -> Result<()> {
+        if let Some(mounted) = self.mounted.take() {
+            mounted.unmount()?;
+        }
+        self.was_readonly = true;
+        self.set_readonly(true)
+    }
     pub fn close(mut self) -> Result<()> {
         if let Some(mounted) = self.mounted.take() {
             mounted.unmount()?;
@@ -136,6 +160,80 @@ impl Drop for SlotMount {
         if self.was_readonly {
             if let Err(error) = self.set_readonly(true) {
                 eprintln!("recab: warning: {error:#}");
+            }
+        }
+    }
+}
+
+/// Destructive legacy staging uses the same checked inactive-device boundary.
+/// Its guard restores protection even when extraction or validation fails.
+pub(crate) struct StageDevice {
+    device: File,
+    was_readonly: bool,
+}
+impl StageDevice {
+    pub fn open(
+        target: &crate::target::Target,
+        path: &std::path::Path,
+        uuid: &str,
+    ) -> Result<Self> {
+        let device = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(fs::canonicalize(path)?)?;
+        let meta = device.metadata()?;
+        let pinned = PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            device.as_raw_fd()
+        ));
+        if !meta.file_type().is_block_device()
+            || crate::target::partuuid(&pinned)? != uuid
+            || meta.rdev() == fs::metadata(&target.root)?.dev()
+        {
+            return Err(refuse(
+                "staging device is not the checked inactive partition",
+            ));
+        }
+        if target_root::mount_table_at(std::path::Path::new("/proc/self/mountinfo"))?
+            .iter()
+            .any(|m| libc::makedev(m.dev.0, m.dev.1) == meta.rdev())
+        {
+            return Err(refuse("staging partition is already mounted"));
+        }
+        let mut readonly: libc::c_int = 0;
+        if unsafe { libc::ioctl(device.as_raw_fd(), 0x125e, &mut readonly) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let guard = Self {
+            device,
+            was_readonly: readonly != 0,
+        };
+        if guard.was_readonly {
+            let value: libc::c_int = 0;
+            if unsafe { libc::ioctl(guard.device.as_raw_fd(), 0x125d, &value) } < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(guard)
+    }
+    pub fn path(&self) -> PathBuf {
+        PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            self.device.as_raw_fd()
+        ))
+    }
+}
+impl Drop for StageDevice {
+    fn drop(&mut self) {
+        if self.was_readonly {
+            let value: libc::c_int = 1;
+            if unsafe { libc::ioctl(self.device.as_raw_fd(), 0x125d, &value) } < 0 {
+                eprintln!(
+                    "recab: warning: restoring staged device protection failed: {}",
+                    std::io::Error::last_os_error()
+                );
             }
         }
     }

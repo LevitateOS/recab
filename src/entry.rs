@@ -175,6 +175,36 @@ impl Entry {
         self.set_options(options);
     }
 
+    pub fn set_slot(&mut self, slot: crate::Slot) {
+        let mut options = self
+            .options()
+            .into_iter()
+            .filter(|o| !o.starts_with("recab.slot="))
+            .collect::<Vec<_>>();
+        options.push(format!("recab.slot={slot}"));
+        self.set_options(options);
+    }
+    pub fn set_artifacts(&mut self, kernel: &str, initrd: &str) {
+        self.replace_keys(
+            &["linux", "efi", "initrd"],
+            vec![format!("linux /{kernel}"), format!("initrd /{initrd}")],
+        );
+    }
+    pub fn artifacts(&self) -> anyhow::Result<(String, Option<String>)> {
+        let kernels = self.values("linux").collect::<Vec<_>>();
+        let initrds = self.values("initrd").collect::<Vec<_>>();
+        if kernels.len() != 1 || initrds.len() > 1 || self.values("efi").next().is_some() {
+            return Err(crate::error::refuse(
+                "generation entry needs one kernel and at most one initramfs",
+            ));
+        }
+        Ok((
+            kernels[0].trim_start_matches('/').to_string(),
+            initrds
+                .first()
+                .map(|p| p.trim_start_matches('/').to_string()),
+        ))
+    }
     /// The files the entry loads from the ESP.
     pub fn boot_files(&self) -> Vec<String> {
         BOOT_FILE_KEYS

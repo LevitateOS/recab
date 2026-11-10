@@ -1,9 +1,8 @@
 //! `recab stage`: write a prebuilt system into the inactive slot. Every
 //! check runs first ([`check`]) and yields a [`StagePlan`]; only [`write`]
 //! changes anything. It makes the slot unbootable (its kernel goes), formats
-//! and fills the partition, carries the machine's state, and installs the
-//! kernel and entry last, so an interrupted stage never leaves a half-written
-//! slot bootable.
+//! and fills the partition, carries the machine's state, and saves boot inputs.
+//! The shared finalizer validates/seals the root and publishes the entry last.
 
 use anyhow::{Context, Result};
 use distro_profile::{os_release_fact, os_release_value, Flavour, InitSystem};
@@ -57,8 +56,6 @@ pub(crate) struct StagePlan {
     /// Files written into the new slot as prepared: merged account files
     /// and the fstab, with their mode.
     prepared: Vec<(String, String, u32)>,
-    /// The image's init system (the running system's).
-    init: InitSystem,
     state_partition: String,
     /// The release medium, mounted until the slot is written.
     _medium: Option<Mounted>,
@@ -168,7 +165,7 @@ pub(crate) fn check(
             .saturating_add(16 * 1024 * 1024);
         check_inode_capacity(
             slot,
-            &device,
+            slot_bytes,
             image_entries
                 .saturating_add(carried_entries)
                 .saturating_add(128),
@@ -186,7 +183,6 @@ pub(crate) fn check(
             baseline,
             carry,
             prepared,
-            init: image.init,
             state_partition,
             _medium: medium,
         })
@@ -342,7 +338,6 @@ fn check_partition(
 
 /// What a stage needs from the image itself.
 struct Image {
-    init: InitSystem,
     list: Vec<Carry>,
     /// Each account file the list names: path, the image's text, its mode.
     accounts: Vec<(String, String, u32)>,
@@ -412,7 +407,6 @@ or pass --change-flavour to change this machine to the {staged} system",
         }
     }
     Ok(Image {
-        init,
         list,
         accounts,
     })
@@ -472,12 +466,7 @@ pub(crate) fn write(target: &Target, plan: StagePlan, write: SlotWrite) -> Resul
         )
     })?;
     write
-        .finish(
-            &plan.kernel,
-            plan.initrd.as_deref(),
-            plan.init,
-            &generation.id,
-        )
+        .finish(&plan.kernel, plan.initrd.as_deref())
         .map_err(|err| {
             classified(
                 ErrorClass::PartialUpdate,
@@ -488,9 +477,10 @@ pub(crate) fn write(target: &Target, plan: StagePlan, write: SlotWrite) -> Resul
 }
 
 fn fill(target: &Target, plan: &StagePlan) -> Result<Generation> {
+    let device = crate::slot_mount::StageDevice::open(target, &plan.device, &plan.partuuid)?;
     let role = slot_role(plan.slot);
     let (program, mut args) = role.filesystem().mkfs(role.label());
-    args.push(plan.device.display().to_string());
+    args.push(device.path().display().to_string());
     target_root::run(Command::new(program).args(&args))?;
 
     let point = target.stage_mount(&format!(
@@ -498,7 +488,7 @@ fn fill(target: &Target, plan: &StagePlan) -> Result<Generation> {
         plan.slot.to_string().to_ascii_lowercase()
     ));
     fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
-    let mounted = Mounted::new(target, &[], &plan.device, &point)?;
+    let mounted = Mounted::new(target, &[], &device.path(), &point)?;
     target_root::run(
         Command::new(&target.programs.recstrap)
             .args(["--quiet", "--rootfs"])
@@ -545,6 +535,7 @@ fn fill(target: &Target, plan: &StagePlan) -> Result<Generation> {
         &target.state_dir,
     )?;
     generation.mark(&point, plan.slot, &plan.partuuid)?;
+    drop(destination);
     sync_filesystem(&point)?;
     mounted.unmount()?;
     Ok(generation)
@@ -575,7 +566,15 @@ fn expanded_usage(root: &Path) -> Result<(u64, u64)> {
     }
     walk(&Root::open(root)?, Path::new(""))
 }
-fn check_inode_capacity(slot: Slot, device: &Path, required: u64) -> Result<()> {
+fn check_inode_capacity(slot: Slot, bytes: u64, required: u64) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // mke2fs opens even a -n target writable. Probe identical geometry on an
+    // anonymous sparse file so preflight never unlocks the real fallback.
+    let fd = unsafe { libc::memfd_create(c"recab-mkfs-preflight".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
+    let probe = unsafe { fs::File::from_raw_fd(fd) };
+    probe.set_len(bytes)?;
+    let path = format!("/proc/{}/fd/{}", std::process::id(), probe.as_raw_fd());
     let role = slot_role(slot);
     let (program, args) = role.filesystem().mkfs(role.label());
     // -n computes the same filesystem geometry without writing the device.
@@ -583,7 +582,7 @@ fn check_inode_capacity(slot: Slot, device: &Path, required: u64) -> Result<()> 
         Command::new(program)
             .args(args)
             .arg("-n")
-            .arg(device)
+            .arg(path)
             .env("LC_ALL", "C"),
     )?;
     let output = format!(

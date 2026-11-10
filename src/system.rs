@@ -86,6 +86,8 @@ impl System {
             _ => None,
         };
         if let Some(slot) = slot {
+            crate::filesystem::private_mounts()?;
+            crate::finalize::verify_slot(self, slot)?;
             self.backend
                 .verify_generation(&self.boot, slot, self.state.require_ready(slot)?)?;
         }
@@ -110,10 +112,12 @@ impl System {
         }
         let name = transition.operation.name();
         if let Some(change) = transition.boot {
+            crate::filesystem::private_mounts()?;
             let slot = match change {
                 crate::state::BootChange::OneShot(slot)
                 | crate::state::BootChange::Default(slot) => slot,
             };
+            crate::finalize::verify_slot(self, slot)?;
             self.backend.verify_generation(
                 &self.boot,
                 slot,
@@ -124,6 +128,7 @@ impl System {
                 .map_err(|err| select_failed(name, err))?;
         }
         let mut next = transition.next.clone();
+        next.schema = crate::state::StateSchema::default();
         next.last_operation = Some(transition.operation.label());
         next.last_transition_unix = Some(now()?);
         self.store.save(&next).map_err(|err| {

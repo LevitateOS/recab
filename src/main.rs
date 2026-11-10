@@ -14,11 +14,11 @@ use recpart::types::InstallMode;
 #[command(about = "Manage system updates and rollback with two root slots (A/B)")]
 #[command(version)]
 #[command(
-    after_help = "Common tasks:\n  recab status                    Show the running slot and next boot\n  recab status --root /mnt         Inspect an installed target\n  recab stage --from-media /media  Write an update to the inactive slot\n  recab set-next B                 Schedule one trial boot of slot B\n  recab rollback                  Select the known-good slot for next boot\n\nA/B keeps two system copies. stage formats the inactive slot; set-next selects\na trial boot. The trial service commits a healthy boot automatically.\nRead 'recab status' before choosing a slot. Add --json for structured status."
+    after_help = "Common tasks:\n  recab status                    Show the running slot and next boot\n  recab status --root /mnt         Inspect an installed target\n  recab prepare                   Continue the running system in the inactive slot\n  recab finalize                  Validate, seal and publish that candidate\n  recab stage --from-media /media  Replace the inactive slot from release media\n  recab set-next B                 Schedule one trial boot of slot B\n  recab rollback                  Select the known-good slot for next boot\n\nA/B keeps two system copies. prepare synchronizes differences; finalize seals\nthe candidate; set-next selects a trial boot. stage replaces the inactive slot. The trial service commits a healthy boot automatically.\nRead 'recab status' before choosing a slot. Add --json for structured status."
 )]
 struct Cli {
-    /// Machine-readable output: `status` and `health` print JSON, and any
-    /// command that fails prints its error as one JSON object on stderr.
+    /// Print structured status, health, inventory, preparation and finalization;
+    /// any command that fails prints one JSON error on stderr.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -27,6 +27,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Validate, flush and seal the candidate, then publish its immutable boot entry.
+    Finalize {
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+        #[arg(long, requires = "initrd")]
+        kernel: Option<PathBuf>,
+        #[arg(long, requires = "kernel")]
+        initrd: Option<PathBuf>,
+        #[arg(long)]
+        change_flavour: bool,
+    },
     /// Synchronize the inactive slot in place, or reopen its existing preparation.
     Prepare {
         #[arg(long, requires = "revision")]
@@ -178,6 +191,27 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
+        Command::Finalize {
+            preparation,
+            revision,
+            kernel,
+            initrd,
+            change_flavour,
+        } => {
+            let result = recab::finalize(&recab::FinalizeRequest {
+                preparation,
+                revision,
+                kernel,
+                initrd,
+                change_flavour,
+            })?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                println!("Finalized generation {}: {} boot payload bytes written, {} files reused. Ready for a trial boot.",result.generation.id,result.boot_bytes_written,result.reused_boot_files);
+                if !result.accounting_complete { println!("Earlier interrupted writes are unknown; counters cover the completed attempt."); }
+            }
+        }
         Command::Prepare {
             preparation,
             revision,
@@ -191,7 +225,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     preparation.id, preparation.slot, preparation.revision, preparation.phase
                 );
                 if let Some(report) = preparation.synchronization {
-                    println!("Last synchronization: {} payload bytes written in {} ranges; {} metadata updates. Boot finalization is still required.", report.payload_bytes_written, report.range_writes, report.metadata_updates);
+                    println!("Last synchronization: {} payload bytes written in {} ranges; {} metadata updates. Finalize before trial boot.", report.payload_bytes_written, report.range_writes, report.metadata_updates);
                     if !report.accounting_complete {
                         println!("Earlier interrupted writes are unknown; counters cover the completed attempt.");
                     }
@@ -387,6 +421,9 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
         generation,
         readiness,
         generation_ready,
+        seal,
+        kernel,
+        initrd,
     } in slots
     {
         println!(
@@ -398,6 +435,15 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
             readiness,
             yes_no(*generation_ready)
         );
+        if let Some(seal) = seal {
+            println!(
+                "slot {slot}: sealed {} {}, kernel {}, initramfs {}",
+                seal.architecture,
+                seal.kernel_release,
+                kernel.as_deref().unwrap_or("none"),
+                initrd.as_deref().unwrap_or("none")
+            );
+        }
         println!(
             "slot {slot}: entry {entry}, kernel /{boot_dir}, root {}, device {}, bootable {}, trial options {}",
             root.as_deref().unwrap_or("none"),

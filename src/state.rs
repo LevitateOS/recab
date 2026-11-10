@@ -72,7 +72,7 @@ pub(crate) enum StateSchema {
 }
 impl Default for StateSchema {
     fn default() -> Self {
-        Self::Current { major: 2, minor: 1 }
+        Self::Current { major: 2, minor: 2 }
     }
 }
 
@@ -93,6 +93,8 @@ pub struct SlotState {
     pub partuuid: String,
     pub generation: Option<Generation>,
     pub readiness: Readiness,
+    #[serde(default)]
+    pub seal: Option<crate::BootSeal>,
 }
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +104,7 @@ pub enum PreparationPhase {
     AwaitingSynchronization,
     Prepared,
     Staging,
+    Finalizing,
     Ready,
     Interrupted,
 }
@@ -122,6 +125,8 @@ pub struct Preparation {
     pub synchronized: bool,
     #[serde(default)]
     pub synchronization: Option<crate::SyncReport>,
+    #[serde(default)]
+    pub finalization: Option<crate::Finalization>,
 }
 
 /// What recab keeps in its state file.
@@ -161,7 +166,7 @@ impl PersistentState {
             StateSchema::Legacy(1)
             | StateSchema::Current {
                 major: 2,
-                minor: 0 | 1,
+                minor: 0 | 1 | 2,
             } => Ok(()),
             _ => Err("unsupported recab state format; use a compatible recovery tool".into()),
         }
@@ -215,6 +220,18 @@ impl PersistentState {
                 && record.generation.is_none()
             {
                 return Err(refuse("a complete slot has no generation identity"));
+            }
+        }
+        for record in &self.slots {
+            if let Some(seal) = &record.seal {
+                if record
+                    .generation
+                    .as_ref()
+                    .is_none_or(|g| g.id != seal.generation)
+                    || seal.protocol != 3
+                {
+                    return Err(refuse("slot seal does not match its generation/protocol"));
+                }
             }
         }
         for slot in [self.known_good_slot, self.previous_good_slot]
@@ -373,6 +390,10 @@ pub(crate) enum Request {
         id: String,
         revision: u64,
     },
+    Finalize {
+        expected_id: Option<String>,
+        expected_revision: Option<u64>,
+    },
 }
 
 /// A state transition; its names are used in the state file and audit log.
@@ -383,6 +404,7 @@ pub(crate) enum Operation {
     Stage(Slot),
     Prepare(Slot),
     Discard(Slot),
+    Finalize(Slot),
     SetNext(Slot),
     Commit(Slot),
     Rollback(Slot),
@@ -399,6 +421,7 @@ impl Operation {
             Operation::Stage(_) => "stage",
             Operation::Prepare(_) => "prepare",
             Operation::Discard(_) => "discard",
+            Operation::Finalize(_) => "finalize",
             Operation::SetNext(_) => "set-next",
             Operation::Commit(_) => "commit",
             Operation::Rollback(_) => "rollback",
@@ -413,6 +436,7 @@ impl Operation {
             | Operation::Stage(slot)
             | Operation::Prepare(slot)
             | Operation::Discard(slot)
+            | Operation::Finalize(slot)
             | Operation::SetNext(slot)
             | Operation::Commit(slot)
             | Operation::Rollback(slot)
@@ -471,6 +495,11 @@ pub(crate) fn plan(
         }
         Request::SetNext(slot) => {
             let generation = state.require_ready(slot)?;
+            if state.slot(slot).unwrap().seal.is_none() {
+                return Err(refuse(
+                    "candidate must be finalized before scheduling a trial",
+                ));
+            }
             if !committed(state, sel) {
                 return Err(refuse(format!(
                     "slot {active} is running uncommitted and slot {slot} is the known-good slot; run 'recab commit' to keep slot {active}, or 'recab rollback' to return to slot {slot}"
@@ -552,13 +581,17 @@ pub(crate) fn plan(
                     expected_id.as_deref(),
                     expected_revision,
                 )?;
-                if preparation.phase == PreparationPhase::Ready {
+                if preparation.phase == PreparationPhase::Ready
+                    || (preparation.operation == "finalize" && preparation.synchronized)
+                {
                     let reopened = next.preparation.as_mut().unwrap();
                     reopened.phase = PreparationPhase::Prepared;
                     reopened.operation = "prepare".into();
                     reopened.synchronized = true;
+                    reopened.finalization = None;
                     reopened.revision += 1;
                     next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
+                    next.slot_mut(inactive)?.seal = None;
                     return Ok(Some(Transition {
                         operation: Operation::Prepare(inactive),
                         next,
@@ -580,6 +613,7 @@ pub(crate) fn plan(
             let source = state.require_ready(active)?;
             next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
             next.slot_mut(inactive)?.generation = None;
+            next.slot_mut(inactive)?.seal = None;
             next.previous_good_slot = None;
             next.preparation = Some(Preparation {
                 id,
@@ -593,9 +627,41 @@ pub(crate) fn plan(
                 failure: None,
                 synchronized: false,
                 synchronization: None,
+                finalization: None,
             });
             Transition {
                 operation: Operation::Prepare(inactive),
+                next,
+                boot: None,
+            }
+        }
+        Request::Finalize {
+            expected_id,
+            expected_revision,
+        } => {
+            ensure_preparation_allowed(state, sel)?;
+            let p = state
+                .preparation
+                .as_ref()
+                .ok_or_else(|| refuse("prepare the inactive system before finalization"))?;
+            check_preparation(p, sel, state, expected_id.as_deref(), expected_revision)?;
+            if !p.synchronized && p.phase != PreparationPhase::Ready {
+                return Err(refuse("synchronization must complete before finalization"));
+            }
+            if !matches!(p.operation.as_str(), "prepare" | "finalize" | "stage") {
+                return Err(refuse("the previous operation requires recovery"));
+            }
+            if p.phase == PreparationPhase::Ready && state.slot(inactive).unwrap().seal.is_some() {
+                return Ok(None);
+            }
+            let p = next.preparation.as_mut().unwrap();
+            p.operation = "finalize".into();
+            p.phase = PreparationPhase::Finalizing;
+            p.failure = None;
+            p.revision += 1;
+            next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
+            Transition {
+                operation: Operation::Finalize(inactive),
                 next,
                 boot: None,
             }
@@ -615,6 +681,7 @@ pub(crate) fn plan(
             next.preparation = None;
             next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
             next.slot_mut(inactive)?.generation = None;
+            next.slot_mut(inactive)?.seal = None;
             Transition {
                 operation: Operation::Discard(inactive),
                 next,
@@ -663,9 +730,11 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {inactive}."
                 failure: None,
                 synchronized: false,
                 synchronization: None,
+                finalization: None,
             });
             next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
             next.slot_mut(inactive)?.generation = None;
+            next.slot_mut(inactive)?.seal = None;
             next.pending_trial_generation = None;
             next.known_good_slot = Some(active);
             // A new system in the slot ends any trial scheduled before.

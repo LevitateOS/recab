@@ -156,7 +156,7 @@ fn scan(
 ) -> Result<()> {
     for name in root.names(relative)? {
         let path = relative.join(&name);
-        if path == Path::new(MARKER) {
+        if path == Path::new(MARKER) || path == Path::new(recinit::installed::BOOT_RECORD) {
             continue;
         }
         let metadata = root
@@ -343,9 +343,15 @@ impl Generation {
         let bytes = serde_json::to_vec(
             &serde_json::json!({ "version": 1, "generation": self.id, "slot": slot, "partuuid": partuuid }),
         )?;
-        Root::open(root)?
-            .entry(Path::new(MARKER), true)?
-            .write(&bytes, 0o600)
+        write_record(root, MARKER, &bytes)
+    }
+    pub(crate) fn mark_boot(&self, root: &Path, slot: Slot, uuid: &str, peer: &str) -> Result<()> {
+        self.mark(root, slot, uuid)?;
+        write_record(
+            root,
+            recinit::installed::BOOT_RECORD,
+            format!("1 {slot} {uuid} {} {peer}\n", self.id).as_bytes(),
+        )
     }
     pub fn verify_root(&self, root: &Path, slot: Slot, partuuid: &str) -> Result<()> {
         let marker = Root::open(root)?
@@ -380,4 +386,18 @@ impl Generation {
             ))
             .is_ok_and(|bytes| digest(&bytes) == self.id)
     }
+}
+
+fn write_record(root: &Path, path: &str, bytes: &[u8]) -> Result<()> {
+    let opened = Root::open(root)?;
+    let entry = opened.entry(Path::new(path), true)?;
+    if let Some(meta) = entry.metadata()? {
+        if !meta.is_file() {
+            return Err(refuse("boot metadata must be a regular file"));
+        }
+        if meta.nlink() != 1 {
+            fs::remove_file(entry.path())?;
+        }
+    }
+    entry.write(bytes, 0o600)
 }

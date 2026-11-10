@@ -158,7 +158,7 @@ try:
     first=cli(active,'prepare','--preparation',interrupted['id'],'--revision',str(interrupted['revision']))
     check(first['phase']=='prepared' and first['synchronized'],'resume did not complete')
     check(first['synchronization']['resumed'] and not first['synchronization']['accounting_complete'],'interrupted counters claimed completeness')
-    check(json.loads((state/'state.json').read_text())['schema']=={'major':2,'minor':1},'minor safety format was not upgraded')
+    check(json.loads((state/'state.json').read_text())['schema']=={'major':2,'minor':2},'minor safety format was not upgraded')
     cli(active,'set-next','B',code=21,contains='incomplete')
     run('mount','-t','ext4',devices['B'],str(b));mounts.add('B')
     check((b/'var/cache/alias').read_bytes()==b'cached publication must survive','excluded hardlink alias was patched')

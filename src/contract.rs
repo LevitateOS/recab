@@ -6,12 +6,13 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 use tool_contract::Contract;
 
-use crate::{ErrorClass, ErrorPayload, Health, Inventory, Preparation, Slot, Status};
+use crate::{ErrorClass, ErrorPayload, Finalization, Health, Inventory, Preparation, Slot, Status};
 
 pub fn export() -> Result<Contract> {
     let docs = concat!(env!("CARGO_MANIFEST_DIR"), "/docs");
     let mut c = Contract::new("recab", &["recab"]);
-    c.schema::<Preparation>(docs, "preparation")?
+    c.schema::<Finalization>(docs, "finalization")?
+        .schema::<Preparation>(docs, "preparation")?
         .schema::<Inventory>(docs, "inventory")?
         .schema::<Status>(docs, "status")?
         .schema::<Health>(docs, "health")?

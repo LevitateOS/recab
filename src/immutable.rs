@@ -2,13 +2,13 @@
 //! read-only, including /etc. User data remains on shared /var.
 
 use anyhow::{Context, Result};
-use recinit::installed::{IMMUTABLE_CONFIG, check_immutable_initramfs};
+use recinit::installed::{check_immutable_initramfs, IMMUTABLE_CONFIG};
 use std::path::Path;
 
 use crate::error::refuse;
 use crate::filesystem::Root;
 use crate::state::Slot;
-use crate::target::{Target, partuuid};
+use crate::target::{partuuid, Target};
 
 pub(crate) fn check_initramfs(initrd: Option<&Path>) -> Result<()> {
     let path = initrd.ok_or_else(|| {
@@ -153,6 +153,11 @@ pub(crate) fn prepare(root: &Path, slot: Slot, state: &str) -> Result<()> {
     opened
         .entry(Path::new(IMMUTABLE_CONFIG), true)?
         .write(format!("{slot} PARTUUID={state}\n").as_bytes(), 0o644)?;
+    let release = opened
+        .optional_text(Path::new("etc/os-release"))?
+        .context("missing os-release")?;
+    let init = distro_profile::os_release_fact(&release, "REC_INIT")?;
+    crate::runtime::Policy::check(root, init)?.apply(root)?;
     Ok(())
 }
 

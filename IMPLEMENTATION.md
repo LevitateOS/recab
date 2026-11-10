@@ -71,12 +71,58 @@ unsupported special files, same-device bind mounts and space refusal were checke
 Insufficient space left the ledger and existing boot entry unchanged. The check
 supplies scratch firmware/boot records; it does not boot a system.
 
-Writes now promote state 2.0 to 2.1; P02's reader refuses 2.1, preventing it from
-dropping synchronization progress and reseeding pending changes. Status schema 4
+At the P03 checkpoint, writes promoted state 2.0 to 2.1; P02's reader refuses
+2.1, preventing it from
+dropping synchronization progress and reseeding pending changes. P03's status schema 4
 and generated schemas/TypeScript expose the saved synchronization report.
 Focused Rust compilation and TUI/docs typechecks pass. No full builds, unit
-suites or VM runs were performed. P04 runtime migration/finalization and P05
-initial equivalent B remain outstanding, along with Recipe/update integration.
+suites or VM runs were performed. P05 initial equivalent B and Recipe/update
+integration remain outstanding.
+
+P04 now implements `finalize` in both directions. Read-only preflight validates
+identity/profile, ELF init and libraries, accounts, fstab, runtime directories,
+producer-bound recab compatibility in candidate and retained fallback, available
+Recipe receipts, full v3 initramfs, kernel release/architecture and module provenance. Machine identity and enabled
+SSH keys must be seeded before finalization. The destructive staging entry point
+now uses the same finalizer and restores device protection on extraction failure. Its geometry preflight runs on an
+anonymous sparse file because mke2fs opens even a dry-run target writable.
+The package/finalizer installs explicit runtime policy for mtab, DNS, systemd first-boot writers and OpenRC clock updates.
+The installer orders personalization before generation capture. Release production
+binds the kernel hash to the installed module tree; old images with a changed
+kernel cannot bypass this by merely matching a release string.
+
+Finalization saves intent, keeps the entry absent, applies policy, freezes the
+candidate inventory, writes root records and flushes the filesystem. Content-hash
+boot objects and generation manifests become durable before the root is unmounted
+and its block device protected read-only. Publication is last. Interrupted work
+reconciles the same generation; reopening preparation explicitly permits editing.
+Selection/commit/rollback recheck root/record/manifest/artifacts. The v3 initramfs
+checks kernel release, unique partition identities and the slot/root/generation
+record before installed init, and protects the peer root too. Boot collection
+retains both recorded slots and foreign entry references. State 2.2 makes earlier
+writers refuse mutation; status schema 5 and finalization schema expose seals,
+artifact paths, progress and boot-write accounting. Unknown interrupted writes
+remain explicit and application bytes are never described as SMART totals.
+
+Focused validation uses `tests/finalization.py` against temporary GPT/ext4 roots
+and a real vfat ESP, an existing UEFI kernel/module, native ELF fixtures and
+structural firmware/initramfs records. It checks durable-intent termination,
+publication failure/retry, absent entries, readonly devices, stale revision,
+idempotence, boot-record tampering, A→B→A selection/commit/rollback, and artifact
+reuse with zero reverse boot payload writes. Local X, corrupted boot artifacts,
+and case-insensitive foreign references during collection are checked too.
+Both systemd and OpenRC configurations passed these filesystem/CLI checks.
+The OpenRC run also passed real EROFS extraction through recstrap, shared
+finalization after staging, and protection restoration after failed extraction.
+Scratch roots carry valid host SELinux labels; denied label removal remains an
+explicit incomplete-preparation error with operation context.
+The P03 real-filesystem synchronization regression check still passes. A focused
+recinit producer run using cached Alpine tools, static busybox and the existing
+7.3.3-levitate kernel tree produced a 1922 KiB v3 archive accepted by the new
+whole-stream inspector. Rust compilation and documentation/TUI typechecks pass.
+This does not establish a kernel, PID 1 or distro-service boot. Full installed boot/hardware and aarch64 validation
+remain pending; no full system builds or VM runs were requested or performed.
+
 The starting-point description below records the pre-implementation audit.
 
 ## Starting point

@@ -79,6 +79,31 @@ pub(crate) fn run(target: Target, request: &InitRequest) -> Result<()> {
         let state = crate::immutable::state_partition(&target)?;
         crate::immutable::prepare(&target.root, Slot::A, &state)?;
     }
+    if matches!(request.layout, InitLayout::Ab { .. }) {
+        let backend = SystemdBoot::new(&target);
+        let state = crate::immutable::state_partition(&target)?;
+        let esp = backend.partition()?;
+        if crate::filesystem::Root::open(&target.root)?
+            .metadata(Path::new("usr/lib/recab/kernel.json"))?
+            .is_none()
+        {
+            return Err(refuse(
+                "immutable installation requires the release kernel/module binding",
+            ));
+        }
+        crate::candidate::check(
+            &target.root,
+            &target.root,
+            Slot::A,
+            &installed_root,
+            &state,
+            &esp,
+            &request.kernel,
+            request.initrd.as_ref().unwrap(),
+            &crate::generation::hash_file(&request.kernel)?,
+            false,
+        )?;
+    }
     let generation = if matches!(request.layout, InitLayout::Ab { .. }) {
         let generation = Generation::capture(
             &target.root,
@@ -86,7 +111,13 @@ pub(crate) fn run(target: Target, request: &InitRequest) -> Result<()> {
             request.initrd.as_deref(),
             &target.state_dir,
         )?;
-        generation.mark(&target.root, Slot::A, &installed_root)?;
+        let peer = entries
+            .iter()
+            .find(|(slot, _, _)| *slot == Some(Slot::B))
+            .unwrap()
+            .2
+            .clone();
+        generation.mark_boot(&target.root, Slot::A, &installed_root, &peer)?;
         Some(generation)
     } else {
         None
@@ -149,6 +180,7 @@ until they are, they may select another entry.{later}"
                     slot.map(|slot| SlotState {
                         slot,
                         partuuid: partuuid.clone(),
+                        seal: None,
                         generation: if slot == Slot::A {
                             generation.clone()
                         } else {

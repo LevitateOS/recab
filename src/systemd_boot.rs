@@ -135,7 +135,9 @@ impl SystemdBoot {
             let entry_root = self
                 .entry(&prefix, Some(slot))?
                 .and_then(|entry| entry.root_partuuid());
-            let recorded = state.slot(slot).map(|record| record.partuuid.to_ascii_lowercase());
+            let recorded = state
+                .slot(slot)
+                .map(|record| record.partuuid.to_ascii_lowercase());
             if recorded
                 .as_ref()
                 .zip(entry_root.as_ref())
@@ -376,26 +378,7 @@ impl SystemdBoot {
             return Err(refuse("boot entry does not match the recorded generation"));
         }
         let root = crate::filesystem::Root::open(&self.target.esp)?;
-        let mut kernel = None;
-        let mut initrd = None;
-        for line in entry.render().lines() {
-            let mut fields = line.split_whitespace();
-            match (fields.next(), fields.next()) {
-                (Some("linux"), Some(path)) => {
-                    kernel = Some(path.trim_start_matches('/').to_string())
-                }
-                (Some("initrd"), Some(path)) if initrd.is_none() => {
-                    initrd = Some(path.trim_start_matches('/').to_string())
-                }
-                (Some("initrd"), Some(_)) => {
-                    return Err(refuse(
-                        "multiple initramfs files are not supported by this generation format",
-                    ))
-                }
-                _ => {}
-            }
-        }
-        let kernel = kernel.ok_or_else(|| refuse("generation entry has no kernel"))?;
+        let (kernel, initrd) = entry.artifacts()?;
         let kernel = root.entry(Path::new(&kernel), false)?;
         if crate::generation::hash_reader(&mut kernel.open()?)? != generation.kernel_digest {
             return Err(refuse(
@@ -429,7 +412,8 @@ impl SystemdBoot {
     /// boot it once it has a kernel at the running slot (a default naming
     /// any other entry, a one-shot naming it while no trial is pending: they
     /// change nothing systemd-boot boots now, since it skips the slot), then
-    /// remove its kernel, so it cannot boot until [`SlotWrite::finish`].
+    /// remove its entry and transitional kernel inputs. Only finalization may
+    /// publish the new entry.
     pub fn begin_slot_write<'a>(&'a self, boot: &'a Boot, slot: Slot) -> Result<SlotWrite<'a>> {
         self.vars.can_change()?;
         let active = entry_name(&boot.prefix, boot.selection.active);
@@ -457,13 +441,6 @@ impl SystemdBoot {
                 .set(Var::OneShot, None)
                 .with_context(|| unchanged(Var::OneShot))?;
         }
-        let entry = self.entry(&boot.prefix, Some(slot))?.unwrap_or(Entry::new(
-            &format!("{} (Slot {slot})", self.target.os_name()?),
-            &layout_name(&boot.prefix, Some(slot)),
-            true,
-            &self.slot_partuuid(boot, slot)?,
-            "",
-        ));
         self.invalidate_entry(boot, slot)?;
         let dir = self.kernel_dir(boot, slot);
         if dir.exists() {
@@ -475,7 +452,6 @@ impl SystemdBoot {
             backend: self,
             boot,
             slot,
-            entry,
         })
     }
 
@@ -531,8 +507,9 @@ impl SystemdBoot {
                 partuuid,
                 options,
             );
-            if slot.is_some() {
+            if let Some(slot) = slot {
                 entry.make_immutable();
+                entry.set_slot(*slot);
             }
             let path = entries_dir.join(entry_file(&prefix, *slot));
             target_root::write_durable(&path, entry.render().as_bytes(), None)
@@ -615,31 +592,17 @@ pub(crate) struct SlotWrite<'a> {
     backend: &'a SystemdBoot,
     boot: &'a Boot,
     slot: Slot,
-    entry: Entry,
 }
 
 impl SlotWrite<'_> {
-    /// Install the slot's kernel (and initrd) and point its entry at them,
-    /// with the trial options for `init` (the slot is uncommitted). The entry is written first and the kernel last, so the slot
-    /// can boot only once everything is in place.
-    pub fn finish(
-        self,
-        kernel: &Path,
-        initrd: Option<&Path>,
-        init: InitSystem,
-        generation: &str,
-    ) -> Result<()> {
-        let (backend, prefix, slot) = (self.backend, &self.boot.prefix, self.slot);
-        let id = entry_name(prefix, slot);
-        let mut entry = self.entry;
-        entry.set_generation(generation);
-        entry.set_boot_files(&layout_name(prefix, Some(slot)), initrd.is_some());
-        entry.make_immutable();
-        make_trial(&mut entry, init);
-        let path = backend.entries_dir().join(&id);
-        install_kernel(&backend.kernel_dir(self.boot, slot), kernel, initrd)?;
-        target_root::write_durable(&path, entry.render().as_bytes(), None)
-            .with_context(|| format!("writing '{}'", path.display()))
+    /// Save transitional stage inputs without publishing an entry. The shared
+    /// finalizer validates the root and installs generation objects before boot.
+    pub fn finish(self, kernel: &Path, initrd: Option<&Path>) -> Result<()> {
+        install_kernel(
+            &self.backend.kernel_dir(self.boot, self.slot),
+            kernel,
+            initrd,
+        )
     }
 }
 
@@ -693,4 +656,345 @@ fn install_loader(root: &Path, esp: &Path) -> Result<()> {
         target_root::copy_durable(&source, &dest)?;
     }
     Ok(())
+}
+
+/// Content-addressed boot payloads shared by generations and slots on the ESP.
+pub(crate) fn object_paths(g: &crate::Generation) -> Result<(String, String)> {
+    Ok((
+        format!("recab/objects/{}.linux", g.kernel_digest),
+        format!(
+            "recab/objects/{}.initrd",
+            g.initrd_digest
+                .as_ref()
+                .ok_or_else(|| refuse("finalized generation needs an initramfs"))?
+        ),
+    ))
+}
+fn manifest(g: &crate::Generation, seal: &crate::BootSeal) -> serde_json::Value {
+    serde_json::json!({"version":1,"generation":g.id,"kernel":g.kernel_digest,"initrd":g.initrd_digest,"kernel_release":seal.kernel_release,"architecture":seal.architecture,"protocol":seal.protocol})
+}
+impl SystemdBoot {
+    fn remove_temporary_boot_files(&self) -> Result<()> {
+        // The global recab lock is held. Interrupted atomic copies never had
+        // a bootable name, so they cannot be referenced by an entry.
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        for dir in ["recab/objects", "recab/generations"] {
+            if root.metadata(Path::new(dir))?.is_none() {
+                continue;
+            }
+            for name in root.names(Path::new(dir))? {
+                let Some(name) = name.to_str() else { continue };
+                let Some((object, pid)) =
+                    name.strip_prefix('.').and_then(|n| n.split_once(".tmp-"))
+                else {
+                    continue;
+                };
+                let Some((digest, extension)) = object.split_once('.') else {
+                    continue;
+                };
+                if digest.len() != 64
+                    || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+                    || pid.is_empty()
+                    || !pid.bytes().all(|b| b.is_ascii_digit())
+                    || !matches!(extension, "linux" | "initrd" | "json")
+                {
+                    continue;
+                }
+                let entry = root.entry(&Path::new(dir).join(name), false)?;
+                if !entry.metadata()?.is_some_and(|m| m.is_file()) {
+                    return Err(refuse("unexpected temporary boot object type"));
+                }
+                fs::remove_file(entry.path())?;
+            }
+            target_root::sync_dir(&root.entry(Path::new(dir), false)?.path())?;
+        }
+        Ok(())
+    }
+    pub(crate) fn partition(&self) -> Result<String> {
+        let path = fs::canonicalize(&self.target.esp)?;
+        let table = target_root::mount_table_at(Path::new("/proc/self/mountinfo"))?;
+        let mount = target_root::mount_holding(&table, &path)?
+            .ok_or_else(|| refuse("ESP is not mounted"))?;
+        if mount.mount_point != path || mount.fstype != "vfat" || mount.root != Path::new("/") {
+            return Err(refuse(
+                "finalization requires a separately mounted vfat ESP",
+            ));
+        }
+        partuuid(Path::new(&mount.source))
+    }
+    pub(crate) fn inputs(&self, boot: &Boot, slot: Slot) -> Result<(PathBuf, PathBuf)> {
+        let entry = self
+            .entry(&boot.prefix, Some(slot))?
+            .context("source boot entry is missing")?;
+        let (kernel, initrd) = entry.artifacts()?;
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        let kernel = root.entry(Path::new(&kernel), false)?;
+        let initrd = root.entry(
+            Path::new(&initrd.context("source initramfs missing")?),
+            false,
+        )?;
+        // Resolve only after validating all parent components inside the ESP.
+        Ok((
+            fs::canonicalize(kernel.path())?,
+            fs::canonicalize(initrd.path())?,
+        ))
+    }
+    pub(crate) fn object_inputs(&self, g: &crate::Generation) -> Result<(PathBuf, PathBuf)> {
+        let (kernel, initrd) = object_paths(g)?;
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        Ok((
+            fs::canonicalize(root.entry(Path::new(&kernel), false)?.path())?,
+            fs::canonicalize(root.entry(Path::new(&initrd), false)?.path())?,
+        ))
+    }
+    pub(crate) fn preflight_objects(&self, checked: &crate::candidate::Checked) -> Result<()> {
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        self.remove_temporary_boot_files()?;
+        let mut need = 64 * 1024u64;
+        for (digest, kind, source) in [
+            (&checked.kernel_digest, "linux", &checked.kernel),
+            (&checked.initrd_digest, "initrd", &checked.initrd),
+        ] {
+            let path = format!("recab/objects/{digest}.{kind}");
+            if root.metadata(Path::new(&path))?.is_some() {
+                if crate::generation::hash_reader(
+                    &mut root.entry(Path::new(&path), false)?.open()?,
+                )? != *digest
+                {
+                    return Err(refuse("immutable boot object is corrupt; refusing to overwrite a possibly referenced payload"));
+                }
+            } else {
+                need = need.saturating_add(fs::metadata(source)?.len());
+            }
+        }
+        let file = fs::File::open(&self.target.esp)?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if need > stat.f_bavail.saturating_mul(stat.f_frsize) {
+            return Err(refuse(
+                "ESP has insufficient space for candidate boot artifacts",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn install_objects(
+        &self,
+        checked: &crate::candidate::Checked,
+        g: &crate::Generation,
+        seal: &crate::BootSeal,
+    ) -> Result<(u64, u64, u64)> {
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        let mut bytes = 0;
+        let mut reused = 0;
+        for (digest, kind, source) in [
+            (&checked.kernel_digest, "linux", &checked.kernel),
+            (&checked.initrd_digest, "initrd", &checked.initrd),
+        ] {
+            let path = format!("recab/objects/{digest}.{kind}");
+            let entry = root.entry(Path::new(&path), true)?;
+            if entry.metadata()?.is_some() {
+                if crate::generation::hash_reader(&mut entry.open()?)? != *digest {
+                    return Err(refuse("immutable boot object changed"));
+                }
+                reused += 1;
+                continue;
+            }
+            target_root::copy_durable(source, &entry.path())?;
+            if crate::generation::hash_reader(&mut entry.open()?)? != *digest {
+                return Err(refuse("boot payload changed while being installed"));
+            }
+            bytes += entry.metadata()?.unwrap().len();
+        }
+        let entry = root.entry(Path::new(&format!("recab/generations/{}.json", g.id)), true)?;
+        let expected = manifest(g, seal);
+        let data = serde_json::to_vec(&expected)?;
+        let mut metadata_bytes = 0;
+        let current = if let Some(meta) = entry.metadata()? {
+            if meta.len() > 64 * 1024 {
+                return Err(refuse("oversized generation manifest"));
+            }
+            Some(serde_json::from_reader::<_, serde_json::Value>(
+                entry.open()?,
+            )?)
+        } else {
+            None
+        };
+        if current.as_ref().is_some_and(|value| value != &expected) {
+            return Err(refuse(
+                "generation boot manifest conflicts with immutable identity",
+            ));
+        }
+        if current.is_none() {
+            target_root::write_durable(&entry.path(), &data, Some(0o644))?;
+            metadata_bytes = data.len() as u64;
+        }
+        Ok((bytes, reused, metadata_bytes))
+    }
+    pub(crate) fn publish(
+        &self,
+        boot: &Boot,
+        slot: Slot,
+        g: &crate::Generation,
+        seal: &crate::BootSeal,
+        init: InitSystem,
+    ) -> Result<u64> {
+        if slot == boot.selection.active {
+            return Err(refuse("cannot publish over the active entry"));
+        }
+        let (kernel, initrd) = object_paths(g)?;
+        let source = self
+            .entry(&boot.prefix, Some(boot.selection.active))?
+            .context("active entry missing")?;
+        let extra = source
+            .options()
+            .into_iter()
+            .filter(|o| {
+                !matches!(o.as_str(), "ro" | "rw" | "rootwait")
+                    && ![
+                        "root=",
+                        "rootflags=",
+                        "rootfstype=",
+                        "init=",
+                        "rdinit=",
+                        "resume=",
+                        "recab.",
+                        "systemd.volatile",
+                        "systemd.mount-extra",
+                    ]
+                    .iter()
+                    .any(|prefix| o.starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut entry = Entry::new(
+            &format!("{} (Slot {slot})", self.target.os_name()?),
+            "unused",
+            true,
+            &self.slot_partuuid(boot, slot)?,
+            &extra,
+        );
+        entry.set_artifacts(&kernel, &initrd);
+        entry.make_immutable();
+        entry.set_slot(slot);
+        entry.set_generation(&g.id);
+        make_trial(&mut entry, init);
+        self.verify_manifest(g, seal)?;
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        let dest = root.entry(
+            Path::new(&format!("{ENTRIES_DIR}/{}", entry_name(&boot.prefix, slot))),
+            true,
+        )?;
+        let text = entry.render();
+        if dest.metadata()?.is_some() && dest.open()?.metadata()?.len() == text.len() as u64 {
+            use std::io::Read;
+            let mut existing = String::new();
+            dest.open()?.take(64 * 1024).read_to_string(&mut existing)?;
+            if existing == text {
+                return Ok(0);
+            }
+        }
+        target_root::write_durable(&dest.path(), text.as_bytes(), Some(0o644))?;
+        Ok(text.len() as u64)
+    }
+    pub(crate) fn verify_manifest(
+        &self,
+        g: &crate::Generation,
+        seal: &crate::BootSeal,
+    ) -> Result<()> {
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        let file = root
+            .entry(
+                Path::new(&format!("recab/generations/{}.json", g.id)),
+                false,
+            )?
+            .open()?;
+        if file.metadata()?.len() > 64 * 1024 {
+            return Err(refuse("oversized generation boot manifest"));
+        }
+        if serde_json::from_reader::<_, serde_json::Value>(file)? != manifest(g, seal) {
+            return Err(refuse("generation boot manifest does not match slot seal"));
+        }
+        Ok(())
+    }
+    pub(crate) fn garbage_collect(&self, state: &PersistentState) -> Result<()> {
+        use std::collections::BTreeSet;
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        let mut keep_objects = BTreeSet::new();
+        let mut keep_generations = BTreeSet::new();
+        // Foreign entries may legitimately reference recab's content-addressed files.
+        for name in root.names(Path::new(ENTRIES_DIR))? {
+            if !name
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".conf")
+            {
+                continue;
+            }
+            let mut input = root
+                .entry(&Path::new(ENTRIES_DIR).join(name), false)?
+                .open()?;
+            use std::io::Read;
+            if input.metadata()?.len() > 64 * 1024 {
+                return Err(refuse("oversized boot entry prevents safe collection"));
+            }
+            let mut text = String::new();
+            input.read_to_string(&mut text)?;
+            for path in Entry::parse(&text).boot_files() {
+                let path = path.trim_start_matches('/');
+                if !Path::new(path)
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+                {
+                    return Err(refuse("unsafe boot reference prevents collection"));
+                }
+                keep_objects.insert(path.to_ascii_lowercase());
+            }
+        }
+        for slot in &state.slots {
+            if let Some(g) = &slot.generation {
+                keep_generations.insert(format!("{}.json", g.id));
+                if slot.seal.is_some() {
+                    let (k, i) = object_paths(g)?;
+                    keep_objects.extend([k, i]);
+                }
+            }
+        }
+        for (dir, is_object) in [("recab/objects", true), ("recab/generations", false)] {
+            if root.metadata(Path::new(dir))?.is_none() {
+                continue;
+            }
+            for name in root.names(Path::new(dir))? {
+                let Some(name) = name.to_str() else { continue };
+                let Some((id, extension)) = name.split_once('.') else {
+                    continue;
+                };
+                if id.len() != 64
+                    || !id.bytes().all(|b| b.is_ascii_hexdigit())
+                    || !(if is_object {
+                        matches!(extension, "linux" | "initrd")
+                    } else {
+                        extension == "json"
+                    })
+                {
+                    continue;
+                }
+                let relative = format!("{dir}/{name}");
+                if (is_object && keep_objects.contains(&relative.to_ascii_lowercase()))
+                    || (!is_object && keep_generations.contains(name))
+                {
+                    continue;
+                }
+                let entry = root.entry(Path::new(&relative), false)?;
+                if !entry.metadata()?.is_some_and(|m| m.is_file()) {
+                    return Err(refuse("unexpected object type prevents collection"));
+                }
+                fs::remove_file(entry.path())?;
+            }
+            target_root::sync_dir(&root.entry(Path::new(dir), false)?.path())?;
+        }
+        Ok(())
+    }
 }

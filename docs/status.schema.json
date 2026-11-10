@@ -9,7 +9,8 @@
             "commit",
             "rollback",
             "prepare",
-            "discard"
+            "discard",
+            "finalize"
           ],
           "type": "string"
         },
@@ -116,6 +117,76 @@
       ],
       "type": "object"
     },
+    "BootSeal": {
+      "properties": {
+        "architecture": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "string"
+        },
+        "kernel_release": {
+          "type": "string"
+        },
+        "protocol": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "generation",
+        "kernel_release",
+        "architecture",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "Finalization": {
+      "properties": {
+        "accounting_complete": {
+          "type": "boolean"
+        },
+        "boot_bytes_written": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "boot_metadata_bytes_written": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "generation": {
+          "$ref": "#/$defs/Generation"
+        },
+        "initrd_source": {
+          "type": "string"
+        },
+        "kernel_source": {
+          "type": "string"
+        },
+        "reused_boot_files": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seal": {
+          "$ref": "#/$defs/BootSeal"
+        }
+      },
+      "required": [
+        "generation",
+        "seal",
+        "kernel_source",
+        "initrd_source",
+        "boot_bytes_written",
+        "boot_metadata_bytes_written",
+        "reused_boot_files",
+        "accounting_complete"
+      ],
+      "type": "object"
+    },
     "Generation": {
       "properties": {
         "id": {
@@ -153,6 +224,17 @@
             "string",
             "null"
           ]
+        },
+        "finalization": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Finalization"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "id": {
           "type": "string"
@@ -212,6 +294,7 @@
         "awaiting_synchronization",
         "prepared",
         "staging",
+        "finalizing",
         "ready",
         "interrupted"
       ],
@@ -271,6 +354,20 @@
           "default": false,
           "type": "boolean"
         },
+        "initrd": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kernel": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "readiness": {
           "anyOf": [
             {
@@ -288,6 +385,17 @@
             "string",
             "null"
           ]
+        },
+        "seal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BootSeal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "slot": {
           "$ref": "#/$defs/Slot"

@@ -38,10 +38,16 @@ pub struct SlotView {
     pub readiness: Option<Readiness>,
     #[serde(default)]
     pub generation_ready: bool,
+    #[serde(default)]
+    pub seal: Option<crate::BootSeal>,
+    #[serde(default)]
+    pub kernel: Option<String>,
+    #[serde(default)]
+    pub initrd: Option<String>,
 }
 
 /// The schema of [`Status`].
-pub const STATUS_SCHEMA_VERSION: u32 = 4;
+pub const STATUS_SCHEMA_VERSION: u32 = 5;
 
 /// A change a person or front end can ask recab for.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
@@ -56,6 +62,7 @@ pub enum Action {
     Stage,
     Prepare,
     Discard,
+    Finalize,
 }
 
 /// What recab would make of an action now.
@@ -184,11 +191,21 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
             Some(partuuid) => target_root::device_with_tag("PARTUUID", partuuid)?,
             None => None,
         };
-        let generation_ready = match sys
-            .state
-            .require_ready(slot)
-            .and_then(|generation| sys.backend.verify_generation(&sys.boot, slot, generation))
-        {
+        let generation_ready = match sys.state.require_ready(slot).and_then(|generation| {
+            if sys
+                .state
+                .slot(slot)
+                .is_some_and(|r| r.readiness == Readiness::Ready && r.seal.is_none())
+            {
+                return Err(crate::error::refuse(
+                    "candidate must be finalized before boot selection",
+                ));
+            }
+            if let Some(seal) = sys.state.slot(slot).and_then(|r| r.seal.as_ref()) {
+                crate::finalize::verify_entry(&sys, slot, generation, seal)?;
+            }
+            sys.backend.verify_generation(&sys.boot, slot, generation)
+        }) {
             Ok(()) => true,
             Err(error) => {
                 generation_errors[slot as usize] = Some(format!("{error:#}"));
@@ -198,7 +215,11 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
         slots.push(SlotView {
             slot,
             entry: format!("{ENTRIES_DIR}/{}", entry_name(&sys.boot.prefix, slot)),
-            boot_dir: layout_name(&sys.boot.prefix, Some(slot)),
+            boot_dir: if sys.state.slot(slot).is_some_and(|r| r.seal.is_some()) {
+                "recab/objects".into()
+            } else {
+                layout_name(&sys.boot.prefix, Some(slot))
+            },
             root: partuuid.as_ref().map(|id| format!("PARTUUID={id}")),
             device: device.map(|d| d.display().to_string()),
             bootable: sys.backend.bootable(&sys.boot, slot)?,
@@ -209,6 +230,15 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
                 .and_then(|record| record.generation.clone()),
             readiness: sys.state.slot(slot).map(|record| record.readiness.clone()),
             generation_ready,
+            seal: sys.state.slot(slot).and_then(|r| r.seal.clone()),
+            kernel: entry
+                .as_ref()
+                .and_then(|e| e.artifacts().ok())
+                .map(|(k, _)| k),
+            initrd: entry
+                .as_ref()
+                .and_then(|e| e.artifacts().ok())
+                .and_then(|(_, i)| i),
         });
     }
     let (sel, state) = (&sys.boot.selection, &sys.state);
@@ -244,6 +274,16 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
         state,
     ));
     if let Some(preparation) = &state.preparation {
+        actions.push(action_view(
+            Action::Finalize,
+            Request::Finalize {
+                expected_id: Some(preparation.id.clone()),
+                expected_revision: Some(preparation.revision),
+            },
+            preparation.slot,
+            sel,
+            state,
+        ));
         actions.push(action_view(
             Action::Discard,
             Request::Discard {
