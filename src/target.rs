@@ -5,7 +5,7 @@
 //! other module reads the environment, `/`, `/proc` or an os-release.
 
 use anyhow::{Context, Result};
-use distro_profile::{os_release_fact, os_release_value, Flavour, InitSystem};
+use distro_profile::{os_release_fact, os_release_value, InitSystem};
 use std::path::{Path, PathBuf};
 
 use crate::error::{classified, refuse, ErrorClass};
@@ -52,7 +52,6 @@ pub(crate) struct Firmware {
 pub(crate) struct Programs {
     pub systemctl: String,
     pub rc_status: String,
-    pub recstrap: String,
     /// busybox init's reboot.
     pub reboot: String,
     pub mount: String,
@@ -143,7 +142,6 @@ impl Target {
             programs: Programs {
                 systemctl: program("RECAB_SYSTEMCTL_BIN", "systemctl"),
                 rc_status: program("RECAB_RC_STATUS_BIN", "rc-status"),
-                recstrap: program("RECAB_RECSTRAP_BIN", "recstrap"),
                 reboot: program("RECAB_REBOOT_BIN", "reboot"),
                 mount: "mount".to_string(),
                 umount: "umount".to_string(),
@@ -227,11 +225,6 @@ impl Target {
     /// The init system of the distro profile (`REC_INIT`).
     pub fn init(&self) -> Result<InitSystem> {
         os_release_fact(&self.os_release, "REC_INIT").map_err(|err| self.no_profile(err))
-    }
-
-    /// The flavour of the distro profile (`REC_FLAVOUR`).
-    pub fn flavour(&self) -> Result<Flavour> {
-        Flavour::from_os_release(&self.os_release).map_err(|err| self.no_profile(err))
     }
 
     fn no_profile(&self, err: impl std::fmt::Display) -> anyhow::Error {

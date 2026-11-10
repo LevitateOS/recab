@@ -83,12 +83,14 @@ pub fn finalize(request: &FinalizeRequest) -> Result<Finalization> {
         return Err(refuse("ESP/root/state identities are not distinct"));
     }
     let mut mount = crate::slot_mount::SlotMount::open(&sys, slot, &p.id)?;
+    let merged_inputs=crate::merge::boot_inputs(&sys)?;
     let (kernel, initrd) = match (&request.kernel, &request.initrd, &p.finalization) {
         (Some(k), Some(i), _) => (std::fs::canonicalize(k)?, std::fs::canonicalize(i)?),
         (None, None, Some(f)) => sys.backend.object_inputs(&f.generation).unwrap_or((
             PathBuf::from(&f.kernel_source),
             PathBuf::from(&f.initrd_source),
         )),
+        _ if merged_inputs.is_some() => {let inputs=merged_inputs.as_ref().unwrap();(inputs.kernel(),inputs.initramfs())},
         _ => sys.backend.inputs(&sys.boot, active)?,
     };
     let checked = crate::candidate::check(
@@ -101,7 +103,7 @@ pub fn finalize(request: &FinalizeRequest) -> Result<Finalization> {
         &kernel,
         &initrd,
         &source.kernel_digest,
-        request.change_flavour,
+        request.change_flavour || merged_inputs.as_ref().is_some_and(|v|crate::release::installed(&sys.target).is_ok_and(|(identity,_)|identity.flavour!=v.manifest().identity.flavour)),
     )
     .map_err(|error| crate::error::or_class(error, ErrorClass::StateOrDetection))?;
     let policy = crate::runtime::Policy::check(&mount.point, checked.init)?;

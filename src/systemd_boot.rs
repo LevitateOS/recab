@@ -399,58 +399,6 @@ impl SystemdBoot {
         Ok(())
     }
 
-    /// The slot's kernel directory on the ESP.
-    pub fn kernel_dir(&self, boot: &Boot, slot: Slot) -> PathBuf {
-        self.target.esp.join(layout_name(&boot.prefix, Some(slot)))
-    }
-
-    /// Start writing the inactive `slot`: point firmware variables that would
-    /// boot it once it has a kernel at the running slot (a default naming
-    /// any other entry, a one-shot naming it while no trial is pending: they
-    /// change nothing systemd-boot boots now, since it skips the slot), then
-    /// remove its entry and transitional kernel inputs. Only finalization may
-    /// publish the new entry.
-    pub fn begin_slot_write<'a>(&'a self, boot: &'a Boot, slot: Slot) -> Result<SlotWrite<'a>> {
-        self.vars.can_change()?;
-        let active = entry_name(&boot.prefix, boot.selection.active);
-        let unchanged = |var: Var| {
-            format!(
-                "could not point {} at '{active}'; slot {slot} was not changed",
-                var.name()
-            )
-        };
-        if boot
-            .raw_default
-            .as_deref()
-            .is_some_and(|raw| !same_entry(raw, &active))
-        {
-            self.vars
-                .set(Var::Default, Some(&active))
-                .with_context(|| unchanged(Var::Default))?;
-        }
-        let names_slot = boot
-            .raw_oneshot
-            .as_deref()
-            .is_some_and(|raw| slot_of_entry(&boot.prefix, raw) == Some(slot));
-        if names_slot && boot.selection.oneshot.is_none() {
-            self.vars
-                .set(Var::OneShot, None)
-                .with_context(|| unchanged(Var::OneShot))?;
-        }
-        self.invalidate_entry(boot, slot)?;
-        let dir = self.kernel_dir(boot, slot);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)
-                .with_context(|| format!("removing slot {slot}'s kernel '{}'", dir.display()))?;
-            target_root::sync_dir(&self.target.esp)?;
-        }
-        Ok(SlotWrite {
-            backend: self,
-            boot,
-            slot,
-        })
-    }
-
     pub fn invalidate_entry(&self, boot: &Boot, slot: Slot) -> Result<()> {
         if slot == boot.selection.active {
             return Err(refuse("cannot invalidate the running slot"));
@@ -663,25 +611,6 @@ impl SystemdBoot {
                 partuuid(Path::new(&mount.source))
             }
         }
-    }
-}
-
-/// A slot being written: it has no kernel until [`SlotWrite::finish`].
-pub(crate) struct SlotWrite<'a> {
-    backend: &'a SystemdBoot,
-    boot: &'a Boot,
-    slot: Slot,
-}
-
-impl SlotWrite<'_> {
-    /// Save transitional stage inputs without publishing an entry. The shared
-    /// finalizer validates the root and installs generation objects before boot.
-    pub fn finish(self, kernel: &Path, initrd: Option<&Path>) -> Result<()> {
-        install_kernel(
-            &self.backend.kernel_dir(self.boot, self.slot),
-            kernel,
-            initrd,
-        )
     }
 }
 

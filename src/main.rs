@@ -15,7 +15,7 @@ use recpart::types::InstallMode;
 #[command(about = "Manage system updates and rollback with two root slots (A/B)")]
 #[command(version)]
 #[command(
-    after_help = "Common tasks:\n  recab status                    Show the running slot and next boot\n  recab status --root /mnt         Inspect an installed target\n  recab prepare                   Continue the running system in the inactive slot\n  recab finalize                  Validate, seal and publish that candidate\n  recab stage --from-media /media  Replace the inactive slot from release media\n  recab set-next B                 Schedule one trial boot of slot B\n  recab rollback                  Select the known-good slot for next boot\n\nA/B keeps two system copies. prepare synchronizes differences; finalize seals\nthe candidate; set-next selects a trial boot. stage replaces the inactive slot. The trial service commits a healthy boot automatically.\nRead 'recab status' before choosing a slot. Add --json for structured status."
+    after_help = "Common tasks:\n  recab status                    Show the running slot and next boot\n  recab status --root /mnt         Inspect an installed target\n  recab prepare                   Continue the running system in the inactive slot\n  recab finalize                  Validate, seal and publish that candidate\n  recab stage --from-media /media  Merge release media into the preparation\n  recab set-next B                 Schedule one trial boot of slot B\n  recab rollback                  Select the known-good slot for next boot\n\nA/B keeps two system copies. prepare synchronizes differences; finalize seals\nthe candidate; set-next selects a trial boot. stage merges a release and finalizes it when conflict-free. The trial service commits a healthy boot automatically.\nRead 'recab status' before choosing a slot. Add --json for structured status."
 )]
 struct Cli {
     /// Print structured status, health, inventory, preparation and finalization;
@@ -149,7 +149,7 @@ enum Command {
         options: String,
     },
 
-    /// Write a prebuilt system into the inactive slot (formats the slot).
+    /// Merge a verified release into the inactive preparation and finalize when conflict-free.
     Stage {
         /// Verify one release manifest and its bound payloads before staging.
         #[arg(long)]
@@ -161,13 +161,13 @@ enum Command {
         /// rootfs, kernel and, when it carries one, the installed initramfs.
         #[arg(long, value_name = "MEDIA")]
         from_media: Option<PathBuf>,
-        /// EROFS rootfs image: a file, or a partition holding it.
+        /// EROFS rootfs file; raw inputs require their corresponding release.json.
         #[arg(long)]
         rootfs: Option<PathBuf>,
         /// Kernel image for the slot.
         #[arg(long)]
         kernel: Option<PathBuf>,
-        /// Initramfs for the slot, if it boots through one.
+        /// Matching installed initramfs (required for raw manifest-bound inputs).
         #[arg(long)]
         initrd: Option<PathBuf>,
         /// Stage an image of the other flavour (the base system over a
@@ -244,12 +244,54 @@ enum ReleaseCommand {
 
 #[derive(Subcommand)]
 enum UpdateCommand {
+    /// Reproduce a selected package through Recipe for the pinned release.
+    Reproduce {
+        package: String,
+        #[arg(long)]
+        recipe: Option<PathBuf>,
+        #[arg(long)]
+        preparation: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Inspect redacted conflicts and the captured merge revision.
+    Conflicts,
+    /// Resume the exact persisted merge; never recalculate local intent.
+    Recover {
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+    },
+    /// Resolve a conflict; edited resolutions import a bounded regular file.
+    Resolve {
+        conflict: String,
+        #[arg(long)]
+        choice: String,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        preparation: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Adopt a known, verified original release for an older installation.
+    AdoptBaseline {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        trusted_local: bool,
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+    },
     Status,
     Check,
     Download {
         release: Option<String>,
     },
-    /// Reverify cached/media inputs and select them for the preparation; merge is P09.
+    /// Merge verified cached/media inputs without discarding prepared changes.
     Apply {
         release: Option<String>,
         #[arg(long)]
@@ -290,7 +332,95 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
         Command::Update { command } => {
+            match &command {
+                UpdateCommand::Reproduce {
+                    package,
+                    recipe,
+                    preparation,
+                    revision,
+                } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(
+                            &recab::merge::reproduce(
+                                preparation,
+                                *revision,
+                                package,
+                                recipe.as_deref()
+                            )
+                            .map_err(recab::update_error)?
+                        )?
+                    );
+                    return Ok(());
+                }
+                UpdateCommand::Conflicts => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(
+                            &recab::merge::conflicts().map_err(recab::update_error)?
+                        )?
+                    );
+                    return Ok(());
+                }
+                UpdateCommand::Recover {
+                    preparation,
+                    revision,
+                } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(
+                            &recab::merge::recover(preparation.as_deref(), *revision)
+                                .map_err(recab::update_error)?
+                        )?
+                    );
+                    return Ok(());
+                }
+                UpdateCommand::Resolve {
+                    conflict,
+                    choice,
+                    file,
+                    preparation,
+                    revision,
+                } => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(
+                            &recab::merge::resolve(
+                                preparation,
+                                *revision,
+                                conflict,
+                                choice,
+                                file.as_deref()
+                            )
+                            .map_err(recab::update_error)?
+                        )?
+                    );
+                    return Ok(());
+                }
+                UpdateCommand::AdoptBaseline {
+                    manifest,
+                    trusted_local,
+                    preparation,
+                    revision,
+                } => {
+                    recab::merge::adopt_baseline(
+                        manifest,
+                        *trusted_local,
+                        preparation.as_deref(),
+                        *revision,
+                    )
+                    .map_err(recab::update_error)?;
+                    println!("{}", serde_json::to_string(&recab::update::status()?)?);
+                    return Ok(());
+                }
+                _ => {}
+            }
             let result = match command {
+                UpdateCommand::Reproduce { .. }
+                | UpdateCommand::Conflicts
+                | UpdateCommand::Recover { .. }
+                | UpdateCommand::Resolve { .. }
+                | UpdateCommand::AdoptBaseline { .. } => unreachable!(),
                 UpdateCommand::Status => recab::update::status(),
                 UpdateCommand::Check => recab::update::check(),
                 UpdateCommand::Download { release } => recab::update::download(release.as_deref()),
@@ -668,7 +798,11 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
                 "  change: {} {}{}",
                 change.action,
                 change.package,
-                change.actor.as_ref().map(|actor| format!(" (by {actor})")).unwrap_or_default()
+                change
+                    .actor
+                    .as_ref()
+                    .map(|actor| format!(" (by {actor})"))
+                    .unwrap_or_default()
             );
         }
     }

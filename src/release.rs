@@ -297,6 +297,7 @@ fn validate_root(path: &Path, verified: &VerifiedRelease, produced: bool) -> Res
     let inventory =
         SystemInventory::parse(&fs::read(verified.member(&manifest.artifacts.inventory))?)?;
     let root = Root::open(path)?;
+    ensure!(root.metadata(Path::new(crate::merge::BASELINE))?.is_none(),"release images must not contain an installed personalized baseline");
     let identity = root
         .optional_text(Path::new("etc/os-release"))?
         .context("release has no os-release")?;
@@ -416,6 +417,9 @@ pub(crate) fn import_locked(
     manifest: &Path,
     trusted_local: bool,
 ) -> Result<ImportedRelease> {
+    import_locked_options(target,manifest,trusted_local,false)
+}
+pub(crate) fn import_locked_options(target:&Target,manifest:&Path,trusted_local:bool,allow_flavour:bool)->Result<ImportedRelease> {
     let parent = target.state_dir.join("releases");
     fs::create_dir_all(&parent)?;
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
@@ -425,7 +429,7 @@ pub(crate) fn import_locked(
         policy.trust.as_ref(),
         trusted_local,
         Some(&identity),
-        false,
+        allow_flavour,
         Some(&parent),
         None,
     )?;

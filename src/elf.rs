@@ -143,13 +143,16 @@ impl Elf {
     }
 }
 pub(crate) fn executable(root: &Root, relative: &Path, machine: u16, libc: &str) -> Result<()> {
+    linked(root,relative,machine,libc,true)
+}
+pub(crate) fn linked(root:&Root,relative:&Path,machine:u16,libc:&str,execute:bool)->Result<()> {
     let file = root.open_resolved(relative)?.ok_or_else(|| {
         refuse(format!(
             "required executable '{}' is missing",
             relative.display()
         ))
     })?;
-    if file.metadata()?.mode() & 0o111 == 0 {
+    if execute && file.metadata()?.mode() & 0o111 == 0 {
         return Err(refuse("required executable has no execute permission"));
     }
     let mut queue = vec![(root.resolved_path(&file)?, file)];

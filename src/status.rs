@@ -47,7 +47,7 @@ pub struct SlotView {
 }
 
 /// The schema of [`Status`].
-pub const STATUS_SCHEMA_VERSION: u32 = 8;
+pub const STATUS_SCHEMA_VERSION: u32 = 9;
 
 /// Where the two systems stand, in the terms a person is told. recab works
 /// it out here, once, from its own state, so that no front end rebuilds it

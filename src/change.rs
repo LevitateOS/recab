@@ -277,7 +277,7 @@ fn projection(
     crate::filesystem::flush(&out)?;
     Ok((projection, inventory, written))
 }
-fn produce(
+pub(crate) fn produce(
     sys: &System,
     request: &ChangeRequest,
     scope: &str,

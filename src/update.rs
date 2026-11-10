@@ -50,6 +50,8 @@ pub struct UpdateStatus {
     pub last_error: Option<String>,
     /// P08 selects/validates the release; filesystem merging is owned by P09.
     pub merge_complete: bool,
+    #[serde(default)]
+    pub merge: Option<crate::merge::MergeStatus>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Record {
@@ -77,6 +79,8 @@ struct Pending {
     revision: u64,
     release: String,
     trusted_local: bool,
+    #[serde(default)]
+    allow_flavour: bool,
 }
 fn directory(target: &Target) -> PathBuf {
     target.state_dir.join("updates")
@@ -657,7 +661,10 @@ fn pending(sys: &System) -> Result<Option<Pending>> {
         value.schema_version == 1
             && value.preparation == p.id
             && value.source_generation == p.source_generation
-            && value.revision.checked_add(1) == Some(p.revision),
+            && value
+                .revision
+                .checked_add(1)
+                .is_some_and(|r| p.revision >= r),
         "pending update preparation identity mismatch"
     );
     valid_id(&value.release)?;
@@ -687,6 +694,19 @@ pub(crate) fn view(sys: &System) -> Result<UpdateStatus> {
         view.pending_release = Some(value.release);
         view.pending_preparation = Some(value.preparation);
     }
+    if let Some(merge) = crate::merge::status(sys)?.filter(|m| {
+        view.pending_release
+            .as_ref()
+            .is_none_or(|id| id == &m.release)
+    }) {
+        view.merge_complete = merge.phase == "complete";
+        view.phase = merge.phase.clone();
+        if !view.merge_complete {
+            view.pending_release = Some(merge.release.clone());
+            view.pending_preparation = Some(merge.preparation.clone());
+        }
+        view.merge = Some(merge);
+    }
     Ok(view)
 }
 pub fn status() -> Result<UpdateStatus> {
@@ -701,14 +721,39 @@ pub fn apply(
     expected: Option<&str>,
     revision: Option<u64>,
 ) -> Result<UpdateStatus> {
+    apply_options(id, manifest, trusted_local, expected, revision, false)
+}
+pub(crate) fn apply_options(
+    id: Option<&str>,
+    manifest: Option<&Path>,
+    trusted_local: bool,
+    expected: Option<&str>,
+    revision: Option<u64>,
+    allow_flavour: bool,
+) -> Result<UpdateStatus> {
     let sys = System::locked("update-apply")?;
     crate::change::verify_source(&sys)?;
     if let Some(value) = pending(&sys)? {
+        let retry_id = if let Some(manifest) = manifest {
+            ensure!(
+                id.is_none(),
+                "choose a cached release or manifest, not both"
+            );
+            crate::release::import_locked_options(
+                &sys.target,
+                manifest,
+                value.trusted_local,
+                value.allow_flavour,
+            )?
+            .id
+        } else {
+            id.context("retry requires the selected release id or manifest")?
+                .to_owned()
+        };
         ensure!(
-            manifest.is_none()
-                && id == Some(value.release.as_str())
+            retry_id == value.release
                 && expected.is_none_or(|s| s == value.preparation)
-                && revision.is_none_or(|r| r == value.revision + 1),
+                && revision.is_none_or(|r| r == sys.state.preparation.as_ref().unwrap().revision),
             "another update is selected or preparation request is stale"
         );
         let input = crate::release::for_target(
@@ -719,17 +764,24 @@ pub fn apply(
                 .join(&value.release)
                 .join(format::MANIFEST),
             value.trusted_local,
-            false,
+            value.allow_flavour,
         )?;
         ensure!(input.id() == value.release, "selected cache changed");
-        return view(&sys);
+        drop(input);
+        crate::merge::start(
+            &sys,
+            &value.release,
+            value.trusted_local,
+            value.allow_flavour,
+        )?;
+        return view(&System::read(None)?);
     }
     let id = if let Some(path) = manifest {
         ensure!(
             id.is_none(),
             "choose a cached release or manifest, not both"
         );
-        crate::release::import_locked(&sys.target, path, trusted_local)?.id
+        crate::release::import_locked_options(&sys.target, path, trusted_local, allow_flavour)?.id
     } else {
         id.context("apply requires a cached release id or --manifest")?
             .to_owned()
@@ -743,9 +795,21 @@ pub fn apply(
             .join(&id)
             .join(format::MANIFEST),
         trusted_local,
-        false,
+        allow_flavour,
     )?;
     ensure!(input.id() == id, "cached release identity mismatch");
+    if crate::merge::status(&sys)?.is_some_and(|m| m.phase == "complete" && m.release == id) {
+        let p = sys
+            .state
+            .preparation
+            .as_ref()
+            .context("preparation missing")?;
+        ensure!(
+            expected.is_none_or(|id| id == p.id) && revision.is_none_or(|r| r == p.revision),
+            "stale preparation id/revision"
+        );
+        return view(&sys);
+    }
     let (installed, _) = crate::release::installed(&sys.target)?;
     ensure!(
         input.manifest().identity.sequence > installed.sequence,
@@ -776,7 +840,7 @@ pub fn apply(
             .join(&id)
             .join(format::MANIFEST),
         trusted_local,
-        false,
+        allow_flavour,
     )?;
     ensure!(input.id() == id, "cached release changed");
     save(
@@ -788,17 +852,24 @@ pub fn apply(
             revision: p.revision,
             release: id,
             trusted_local,
+            allow_flavour,
         },
     )?;
     let mut next = sys.state.clone();
     let p = next.preparation.as_mut().unwrap();
     p.operation = "update".into();
     p.phase = crate::PreparationPhase::Interrupted;
-    p.failure=Some("verified release selected; filesystem merge awaits P09 (cancel-update retains prepared changes)".into());
+    p.failure = Some("verified release selected; resume the captured release merge".into());
     p.revision += 1;
     sys.store.save(&next)?;
     let updated = System::read(None)?;
-    view(&updated)
+    crate::merge::start(
+        &updated,
+        &pending(&updated)?.unwrap().release,
+        trusted_local,
+        allow_flavour,
+    )?;
+    view(&System::read(None)?)
 }
 pub fn cancel(id: &str, revision: u64) -> Result<UpdateStatus> {
     let sys = System::locked("cancel-update")?;
@@ -809,6 +880,7 @@ pub fn cancel(id: &str, revision: u64) -> Result<UpdateStatus> {
         p.id == id && p.revision == revision,
         "stale preparation id/revision"
     );
+    crate::merge::cancel(&sys)?;
     let mut next = sys.state.clone();
     let p = next.preparation.as_mut().unwrap();
     p.operation = "prepare".into();

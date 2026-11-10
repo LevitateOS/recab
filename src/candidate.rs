@@ -294,14 +294,16 @@ fn runtime(root: &Root, machine: u16, libc: &str) -> Result<()> {
 }
 
 fn mounts(root: &Root, slot: Slot, uuid: &str, state: &str, esp: &str) -> Result<()> {
+    mounts_text(root,slot,uuid,state,esp,&text(root,"etc/fstab")?)
+}
+pub(crate) fn mounts_text(root:&Root,slot:Slot,uuid:&str,state:&str,esp:&str,fstab:&str)->Result<()> {
     let immutable = text(root, recinit::installed::IMMUTABLE_CONFIG)?;
     if immutable.split_whitespace().collect::<Vec<_>>()
         != [slot.to_string(), format!("PARTUUID={state}")]
     {
         return Err(refuse("candidate immutable slot/state identity is wrong"));
     }
-    let fstab = text(root, "etc/fstab")?;
-    crate::immutable::check(&root.location()?, &fstab)?;
+    crate::immutable::check(&root.location()?, fstab)?;
     let mut counts = [0; 5];
     for line in fstab.lines().filter(|l| !l.trim_start().starts_with('#')) {
         let f = line.split_whitespace().collect::<Vec<_>>();
@@ -367,7 +369,7 @@ fn mounts(root: &Root, slot: Slot, uuid: &str, state: &str, esp: &str) -> Result
     Ok(())
 }
 
-fn accounts(root: &Root) -> Result<()> {
+pub(crate) fn accounts(root: &Root) -> Result<()> {
     let mut tables = BTreeMap::new();
     for (file, fields) in [("passwd", 7), ("shadow", 9), ("group", 4), ("gshadow", 4)] {
         let p = format!("etc/{file}");
@@ -486,7 +488,17 @@ fn receipts(root: &Root) -> Result<()> {
     if let Some(text) = root.optional_text(Path::new(levitate_recipe::system::RECEIPT))? {
         let receipt = levitate_recipe::system::Receipt::parse(Some(&text))?;
         for package in receipt.packages.values() {
-            for path in package.files.keys() {
+            for (path,entry) in &package.files {
+                if entry.kind=="file" || entry.kind=="hardlink" {
+                    if let Some(mut file)=root.open_resolved(Path::new(path))? {
+                        let mut head=[0;20];let count=file.read(&mut head)?;
+                        if count==20 && &head[..4]==b"\x7fELF" && matches!(u16::from_le_bytes([head[16],head[17]]),2|3) {
+                            let os=root.optional_text(Path::new("etc/os-release"))?.context("package OS identity missing")?;
+                            let machine=if cfg!(target_arch="x86_64"){62}else{183};
+                            crate::elf::linked(root,Path::new(path),machine,&distro_profile::os_release_value(&os,"REC_LIBC").context("package libc missing")?,false)?;
+                        }
+                    }
+                }
                 if root.metadata(Path::new(path))?.is_none() {
                     return Err(refuse(format!(
                         "selected system package file is missing: {path}"

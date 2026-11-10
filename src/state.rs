@@ -435,8 +435,8 @@ pub(crate) enum Request {
 pub(crate) enum Operation {
     /// `recab init` set up the slots with this one holding the system.
     Init(Slot),
-    Stage(Slot),
     Prepare(Slot),
+    Update(Slot),
     Discard(Slot),
     Finalize(Slot),
     SetNext(Slot),
@@ -452,8 +452,8 @@ impl Operation {
     pub fn name(self) -> &'static str {
         match self {
             Operation::Init(_) => "init",
-            Operation::Stage(_) => "stage",
             Operation::Prepare(_) => "prepare",
+            Operation::Update(_) => "update",
             Operation::Discard(_) => "discard",
             Operation::Finalize(_) => "finalize",
             Operation::SetNext(_) => "set-next",
@@ -467,8 +467,8 @@ impl Operation {
     pub fn slot(self) -> Slot {
         match self {
             Operation::Init(slot)
-            | Operation::Stage(slot)
             | Operation::Prepare(slot)
+            | Operation::Update(slot)
             | Operation::Discard(slot)
             | Operation::Finalize(slot)
             | Operation::SetNext(slot)
@@ -726,68 +726,9 @@ pub(crate) fn plan(
             }
         }
         Request::Stage { id } => {
-            if state.preparation.is_some() {
-                return Err(refuse(
-                    "a preparation already exists; release staging cannot discard its pending work",
-                ));
-            }
-            if !committed(state, sel) {
-                return Err(refuse(format!(
-                    "slot {active} is running uncommitted, so slot {inactive} is the fallback; staging over it would leave no known-good system.\n\
-Run 'recab commit' to keep slot {active}, or reboot into slot {inactive}."
-                )));
-            }
-            if sel.next_boot() == Some(inactive) {
-                return Err(refuse(format!(
-                    "the next boot is slot {inactive}; run 'recab rollback' (or 'recab commit') so it is slot {active} before staging slot {inactive}"
-                )));
-            }
-            if sel.foreign_default {
-                return Err(refuse(format!(
-                    "systemd-boot boots another entry by default; run 'recab commit' so it is slot {active} before staging slot {inactive}"
-                )));
-            }
-            // After a one-shot boot of the running slot, the freshly written
-            // slot would boot as the default, untried.
-            if sel.default == Some(inactive) {
-                return Err(refuse(format!(
-                    "the default is slot {inactive}; run 'recab commit' so it is slot {active} before staging slot {inactive}"
-                )));
-            }
-            let source = state.require_ready(active)?;
-            next.preparation = Some(Preparation {
-                id,
-                slot: inactive,
-                source_slot: active,
-                source_generation: source.id.clone(),
-                revision: 0,
-                operation: "stage".into(),
-                phase: PreparationPhase::Staging,
-                completed_steps: 0,
-                failure: None,
-                synchronized: false,
-                synchronization: None,
-                finalization: None,
-                change: None,
-                last_change: None,
-                changes: Vec::new(),
-            });
-            next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
-            next.slot_mut(inactive)?.generation = None;
-            next.slot_mut(inactive)?.seal = None;
-            next.pending_trial_generation = None;
-            next.known_good_slot = Some(active);
-            // A new system in the slot ends any trial scheduled before.
-            next.pending_trial_slot = None;
-            // Its system is about to be replaced: nothing to roll back to.
-            if next.previous_good_slot == Some(inactive) {
-                next.previous_good_slot = None;
-            }
-            Transition {
-                operation: Operation::Stage(inactive),
-                next,
-                boot: None,
-            }
+            // Media staging uses the same preserving continuation. Input and
+            // merge verdicts are supplied by the release engine, not mkfs.
+            return plan(Request::Prepare {id,expected_id:None,expected_revision:None},sel,state);
         }
     };
     Ok(Some(transition))

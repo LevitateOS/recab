@@ -275,8 +275,9 @@ ended, failed units), shown by `recab status`, and audited.
 The CLI/library MUST additionally expose preparation, reopening, finalization,
 safe recovery/discard and update acquisition/application. Exact command names
 are not specified here; this list MUST NOT imply nonexistent commands work.
-Current `stage` formats and replaces the inactive system and does not meet the
-continuation requirements.
+`stage` now routes verified media/manifests through the preserving release merge;
+raw files require their corresponding manifest. Conflicts and recovery are
+exposed through `update conflicts`, `resolve`, `reproduce` and `recover`.
 
 **REQ-CLI-002**: `recab status` MUST report, at minimum:
 

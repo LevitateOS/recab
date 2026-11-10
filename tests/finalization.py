@@ -7,7 +7,7 @@ an actual VM boot can establish PID 1, hardware-driver and service behavior.
 import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
 sys.dont_write_bytecode=True
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--stage-recstrap',type=Path,help='also exercise destructive staging through the shared finalizer');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");args=p.parse_args()
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
 BIN=str(args.binary.resolve(strict=True));KERNEL=args.kernel.resolve(strict=True);MODULE=args.module.resolve(strict=True)
 GUID='4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
@@ -162,7 +162,7 @@ try:
         from updates import Updates
         updates=Updates(globals())
     image=base/'scratch.img'
-    root_mib=2560 if args.stage_recstrap else 128
+    root_mib=128
     state_mib=512 if args.updates else (128 if args.release_builder else 32)
     with image.open('wb') as f:f.truncate((root_mib*2+state_mib+112)*1024*1024)
     run('sfdisk',str(image),input=f'label:gpt\nsize={root_mib}M,type=L,name=TEST_A\nsize={root_mib}M,type=L,name=TEST_B\nsize={state_mib}M,type=L,name=TEST_STATE\nsize=96M,type=U,name=TEST_ESP\n'.encode())
@@ -211,6 +211,9 @@ try:
         modules=root/f'usr/lib/modules/{release}';(modules/'kernel').mkdir(parents=True);(modules/'kernel/test.ko').write_bytes(module);(modules/'modules.dep').write_bytes(dep);(modules/'modules.builtin').write_bytes(builtin)
         cli(dict(env,RECAB_ROOT=str(root)),'install-unit','--root',str(root),'--init',args.init)
         check((root/'usr/lib/recab/runtime.json').exists(),'producer runtime compatibility record missing')
+        if updates:
+            updates.seed(root,globals())
+            cli(dict(env,RECAB_ROOT=str(root)),'baseline','--root',str(root))
     def generation(slot):
         root=roots[slot];g={'inventory_digest':digest(cli(dict(env,RECAB_ROOT=str(root)),'inventory','--root',str(root))),'kernel_digest':kernel_hash,'initrd_digest':initrd_hash}
         g['id']=sha(packed([g['inventory_digest'],g['kernel_digest'],g['initrd_digest']]))
@@ -228,9 +231,6 @@ try:
     if args.installation:
         result=installation();success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     ga=generation('A');gb=generation('B')
-    if args.stage_recstrap:
-        release_image=base/'fixture.erofs';run('mkfs.erofs',str(release_image),str(roots['A']))
-        env['RECAB_RECSTRAP_BIN']=str(args.stage_recstrap.resolve(strict=True))
     fixture_prefix="levitateos" if args.release_builder else "lev"
     def legacy_entry(slot,g):
         (esp/f'loader/entries/{fixture_prefix}-{slot.lower()}.conf').write_text(f'title {slot}\nlinux /legacy/vmlinuz\ninitrd /legacy/initrd.img\noptions root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n')
@@ -248,14 +248,6 @@ try:
     def running(slot,g):
         (proc/'cmdline').write_text(f'root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n');(proc/'self/mountinfo').write_text(Path('/proc/self/mountinfo').read_text());return dict(env,RECAB_ROOT=str(roots[slot]))
     active=running(first,ga if first=='A' else gb)
-    if args.stage_recstrap:
-        cli(dict(active,RECAB_RECSTRAP_BIN='/usr/bin/false'),'stage','--rootfs',str(release_image),'--kernel',str(esp/'legacy/vmlinuz'),'--initrd',str(initrd),code=22)
-        failed_stage=cli(active,'status')['preparation'];check(run('blockdev','--getro',dev['B']).stdout.strip()==b'1' and not (esp/'loader/entries/lev-b.conf').exists(),'failed extraction left candidate writable/bootable')
-        cli(active,'discard','--preparation',failed_stage['id'],'--revision',str(failed_stage['revision']))
-        cli(active,'stage','--rootfs',str(release_image),'--kernel',str(esp/'legacy/vmlinuz'),'--initrd',str(initrd))
-        stage_status=cli(active,'status');check(stage_status['slots'][1]['generation_ready'],'staging bypassed/failed finalization')
-        check(run('blockdev','--getro',dev['B']).stdout.strip()==b'1','staging left candidate unprotected')
-        staged=stage_status['preparation'];cli(active,'discard','--preparation',staged['id'],'--revision',str(staged['revision']))
     prepared=cli(active,'prepare');check(prepared['phase']=='prepared','preparation did not complete')
     if updates:
         result=updates.exercise(globals(),active);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
@@ -335,7 +327,7 @@ try:
     object=esp/candidate['kernel'].lstrip('/');saved_object=object.read_bytes();object.write_bytes(saved_object[:-1]+bytes([saved_object[-1]^1]))
     cli(on_b,'set-next','A',code=21,contains='kernel content');object.write_bytes(saved_object)
     cli(on_b,'set-next','A');cli(on_b,'rollback')
-    success=True;print(json.dumps({'result':'PASS','init':args.init,'stage_checked':bool(args.stage_recstrap),'kernel_release':release,'interrupted_finalization_recovered':True,'publication_failure_recovered':True,'reverse_boot_bytes_written':back['boot_bytes_written'],'reused_boot_files':back['reused_boot_files'],'checks':['real ext4 roots and vfat ESP','full archive validation','runtime compatibility binding','durable intent','entry absent on interruption/failure','readonly block devices','generation-bound entries','set-next/commit/rollback in both directions','boot record tampering refusal','artifact reuse','local X preserved','foreign-reference collection','artifact tampering refusal']},indent=2))
+    success=True;print(json.dumps({'result':'PASS','init':args.init,'kernel_release':release,'interrupted_finalization_recovered':True,'publication_failure_recovered':True,'reverse_boot_bytes_written':back['boot_bytes_written'],'reused_boot_files':back['reused_boot_files'],'checks':['real ext4 roots and vfat ESP','full archive validation','runtime compatibility binding','durable intent','entry absent on interruption/failure','readonly block devices','generation-bound entries','set-next/commit/rollback in both directions','boot record tampering refusal','artifact reuse','local X preserved','foreign-reference collection','artifact tampering refusal']},indent=2))
 finally:
     if child is not None and child.poll() is None:child.kill();child.communicate(timeout=10)
     for key in sorted(mounts,key=lambda p:p.count('/'),reverse=True):subprocess.run(['umount',str(base/key)],check=False)

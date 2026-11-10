@@ -72,6 +72,7 @@ pub(crate) struct Synchronization {
     partuuid: String,
     temporary: String,
     selected: bool,
+    sources: BTreeMap<Vec<u8>, PathBuf>,
 }
 
 fn path(bytes: &[u8]) -> &Path {
@@ -446,6 +447,7 @@ impl Synchronization {
             partuuid: uuid.into(),
             temporary,
             selected: false,
+            sources: BTreeMap::new(),
         };
         result.capacity()?;
         Ok(result)
@@ -456,12 +458,20 @@ impl Synchronization {
     pub(crate) fn selected(
         source: &Path,
         destination: &Path,
-        mut desired: Inventory,
+        desired: Inventory,
         removals: &[String],
         slot: Slot,
         uuid: &str,
         id: &str,
     ) -> Result<Self> {
+        Self::selection(source,destination,desired,&removals.iter().map(|p|p.as_bytes().to_vec()).collect::<Vec<_>>(),slot,uuid,id,false,BTreeMap::new())
+    }
+    /// Complete, already resolved merge selection. Every descendant removal is
+    /// explicit; no recursive removal can cross into shared/runtime contents.
+    pub(crate) fn merged(source:&Path,destination:&Path,desired:Inventory,removals:&[Vec<u8>],slot:Slot,uuid:&str,id:&str,sources:BTreeMap<Vec<u8>,PathBuf>)->Result<Self> {
+        Self::selection(source,destination,desired,removals,slot,uuid,id,true,sources)
+    }
+    fn selection(source:&Path,destination:&Path,mut desired:Inventory,removals:&[Vec<u8>],slot:Slot,uuid:&str,id:&str,tree:bool,sources:BTreeMap<Vec<u8>,PathBuf>)->Result<Self> {
         let source = Root::open(source)?;
         let destination_root = Root::open(destination)?;
         desired.entries.retain(|n| !n.path.is_empty());
@@ -469,7 +479,7 @@ impl Synchronization {
             .entries
             .iter()
             .map(|n| path(&n.path).to_path_buf())
-            .chain(removals.iter().map(PathBuf::from))
+            .chain(removals.iter().map(|p|path(p).to_path_buf()))
             .collect::<Vec<_>>();
         let observed = Inventory::capture_paths(destination, &paths)?;
         let actual = observed
@@ -480,7 +490,7 @@ impl Synchronization {
         let mut operations = Vec::new();
         let mut deleting = removals
             .iter()
-            .map(|p| p.as_bytes().to_vec())
+            .cloned()
             .collect::<Vec<_>>();
         for node in &desired.entries {
             if actual
@@ -488,7 +498,7 @@ impl Synchronization {
                 .is_some_and(|old| old.kind != node.kind)
             {
                 if actual[&node.path].kind == "dir"
-                    && !destination_root.names(path(&node.path))?.is_empty()
+                    && !tree && !destination_root.names(path(&node.path))?.is_empty()
                 {
                     return Err(refuse(
                         "selected update cannot replace a populated directory",
@@ -502,7 +512,13 @@ impl Synchronization {
         for p in deleting {
             if let Some(old) = actual.get(&p) {
                 if old.kind == "dir" && !destination_root.names(path(&p))?.is_empty() {
-                    continue;
+                    if !tree { continue; }
+                    for name in destination_root.names(path(&p))? {
+                        let child=path(&p).join(name);
+                        if !removals.iter().any(|r|path(r)==child) {
+                            return Err(refuse("merge deletion has an unselected directory child"));
+                        }
+                    }
                 }
                 operations.push(Operation::Remove(p));
             }
@@ -537,6 +553,7 @@ impl Synchronization {
             partuuid: uuid.into(),
             temporary: format!(".recab-sync-{id}"),
             selected: true,
+            sources,
         };
         result.capacity()?;
         Ok(result)
@@ -835,13 +852,15 @@ impl Synchronization {
         }
         trait Input: Read + Seek {}
         impl<T: Read + Seek> Input for T {}
-        let mut input: Box<dyn Input> = if owned(&node.path) {
+        let mut input: Box<dyn Input> = if owned(&node.path) && !self.sources.contains_key(&node.path) {
             Box::new(std::io::Cursor::new(materialized(
                 &self.source,
                 &node.path,
                 self.slot,
                 &self.partuuid,
             )?))
+        } else if let Some(source)=self.sources.get(&node.path) {
+            Box::new(levitate_recipe::fsx::open_regular(source)?)
         } else {
             Box::new(entry(&self.source, &node.path)?.open()?)
         };

@@ -49,20 +49,20 @@ rollback. It does **not yet implement the full lifecycle above**:
 - `init` now populates B from the personalized A, verifies normalized equivalence,
   seals both roots and publishes both generation-bound entries. A starts
   committed/default; B is ready without a fabricated successful trial.
-- `stage` reformats the inactive slot and carries selected configuration from
-  the running slot, then uses the same validating/sealing finalizer. It cannot continue a system incrementally or preserve X
-  already prepared in the inactive slot when applying an update.
+- `stage` now imports a verified release and uses the same preserving merge as
+  `update apply`. It reuses the inactive filesystem and preparation, then
+  finalizes only a conflict-free candidate. Raw inputs require their manifest.
 - `prepare` now synchronizes the inactive ext4 filesystem in place in either
   direction, with whole-system inventories, range writes, durable preparation
   identity/revisions and recovery. Reopening preserves pending changes.
 - Synchronization finishes in `prepared`, while the slot remains incomplete for
   boot. `finalize` now validates and seals it, installs reusable boot artifacts,
   then publishes its entry. Recipe now applies software/configuration changes
-  to that preparation. Downloaded release merging remains incomplete.
+  to that preparation. Release merging now preserves X or reports conflicts.
 - Signed update discovery/download now run through Recipe, with pinned releases,
   bounded networking, verified caching and interruption recovery. Offline apply
-  selects inputs while preserving X; P09 filesystem merging and conflicts remain
-  incomplete. `stage` refuses an existing preparation to protect X.
+  merges the pinned release against its retained baseline and prepared changes.
+  Conflicts, incomplete reproductions and partial merges block finalization.
 - Root's Recipe install/update/remove commands on immutable A/B installs delegate
   to recab. Package selection and `/usr/lib/recipe/profile` belong to each slot;
   independent per-user profiles and output-only builders retain their own routes.
@@ -102,9 +102,9 @@ from its purpose. The commands below describe the existing implementation.
 - `recab baseline --root <dir>`
 - `recab install-unit [--root <dir>] --init <systemd|openrc> [--bin <path>]`
 
-A release-image update with today's destructive staging path, starting in A
-(use A as the trial target instead when running B). This replaces the inactive
-system. It refuses to run while a preparation exists:
+A verified media update, starting in A (use A as the trial target when running
+B). Existing prepared changes participate in the merge; conflicts must be resolved
+before finalization and trial selection:
 
 ```sh
 recab stage --from-media /dev/sr0   # verifies its release.json and complete bound set
@@ -177,7 +177,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   boot record, manifest and artifacts before changing selection. The initramfs
   checks `recab.slot`, root PARTUUID and `recab.generation` against the sealed
   root before starting init, and protects both root devices.
-- `status --json` (schema 8) also says where the two systems stand in one
+- `status --json` (schema 9) also says where the two systems stand in one
   word, so front ends need not work it out from slots and phases:
   `lifecycle.state` is `stable`, `open`, `working`, `interrupted`, `ready`,
   `restart_set`, `on_trial`, `trial_failed` or `unusable`; `lifecycle.other`
@@ -248,51 +248,13 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   variable, else `loader.conf`'s `default`, skipping an entry whose files are
   missing from the ESP (systemd-boot skips it too). A trial is pending while
   `LoaderEntryOneShot` names a bootable slot entry.
-- `stage` writes a prebuilt system into the inactive slot. Before it changes
-  anything on the slot it checks (refusing with exit 21):
-  - the rootfs is an `.erofs` file or block device with an EROFS superblock
-    (magic `0xE0F5E1E2` at byte 1024), and the kernel and initrd are files;
-  - the initramfs supports immutable boot, `/var` is a separate ext4 state
-    partition, and the image matches the running distro and init system
-    (and flavour unless `--change-flavour` is given);
-  - none of the rootfs, kernel and initrd is inside the slot's kernel directory
-    (`/boot/<id>-a|b/`), which stage removes first: copy them elsewhere;
-  - the independent slot mapping names its partition by PARTUUID, the partition
-    has a PARTUUID, is not the running root, and is not mounted;
-  - the rootfs is not the slot's partition, a rootfs partition is not mounted,
-    and the compressed image fits; expanded files, carried configuration,
-    filesystem overhead margin and inode demand must also fit;
-  - carried-path parents/types, complete metadata baseline, account collisions,
-    fstab and immutable layout are valid. Reads and writes stay within opened
-    directory descriptors; absolute image links cannot resolve against the host.
-
-  It needs efivarfs (exit 20 without): a `LoaderEntryDefault` naming another
-  entry than the running slot's, or a `LoaderEntryOneShot` naming the slot
-  while no trial is pending, is skipped by systemd-boot while the slot has no
-  kernel, but would boot the freshly written slot (as the default, untried)
-  once it has one. After input checks, stage records the slot as no longer a
-  rollback target, points a stale default at the running slot and removes such
-  a one-shot before removing the slot's kernel directory. It aborts if those
-  firmware changes fail. It then formats the partition with the
-  filesystem and label recpart's layout gives the slot, extracts the image with
-  `recstrap`, and carries over the machine state the new image lists in
-  `/usr/lib/recab/carried` (packaged with recab). A baseline records the original
-  image's selected paths; changed files win over the release's whole file, with
-  no three-way conflict report. The transitional baseline detects content, mode,
-  owner, link and xattr changes/removals. Account carry checks numeric identities
-  across the complete set and refuses ambiguous additions/deletions, identity
-  migration and differing membership until structured merging arrives in P09.
-  Rewritten account files retain the image's ownership and xattrs. This remains
-  selected configuration carry, not preservation of all system changes.
-  The new `fstab` names the slot's root by PARTUUID. `--from-media` mounts a
-  release medium read-only and requires its rootfs, kernel and installed
-  initramfs. A/B staging requires an initramfs supporting immutable boot.
-  Last it installs the kernel (and initrd) and rewrites the entry's
-  `linux`/`initrd` lines, with `panic=10` and the trial options (below). It
-  refuses while the running slot is uncommitted (the other slot is then the
-  only fallback) and while the slot is the next boot or the default. Some
-  predictable checks run before invalidation. Unexpected extraction, I/O or
-  publication failures can still leave the inactive slot incomplete and unavailable.
+- `stage` verifies its complete release set, creates/reopens the inactive
+  continuation and runs the same O/C/N merge as `update apply`. It does not format
+  or erase a preparation. Conflicts remain inspectable through `update conflicts`;
+  resolving them applies the captured plan, after which `finalize` publishes it.
+  A conflict-free stage finalizes automatically. Media stays read-only. Raw
+  rootfs/kernel/initramfs inputs must match the corresponding signed manifest;
+  use `--manifest --trusted-local` explicitly for unsigned development media.
 - `set-next` sets a one-shot boot of the inactive slot (`LoaderEntryOneShot`)
   and adds the trial options to its entry. A `LoaderEntryDefault` naming
   another entry than the known-good default (one systemd-boot skips) is first
@@ -341,8 +303,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
 
 ### Trial options
 
-While a slot is a trial (scheduled with `set-next`, or staged and not yet
-committed), its entry carries the trial options: recinit's fail-reboot word
+While a slot is scheduled/running as a trial through `set-next`, its entry carries the trial options: recinit's fail-reboot word
 (`recinit::live::FAIL_REBOOT_OPTION`) when the entry boots through an
 initramfs, so the initramfs reboots instead of opening an emergency shell, and
 the init's crash option (systemd's `systemd.crash_action=reboot`; OpenRC has
@@ -415,9 +376,8 @@ recab writes systemd-boot's variables there itself (clearing the immutable flag
 efivarfs sets, one write per variable), as `bootctl` would, so it needs no
 `bootctl`: AcornOS installs only systemd-boot's EFI binary.
 
-`stage` also uses `blkid`, `mkfs.ext4` and `mount` (util-linux, e2fsprogs),
-`chroot` and `recstrap`; it copies files itself, so busybox systems work. `init`
-uses `blkid`. `prepare` uses `blkid`, `mount` and `umount`, requires mount
+`stage` uses the same `blkid`/`mount`/`umount` and confined range writer as
+preparation; it does not run mkfs, chroot or recstrap. `init` uses `blkid`. `prepare` uses `blkid`, `mount` and `umount`, requires mount
 namespace/device access, and refuses an already mounted inactive partition.
 
 ## Security
@@ -433,7 +393,8 @@ Every operation that writes (`init`, `stage`, `set-next`, `commit`, `rollback`,
 | `src/systemd_boot.rs` | The boot selection: entries, `loader.conf`, EFI variables, slot kernels, trial options on entries |
 | `src/store.rs` | The state file, audit log, lock and durable file replacement |
 | `src/init.rs`, `src/installation.rs` | Single-root boot setup and recoverable equivalent A/B installation |
-| `src/stage.rs` | The current destructive release-image update path |
+| `src/stage.rs` | Manifest/media adapter to the preserving release merge |
+| `src/merge.rs`, `src/merge_accounts.rs` | Frozen O/C/N plans, structured accounts, conflicts, resolution and recovery |
 | `src/immutable.rs` | Read-only system configuration and immutable-initramfs compatibility |
 | `src/filesystem.rs` | Directory-FD-confined filesystem access and complete xattrs |
 | `src/generation.rs` | Deterministic system inventories, generation identity and slot markers |
@@ -445,7 +406,7 @@ Every operation that writes (`init`, `stage`, `set-next`, `commit`, `rollback`,
 | `src/slot_mount.rs` | Checked inactive ext4 mounts and device protection restoration |
 | `src/init_system.rs` | The init adapter: startup and failures (`health`), reboot, the crash option |
 | `src/package.rs`, `src/services/` | The trial service files and the carried-state list recab's package carries |
-| `src/carry.rs` | The carried-state list, configuration baseline, copying and account merge |
+| `src/carry.rs` | Legacy baseline compatibility and owned root-reference materialization |
 | `src/error.rs` | Error classes and exit codes |
 
 ## Tests
@@ -494,7 +455,7 @@ installed distribution key is configured. With a key, a detached Ed25519
 signature of the exact manifest bytes is mandatory. Trust comes from
 `/usr/lib/recab/update-source.json`, never the incoming release. The current
 variant defaults have no production endpoint/key. Online discovery/acquisition is
-implemented; preserving X while merging release files remains P09.
+implemented, including baseline-aware merging of the prepared continuation.
 
 Import verifies identity/compatibility, copies and hashes the exact inputs into
 a private read-only set, mounts its actual EROFS image and checks the complete
@@ -508,9 +469,9 @@ existing cache bytes are rechecked. It does not mutate a candidate or ledger.
 before invalidating the candidate. Media must carry the release manifest;
 matching filenames alone no longer establish a release set. For unsigned
 local/development media add `--trusted-local` explicitly. These staging commands
-still replace the inactive system and refuse an existing preparation. Explicit
-legacy `--rootfs/--kernel/--initrd` staging remains available pending P12 and does
-not provide manifest authentication.
+use the preserving merge and accept an existing preparation. Raw
+`--rootfs/--kernel/--initrd` inputs must match their corresponding manifest;
+unbound raw images are refused.
 
 The focused fixture extends `tests/finalization.py` with
 `--release-builder /absolute/path/to/distro-builder`. Build only those CLI/library
@@ -629,7 +590,7 @@ Read once per command (`src/target.rs`), to point recab at a scratch tree.
 Whether the variables directory is efivarfs is read from the filesystem: a
 plain directory holds the variables as plain files.
 
-- `RECAB_ROOT` (default `/`): the running system's root, which `stage` carries the machine's state from
+- `RECAB_ROOT` (default `/`): the running system's protected source root
 - `RECAB_OS_RELEASE_PATH` (default: the root's `etc/os-release`, else `usr/lib/os-release`; its `ID` names the entries and its `REC_INIT` picks the init system)
 - `RECAB_BOOT_ROOT` (default `/boot`)
 - `RECAB_STATE_DIR` (default `/var/lib/recab`: `state.json` and `audit.log`)
@@ -639,7 +600,7 @@ plain directory holds the variables as plain files.
 - `RECAB_EFIVARS_PATH` (default `/sys/firmware/efi/efivars`)
 - `RECAB_STAGE_DIR` (default `/run/recab`, where `stage` mounts the medium, the image and the slot)
 - `RECAB_OPENRC_DIR` (default `/run/openrc`) and `RECAB_RUNLEVELS_DIR` (default the root's `etc/runlevels`), read on OpenRC
-- `RECAB_SYSTEMCTL_BIN` (default `systemctl`), `RECAB_RC_STATUS_BIN` (default `rc-status`), `RECAB_REBOOT_BIN` (default `reboot`, busybox init's, used on OpenRC), `RECAB_RECSTRAP_BIN` (default `recstrap`)
+- `RECAB_SYSTEMCTL_BIN` (default `systemctl`), `RECAB_RC_STATUS_BIN` (default `rc-status`), `RECAB_REBOOT_BIN` (default `reboot`, busybox init's, used on OpenRC)
 
 ## Ownership
 
@@ -653,8 +614,7 @@ updater. Missing implementation belongs in these existing owners.
 
 The focused P04 check is `tests/finalization.py --binary <recab> --kernel
 <existing-UEFI-kernel> --module <matching-ko> --init <systemd|openrc>` (root/loop
-access required; `--stage-recstrap <recstrap>` additionally checks release-image
-extraction/failure through the shared finalizer). It uses real ext4 roots and a vfat ESP and exercises interrupted
+access required). It uses real ext4 roots and a vfat ESP and exercises interrupted
 intent, publication failure/retry, sealing, A→B→A selection/commit/rollback, boot
 record/artifact tampering refusal, preservation of local X, safe collection with
 foreign boot references, and zero repeated boot payload writes. Its native ELF
@@ -687,7 +647,7 @@ recab update check                # verifies signed index and manifest
 recab update download            # pins the checked release; copy its returned id
 recab update download <id>       # retry that exact release, even after restart
 recab update status
-recab update apply <id>          # offline verification/selection, awaiting P09 merge
+recab update apply <id>          # offline merge, retaining X or reporting conflicts
 # Or select mounted media: recab update apply --manifest /mnt/release/release.json
 recab update cancel --preparation <id> --revision <n>
 ```
@@ -706,23 +666,100 @@ EROFS/kernel/initramfs/inventory set through the P07 importer. A cached release
 can be reverified and selected with the network disconnected. These commands
 work for either active slot.
 
-Status schema 8 adds `updates`. Download progress reports verified files/bytes,
+Status schema 9 reports `updates` and its structured `merge`. Download progress reports verified files/bytes,
 reused objects and Recipe process I/O for the current attempt. Failed producers
 can have unreported writes, so `accounting_complete` is false after interruption.
 Counts exclude other verification/cache copies, filesystem journals and device
 writes; no SMART or zero-write claim is made. Failed Recipe diagnostics remain
 in the private update work directory; successful invocation work is removed.
 
-P08's `apply` is a durable offline handoff to P09, not a completed release merge.
-It reuses an existing preparation without reseeding X, verifies/cache-pins the
-selected inputs and reports `awaiting_merge`, `merge_complete: false`. It blocks
-edits/finalization of that preparation until merging is implemented or the
-selection is cancelled. `cancel` requires the current preparation ID/revision
-and restores it without discarding X. Explicit `discard` abandons the selection
-and preparation. Cached/pinned release inputs remain retained for reuse.
+`update apply` now merges the exact verified release into the preparation. An
+unresolved or partially applied merge blocks ordinary edits and finalization.
+`cancel` requires the current preparation ID/revision and retains X before
+release application starts. Once writes start, recover the captured plan;
+cancellation cannot reconstruct discarded release-side choices. Explicit
+`discard` abandons the preparation. Cached release inputs remain retained.
 
 Focused integration uses `tests/finalization.py --release-builder <builder>
 --updates <recipe>` with existing native kernel/module artifacts and a matching
 Ginux launcher; `--updates-running B` exercises B to A. It runs a genuine signed local HTTP feed, disconnect/retry,
 index rollback refusal, offline reuse/selection and cancellation while X is
 prepared. It does not build a distribution or boot a VM.
+
+
+## Release merging, conflicts and recovery (P09)
+
+O is the original release baseline, C is the prepared system (including committed
+local changes and X), and N is the verified incoming release. When C equals O,
+take N, including deletions. When N equals O, keep C, including local deletions.
+When C equals N, keep that result. Otherwise report a conflict. Content, ownership,
+modes, xattrs, symlinks and hardlink groups participate; directory replacement
+conflicts select complete subtrees. Release timestamps are image-writer policy,
+not evidence of a separate content edit. Kernel-assigned SELinux labels are
+retained when incoming metadata declares none, as in Recipe publication.
+
+The installer calls `baseline` before personalization. The protected slot file
+`/usr/lib/recab/release-baseline.json` stores fingerprints and account-field/member
+fingerprints, separate from personalized generation identity. It contains no
+account bodies, password hashes or private keys. Verified adoption and subsequent
+updates also retain the exact release ID/cache. Older installs without a known
+baseline stop visibly; provide the signed original release with
+`update adopt-baseline --manifest OLD/release.json`. Recab never guesses O from C.
+
+```sh
+recab update apply <release-id>
+recab update conflicts
+recab update resolve <conflict-id> --choice local --preparation ID --revision N
+recab update resolve <conflict-id> --choice release --preparation ID --revision N
+recab update resolve <conflict-id> --choice edited --file ./resolved.conf --preparation ID --revision N
+recab update recover --preparation ID --revision N
+recab finalize
+```
+
+Use the current preparation/revision from each result; stale requests fail.
+Edited input is a regular file of at most 1 MiB; its contents and intended mode,
+UID/GID and xattrs are imported explicitly. Directory and hardlink conflicts
+choose a complete side. Account local/release choices select colliding fields,
+preserving unrelated changes; edited account input explicitly replaces the file.
+Membership is merged by presence, so removed users/groups/members do not return
+through unconditional unions. Duplicate names/IDs, missing primary groups,
+passwd/shadow/group/gshadow inconsistencies and invalid file-owner identities
+stop before release writes. Recab does not remap shared user data.
+
+The merge plan captures C once, pins N and persists choices before applying any
+release files. After a kill, `recover` uses that plan and verifies its retained
+inputs; it never recalculates X from a partly updated tree. Account/edited bodies
+remain only in protected candidate work files, which are removed on completion;
+shared state/status carries fingerprints and redacted errors. A failed validation
+or partial merge leaves the baseline incomplete and candidate unavailable. The
+baseline advances only after the complete resolved tree passes account, receipt,
+runtime and matching kernel/module/initramfs validation. The finalizer reuses that
+pinned boot set automatically, including after further local changes Y.
+
+Local Recipe selection and receipts are retained. Changes to runtime libraries
+conservatively require reproduction of selected native ELF packages through
+Recipe. Module packages also require reproduction when the kernel binding
+changes. `package_rebuild` cannot be bypassed with a local/release choice:
+
+```sh
+recab update reproduce PACKAGE --recipe ./compatible.rhai --preparation ID --revision N
+```
+
+The producer declares `NEEDS.inputs.release` as a file. Recab supplies the exact
+verified manifest and `RECAB_RELEASE_BASE` define, forces a fresh isolated
+production, and requires `ctx.recab_release` to acknowledge that ID. The recipe
+must use compatible toolchain/dependencies for that target; this handshake is
+provenance, not a general ABI proof. Reconciliation refuses administrator-owned
+collisions and retains dependency selection; final validation checks native ELF
+loaders/library closure. The worker receives no running/prepared tree. A package
+claiming a changed release-owned path requires an explicit local choice, compatible
+reproduction, or cancellation and removal through Recipe before retrying.
+
+Focused native integration uses `--updates <recipe> --release-builder <builder>`
+with `--updates-running B` for B to A. Optional `--adopt-baseline`,
+`--merge-id-collision`, `--update-kernel <existing-kernel> --update-module <ko>`
+exercise migration, ID collision refusal and an actual different cached kernel.
+The fixture covers deletions, metadata/type conflicts, edited resolution, account
+fields/member removal, Recipe reproduction, actual partial-write kill, frozen-input
+tampering, recovery, later Y and bound finalization. No full distro/kernel/ISO
+build or VM boot is implied.

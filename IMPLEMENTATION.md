@@ -235,7 +235,8 @@ read-only verified inputs. Running A, prepared B with pending X, state and boot
 entries remain unchanged. The host lacks EROFS zstd, so mounted consumer checks
 use a genuine small LZ4 fixture; producer provenance avoids that host limitation.
 No full distro/ISO/kernel builds or VM boots were run. P08 acquisition/index
-publishing is implemented below; P09 release merging remains outstanding.
+publishing and P09 release merging are implemented below; P10/P11 assessment and
+complete frontend work remain.
 
 The starting-point description below records the pre-implementation audit.
 
@@ -736,9 +737,10 @@ P08 implementation:
   verifies immutable objects and publishes hash-addressed index signatures before
   replacing the index. The builder packages the endpoint-specific recipe/policy.
   No production endpoint or key has been invented or configured.
-- Offline `update apply` reverifies cached/media inputs, prepares/reuses the
+- The initial P08 `update apply` handoff reverifies cached/media inputs, prepares/reuses the
   inactive system without reseeding X, and pins a durable selection. It reports
-  `awaiting_merge` and `merge_complete: false`; P09 owns actual release merging.
+  `awaiting_merge` and `merge_complete: false`; P09 below now consumes this
+  selection and performs the merge.
   Edits/finalization remain blocked until merge or CAS-checked cancellation;
   cancellation restores the preparation and retains X. This is an explicit
   handoff, never destructive `stage` or a false completed-update claim.
@@ -769,6 +771,42 @@ conflict/status CLI and Recipe adapter. Depends on P06 through P08.
 Evidence: X plus update succeeds in one B preparation; unrelated release changes
 arrive, deliberate removals remain removed, colliding edits stop visibly, and
 recovery after partial merge preserves the originally captured X.
+
+P09 implementation:
+
+- `merge.rs` captures O/C/N fingerprints, original preparation identity/revision,
+  pinned release and explicit choices before writing release files. It reports
+  structured content/metadata, deletion, directory/tree, hardlink, account,
+  release-identity and package conflicts. CAS-checked resolution imports local,
+  release or bounded edited input. Recovery resumes that plan rather than
+  calculating local intent from a mixed root. A durable validated checkpoint
+  also resumes completion after private input cleanup.
+- Baselines are captured before installer personalization, remain protected in
+  the generation and contain account-field/member fingerprints, never account
+  secrets. Missing/unsafe O blocks with a conflict. Explicit verified original
+  release adoption populates O without changing the running system. Baselines
+  advance only after complete candidate validation and flushing.
+- Structured accounts preserve per-field changes and membership removals.
+  Duplicate IDs, inconsistent tables, primary-group and file-owner failures
+  stop before release application. Shared IDs/data are never silently remapped.
+- Local Recipe receipts/selection survive. Runtime-library changes require
+  native ELF package reproduction through the existing isolated Recipe engine,
+  using a small pinned release input and explicit base acknowledgement. Failed
+  producers leave C and the revision intact. No system tree is a producer input.
+  Compatible target toolchains/dependencies remain the recipe's responsibility;
+  acknowledgement is provenance, not a universal ABI proof.
+- Resolved writes use the existing incremental range/metadata writer, including
+  explicit descendant removals. Account and edited bodies remain in protected
+  candidate work, not shared logs. The finalizer reuses the selected release's
+  verified kernel/initramfs after merge and after later Y. Ordinary staging now
+  uses this engine, accepts an existing preparation and performs no mkfs or
+  unconditional inactive-configuration deletion. Raw files require a manifest.
+- Focused native fixtures cover both slot directions, deletions, conflict
+  inspection/cancellation/resolution, metadata and directory changes, structured
+  account/member changes, real Recipe reproduction, a kill after a release file
+  was written, frozen-input tampering refusal, captured-C recovery, hardlinks,
+  idempotent apply and later changes. Full system builds and VM boots remain
+  explicitly unrun; P10 health/fallback and P11 complete frontend flows remain.
 
 ### P10 Make trial and fallback cover assessment failures
 

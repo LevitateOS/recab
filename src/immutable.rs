@@ -2,25 +2,13 @@
 //! read-only, including /etc. User data remains on shared /var.
 
 use anyhow::{Context, Result};
-use recinit::installed::{check_immutable_initramfs, IMMUTABLE_CONFIG};
+use recinit::installed::IMMUTABLE_CONFIG;
 use std::path::Path;
 
 use crate::error::refuse;
 use crate::filesystem::Root;
 use crate::state::Slot;
 use crate::target::{partuuid, Target};
-
-pub(crate) fn check_initramfs(initrd: Option<&Path>) -> Result<()> {
-    let path = initrd.ok_or_else(|| {
-        refuse("immutable A/B boot requires --initrd: use the release's installed-system initramfs")
-    })?;
-    check_immutable_initramfs(path).map_err(|err| {
-        refuse(format!(
-            "initramfs '{}': {err}; use a release with immutable A/B boot support",
-            path.display()
-        ))
-    })
-}
 
 /// The shared state partition must be mounted separately from the system.
 pub(crate) fn state_partition(target: &Target) -> Result<String> {
