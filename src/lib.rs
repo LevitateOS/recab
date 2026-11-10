@@ -19,6 +19,8 @@ mod entry;
 pub mod contract;
 mod error;
 mod init;
+mod immutable;
+mod filesystem;
 mod init_system;
 mod package;
 mod stage;
@@ -75,7 +77,8 @@ pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
     let slot = transition.operation_slot();
     // Stage resets stale firmware variables before it writes the slot.
     sys.backend.can_change()?;
-    let staged = stage::check(&sys.target, &sys.backend, &sys.boot, slot, source, change_flavour)?;
+    let staged = stage::check(&sys.target, &sys.backend, &sys.boot, slot, source, change_flavour)
+        .map_err(|err| error::or_class(err, ErrorClass::StateOrDetection))?;
     // Recorded before the slot is touched: from here its old system is gone,
     // so nothing may roll back to it, even if the write fails.
     sys.apply(&transition)?;

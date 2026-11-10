@@ -86,7 +86,9 @@ impl SystemdBoot {
         let Some(text) = target_root::read_optional(&path)? else {
             return Ok(Some(path.display().to_string()));
         };
-        for file in Entry::parse(&text).boot_files() {
+        let files = Entry::parse(&text).boot_files();
+        if files.is_empty() { return Ok(Some("entry has no boot loader target".into())); }
+        for file in files {
             if !target_root::exists(&self.target.esp.join(file.trim_start_matches('/')))? {
                 return Ok(Some(file));
             }
@@ -299,7 +301,8 @@ impl SystemdBoot {
         let entries_dir = self.entries_dir();
         fs::create_dir_all(&entries_dir).with_context(|| format!("creating '{}'", entries_dir.display()))?;
         for (slot, title, partuuid) in entries {
-            let entry = Entry::new(title, &layout_name(&prefix, *slot), initrd.is_some(), partuuid, options);
+            let mut entry = Entry::new(title, &layout_name(&prefix, *slot), initrd.is_some(), partuuid, options);
+            if slot.is_some() { entry.make_immutable(); }
             let path = entries_dir.join(entry_file(&prefix, *slot));
             target_root::write_durable(&path, entry.render().as_bytes(), None)
                 .with_context(|| format!("writing '{}'", path.display()))?;
@@ -401,6 +404,7 @@ impl SlotWrite<'_> {
         let id = entry_name(prefix, slot);
         let mut entry = backend.entry(prefix, Some(slot))?.ok_or_else(|| backend.missing_entry(&id))?;
         entry.set_boot_files(&layout_name(prefix, Some(slot)), initrd.is_some());
+        entry.make_immutable();
         make_trial(&mut entry, init);
         let path = backend.entries_dir().join(&id);
         target_root::write_durable(&path, entry.render().as_bytes(), None)

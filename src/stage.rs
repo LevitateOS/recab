@@ -12,7 +12,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::carry::{self, fstab_for_slot, merge_accounts, Baseline, Carry};
+use crate::carry::{self, fstab_for_slot, merge_accounts, Baseline, Carry, CarryPlan};
+use crate::filesystem::Root;
 use crate::error::{classified, refuse, ErrorClass};
 use crate::state::Slot;
 use crate::systemd_boot::{Boot, SlotWrite, SystemdBoot};
@@ -49,13 +50,14 @@ pub(crate) struct StagePlan {
     kernel: PathBuf,
     initrd: Option<PathBuf>,
     /// The image's carried list, and the running slot's baseline.
-    list: Vec<Carry>,
-    baseline: Option<Baseline>,
+    baseline: Baseline,
+    carry: CarryPlan,
     /// Files written into the new slot as prepared: merged account files
     /// and the fstab, with their mode.
     prepared: Vec<(String, String, u32)>,
     /// The image's init system (the running system's).
     init: InitSystem,
+    state_partition: String,
     /// The release medium, mounted until the slot is written.
     _medium: Option<Mounted>,
 }
@@ -72,6 +74,8 @@ pub(crate) fn check(
     source: &StageSource,
     change_flavour: bool,
 ) -> Result<StagePlan> {
+    crate::immutable::require_readonly(target)?;
+    crate::filesystem::private_mounts()?;
     let (medium, request) = match source {
         StageSource::Files(request) => (None, request.clone()),
         StageSource::Media(media) => open_media(target, media)?,
@@ -86,6 +90,8 @@ pub(crate) fn check(
         })?;
     let is_partition = rootfs.rdev.is_some();
     let (kernel, initrd) = check_files(backend, boot, slot, &request)?;
+    crate::immutable::check_initramfs(initrd.as_deref())?;
+    let state_partition = crate::immutable::state_partition(target)?;
     let (device, partuuid) = check_partition(target, backend, boot, slot, &rootfs)?;
 
     let filesystems = target_root::read_optional(&target.proc_dir.join("filesystems"))?.unwrap_or_default();
@@ -98,38 +104,42 @@ pub(crate) fn check(
     fs::create_dir_all(&point).with_context(|| format!("creating '{}'", point.display()))?;
     let options = if is_partition { "ro" } else { "ro,loop" };
     let mounted = Mounted::new(target, &["-t", "erofs", "-o", options], &rootfs.path, &point)?;
-    let image = read_image(target, &point, &rootfs.path, change_flavour);
+    let checked = (|| {
+        let image = read_image(target, &point, &rootfs.path, change_flavour)?;
+        let baseline = Baseline::read(&target.root)?;
+        let running = Root::open(&target.root)?;
+        let mut prepared = Vec::new();
+        for (rel, text, mode) in &image.accounts {
+            let machine = running.optional_text(Path::new(rel))?;
+            let merged = match machine {
+                Some(_) if baseline.as_ref().map(|b| b.unchanged(&target.root, rel)).transpose()?.unwrap_or(false) => account_merge(rel, text, text)?,
+                Some(machine) => account_merge(rel, text, &machine)?,
+                None => return Err(refuse(format!("local account file '{rel}' is absent; structured baseline merging is required"))),
+            };
+            prepared.push((rel.clone(), merged, *mode));
+        }
+        let fstab = image.list.iter().find_map(|c| matches!(c, Carry::Fstab(_)).then(|| c.path().to_string())).unwrap_or_else(|| FSTAB.into());
+        if fstab != FSTAB { return Err(refuse("the carried fstab must be etc/fstab")); }
+        let machine_fstab = running.optional_text(Path::new(&fstab))?.ok_or_else(|| refuse("the running system has no fstab"))?;
+        let rendered = fstab_for_slot(&machine_fstab, &partuuid, slot_role(slot).filesystem().as_str())?;
+        crate::immutable::check(&point, &rendered)?;
+        prepared.push((fstab, rendered, 0o644));
+        let carry = CarryPlan::check(&target.root, &point, &image.list, baseline.as_ref())?;
+        let baseline = Baseline::capture(&point, &image.list)?;
+        let slot_bytes = target_root::block_device_bytes(&device)?;
+        let (expanded, image_entries) = expanded_usage(&point)?;
+        let (running_config, carried_entries) = carry.additional_usage()?;
+        let required = expanded.saturating_add(running_config).saturating_add(16 * 1024 * 1024);
+        check_inode_capacity(slot, &device, image_entries.saturating_add(carried_entries).saturating_add(128))?;
+        if required > slot_bytes.saturating_mul(95) / 100 {
+            return Err(refuse(format!("expanded system and configuration need at least {required} bytes, exceeding slot capacity {slot_bytes}")));
+        }
+        Ok(StagePlan { slot, device, rootfs: rootfs.path, kernel, initrd, baseline, carry,
+            prepared, init: image.init, state_partition, _medium: medium })
+    })();
     mounted.unmount()?;
-    let image = image?;
+    checked
 
-    let mut prepared = Vec::new();
-    for (rel, text, mode) in &image.accounts {
-        let machine = target_root::read_optional(&target.root.join(rel))?;
-        let merged = match machine {
-            Some(machine) => account_merge(rel, text, &machine)?,
-            None => text.clone(),
-        };
-        prepared.push((rel.clone(), merged, *mode));
-    }
-    let fstab = image.list.iter().find_map(|c| matches!(c, Carry::Fstab(_)).then(|| c.path().to_string()));
-    let fstab = fstab.unwrap_or_else(|| FSTAB.to_string());
-    let machine_fstab = fs::read_to_string(target.root.join(&fstab))
-        .with_context(|| format!("reading '{}'", target.root.join(&fstab).display()))?;
-    let role = slot_role(slot);
-    prepared.push((fstab, fstab_for_slot(&machine_fstab, &partuuid, role.filesystem().as_str())?, 0o644));
-
-    Ok(StagePlan {
-        slot,
-        device,
-        rootfs: rootfs.path,
-        kernel,
-        initrd,
-        list: image.list,
-        baseline: Baseline::read(&target.root)?,
-        prepared,
-        init: image.init,
-        _medium: medium,
-    })
 }
 
 /// A release medium's system: the rootfs, kernel and installed initramfs at
@@ -251,7 +261,8 @@ struct Image {
 /// distro and init (and flavour, unless `change_flavour`); its carried list
 /// and account files.
 fn read_image(target: &Target, point: &Path, image: &Path, change_flavour: bool) -> Result<Image> {
-    let text = target_root::os_release(point)?
+    let image_root = Root::open(point)?;
+    let text = image_root.optional_text(Path::new("etc/os-release"))?.or(image_root.optional_text(Path::new("usr/lib/os-release"))?)
         .ok_or_else(|| refuse(format!("rootfs image '{}' has no os-release", image.display())))?;
     let id = os_release_value(&text, "ID").unwrap_or_default().to_ascii_lowercase();
     let running_id = target.entry_prefix()?;
@@ -285,9 +296,9 @@ or pass --change-flavour to change this machine to the {staged} system",
     let mut accounts = Vec::new();
     for entry in &list {
         if let Carry::Accounts(rel) = entry {
-            let path = point.join(rel);
-            if let Some(meta) = target_root::metadata(&path)? {
-                let text = fs::read_to_string(&path).with_context(|| format!("reading '{}'", path.display()))?;
+            if let Some(meta) = image_root.metadata(Path::new(rel))? {
+                if !meta.is_file() { return Err(refuse(format!("account path '{rel}' must be a regular file"))); }
+                let text = image_root.optional_text(Path::new(rel))?.ok_or_else(|| refuse("missing image account file"))?;
                 accounts.push((rel.clone(), text, meta.mode() & 0o7777));
             }
         }
@@ -304,6 +315,15 @@ fn account_merge(rel: &str, image: &str, machine: &str) -> Result<String> {
         Some("gshadow") => (None, Some(3)),
         _ => (None, None),
     };
+    let fields = match Path::new(rel).file_name().and_then(|name| name.to_str()) {
+        Some("passwd") => 7, Some("group" | "gshadow") => 4, Some("shadow") => 9,
+        _ => return Err(refuse("unknown account file in carried list")),
+    };
+    for content in [image, machine] {
+        if content.lines().any(|line| line.is_empty() || line.split(':').count() != fields) {
+            return Err(refuse(format!("malformed account records in '{rel}'")));
+        }
+    }
     merge_accounts(image, machine, id, members)
 }
 
@@ -342,19 +362,48 @@ fn fill(target: &Target, plan: &StagePlan) -> Result<()> {
         .context("extracting the rootfs image into the slot")?;
     // What the new image ships in the carried paths, before the carry
     // changes them: the next update tells the machine's changes from it.
-    Baseline::write(&point, &plan.list)?;
-    carry::carry(&target.root, &point, &plan.list, plan.baseline.as_ref())?;
+    plan.baseline.write_to(&point)?;
+    plan.carry.apply(&point)?;
+    let destination = Root::open(&point)?;
     for (rel, text, mode) in &plan.prepared {
-        let path = point.join(rel);
-        let meta = target_root::metadata(&path)?;
-        fs::write(&path, text).with_context(|| format!("writing '{}'", path.display()))?;
-        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(*mode))?;
-        if let Some(meta) = meta {
-            std::os::unix::fs::chown(&path, Some(meta.uid()), Some(meta.gid()))?;
-        }
+        let entry = destination.entry(Path::new(rel), false)?;
+        if entry.metadata()?.is_some_and(|m| !m.is_file()) { return Err(refuse("prepared account/fstab target is not a regular file")); }
+        entry.remove()?;
+        entry.write(text.as_bytes(), *mode)?;
     }
+    crate::immutable::prepare(&point, plan.slot, &plan.state_partition)?;
     sync_filesystem(&point)?;
     mounted.unmount()
+}
+
+fn expanded_usage(root: &Path) -> Result<(u64, u64)> {
+    fn walk(root: &Root, rel: &Path) -> Result<(u64, u64)> {
+        let mut bytes = 0u64;
+        let mut entries = 0u64;
+        for name in root.names(rel)? {
+            let path = rel.join(name);
+            let meta = root.metadata(&path)?.ok_or_else(|| refuse("image changed during capacity inspection"))?;
+            bytes = bytes.saturating_add(512);
+            entries += 1;
+            if meta.is_dir() { let child = walk(root, &path)?; bytes = bytes.saturating_add(child.0); entries += child.1; }
+            else if meta.is_file() { bytes = bytes.saturating_add(meta.len()); }
+            else if !meta.file_type().is_symlink() { return Err(refuse("system image contains an unsupported special file")); }
+        }
+        Ok((bytes, entries))
+    }
+    walk(&Root::open(root)?, Path::new(""))
+}
+fn check_inode_capacity(slot: Slot, device: &Path, required: u64) -> Result<()> {
+    let role = slot_role(slot);
+    let (program, args) = role.filesystem().mkfs(role.label());
+    // -n computes the same filesystem geometry without writing the device.
+    let out = target_root::run(Command::new(program).args(args).arg("-n").arg(device).env("LC_ALL", "C"))?;
+    let output = format!("{} {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let words = output.split_whitespace().collect::<Vec<_>>();
+    let available = words.windows(2).find_map(|words| (words[1] == "inodes").then(|| words[0].parse::<u64>().ok()).flatten())
+        .ok_or_else(|| refuse("cannot establish the inactive filesystem's inode capacity from mkfs dry run"))?;
+    if required > available { return Err(refuse(format!("expanded system needs {required} inodes; the inactive filesystem provides {available}"))); }
+    Ok(())
 }
 
 /// Flush the filesystem holding `path` to disk.

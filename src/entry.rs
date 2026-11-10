@@ -12,8 +12,8 @@ pub const ENTRIES_DIR: &str = "loader/entries";
 pub const KERNEL_FILE: &str = "vmlinuz";
 pub const INITRD_FILE: &str = "initramfs.img";
 
-/// The root options of every entry recab writes: the root is mounted read-only
-/// and remounted read-write by the installed system's fstab.
+/// Root starts read-only. Mutable installs remount it writable through fstab;
+/// A/B entries require the initramfs to protect it and mount writable state.
 const ROOT_OPTIONS: &[&str] = &["ro", "rootwait"];
 /// Seconds after a kernel panic before the kernel reboots, on every entry
 /// recab writes: a trial that panics reboots into the default slot.
@@ -130,6 +130,14 @@ impl Entry {
     /// at the end.
     pub fn set_options(&mut self, options: Vec<String>) {
         self.replace_keys(&["options"], vec![format!("options {}", options.join(" "))]);
+    }
+
+    pub fn make_immutable(&mut self) {
+        let mut options = self.options();
+        if !options.iter().any(|o| o == recinit::installed::IMMUTABLE_OPTION) {
+            options.push(recinit::installed::IMMUTABLE_OPTION.to_string());
+        }
+        self.set_options(options);
     }
 
     /// The files the entry loads from the ESP.

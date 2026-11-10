@@ -61,6 +61,11 @@ pub(crate) fn run(target: Target, request: &InitRequest) -> Result<()> {
         }
     };
     check_mounts(&target, &request.layout, &installed_root)?;
+    if matches!(request.layout, InitLayout::Ab { .. }) {
+        crate::immutable::check_initramfs(request.initrd.as_deref())?;
+        let state = crate::immutable::state_partition(&target)?;
+        crate::immutable::prepare(&target.root, Slot::A, &state)?;
+    }
     // The installed system's kernel goes to its own directory; slot B's stays
     // empty, so its entry cannot boot until `recab stage` fills it.
     let installed = match request.layout {

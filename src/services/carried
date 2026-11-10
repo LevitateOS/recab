@@ -34,8 +34,7 @@ prefix etc/ssh/ssh_host_
 dir etc/ssh/sshd_config.d
 fstab etc/fstab
 file etc/crypttab
-# root's home (the other homes live on /var).
-dir root
+# Homes are shared on /var and are not part of configuration carry.
 # The services, init and kernel configuration the machine set.
 dir etc/systemd/system
 dir etc/systemd/network
