@@ -5,20 +5,19 @@
 //! The shared finalizer validates/seals the root and publishes the entry last.
 
 use anyhow::{Context, Result};
-use distro_profile::{os_release_fact, os_release_value, Flavour, InitSystem};
+use distro_profile::{Flavour, InitSystem, os_release_fact, os_release_value};
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::carry::{self, fstab_for_slot, merge_accounts, Baseline, Carry, CarryPlan};
-use crate::error::{classified, refuse, ErrorClass};
+use crate::carry::{self, Baseline, Carry, CarryPlan, fstab_for_slot, merge_accounts};
+use crate::error::{ErrorClass, classified, refuse};
 use crate::filesystem::Root;
 use crate::generation::Generation;
 use crate::state::Slot;
 use crate::systemd_boot::{Boot, SlotWrite, SystemdBoot};
 use crate::target::Target;
-use recinit::live::{INITRAMFS_INSTALLED_ISO_PATH, KERNEL_ISO_PATH, ROOTFS_ISO_PATH};
 use recpart::types::Role;
 
 /// The prebuilt system `stage` writes: files, or a release medium holding them.
@@ -28,6 +27,13 @@ pub enum StageSource {
     /// A release medium (its device, or where it is mounted): the rootfs,
     /// kernel and installed initramfs at the live protocol's paths.
     Media(PathBuf),
+    /// Unsigned local media explicitly trusted by the caller.
+    LocalMedia(PathBuf),
+    /// One typed release bundle (including an imported cache object).
+    Manifest {
+        path: PathBuf,
+        trusted_local: bool,
+    },
 }
 
 /// The prebuilt system `stage` writes, as files.
@@ -59,6 +65,7 @@ pub(crate) struct StagePlan {
     state_partition: String,
     /// The release medium, mounted until the slot is written.
     _medium: Option<Mounted>,
+    _release: Option<crate::release::VerifiedRelease>,
 }
 
 /// Check a stage of the inactive `slot` from `source`: the inputs, the
@@ -75,9 +82,35 @@ pub(crate) fn check(
 ) -> Result<StagePlan> {
     crate::immutable::require_readonly(target)?;
     crate::filesystem::private_mounts()?;
-    let (medium, request) = match source {
-        StageSource::Files(request) => (None, request.clone()),
-        StageSource::Media(media) => open_media(target, media)?,
+    let (medium, request, release) = match source {
+        StageSource::Files(request) => (None, request.clone(), None),
+        StageSource::Media(media) | StageSource::LocalMedia(media) => {
+            let (medium, root) = open_media(target, media)?;
+            let release = crate::release::for_target(
+                target,
+                &root.join(distro_contract::release::MANIFEST),
+                matches!(source, StageSource::LocalMedia(_)),
+                change_flavour,
+            )?;
+            let request = StageRequest {
+                rootfs: release.rootfs(),
+                kernel: release.kernel(),
+                initrd: Some(release.initramfs()),
+            };
+            (medium, request, Some(release))
+        }
+        StageSource::Manifest {
+            path,
+            trusted_local,
+        } => {
+            let release = crate::release::for_target(target, path, *trusted_local, change_flavour)?;
+            let request = StageRequest {
+                rootfs: release.rootfs(),
+                kernel: release.kernel(),
+                initrd: Some(release.initramfs()),
+            };
+            (None, request, Some(release))
+        }
     };
     let rootfs = target_root::erofs_image(&request.rootfs)
         .map_err(|err| refuse(format!("rootfs image: {err}")))?
@@ -131,8 +164,8 @@ pub(crate) fn check(
                 Some(machine) => account_merge(rel, text, &machine)?,
                 None => {
                     return Err(refuse(format!(
-                    "local account file '{rel}' is absent; structured baseline merging is required"
-                )))
+                        "local account file '{rel}' is absent; structured baseline merging is required"
+                    )));
                 }
             };
             prepared.push((rel.clone(), merged, *mode));
@@ -171,7 +204,9 @@ pub(crate) fn check(
                 .saturating_add(128),
         )?;
         if required > slot_bytes.saturating_mul(95) / 100 {
-            return Err(refuse(format!("expanded system and configuration need at least {required} bytes, exceeding slot capacity {slot_bytes}")));
+            return Err(refuse(format!(
+                "expanded system and configuration need at least {required} bytes, exceeding slot capacity {slot_bytes}"
+            )));
         }
         Ok(StagePlan {
             slot,
@@ -185,6 +220,7 @@ pub(crate) fn check(
             prepared,
             state_partition,
             _medium: medium,
+            _release: release,
         })
     })();
     mounted.unmount()?;
@@ -194,7 +230,7 @@ pub(crate) fn check(
 /// A release medium's system: the rootfs, kernel and installed initramfs at
 /// the live protocol's paths. A block device is mounted read-only under the
 /// stage directory; a directory is taken as the mounted medium.
-fn open_media(target: &Target, media: &Path) -> Result<(Option<Mounted>, StageRequest)> {
+fn open_media(target: &Target, media: &Path) -> Result<(Option<Mounted>, PathBuf)> {
     let meta = fs::metadata(media)
         .map_err(|err| refuse(format!("release medium '{}': {err}", media.display())))?;
     let (mounted, root) = if meta.is_dir() {
@@ -212,22 +248,7 @@ fn open_media(target: &Target, media: &Path) -> Result<(Option<Mounted>, StageRe
             media.display()
         )));
     };
-    // Every release medium carries the installed initramfs; one without it
-    // is not a release medium.
-    let initrd = root.join(INITRAMFS_INSTALLED_ISO_PATH);
-    if !target_root::exists(&initrd)? {
-        return Err(refuse(format!(
-            "release medium '{}' has no installed initramfs ('{}')",
-            media.display(),
-            initrd.display()
-        )));
-    }
-    let request = StageRequest {
-        rootfs: root.join(ROOTFS_ISO_PATH),
-        kernel: root.join(KERNEL_ISO_PATH),
-        initrd: Some(initrd),
-    };
-    Ok((mounted, request))
+    Ok((mounted, root))
 }
 
 /// The kernel and initrd, canonical: files, and none of them (nor the
@@ -284,7 +305,9 @@ fn check_partition(
 ) -> Result<(PathBuf, String)> {
     let partuuid = backend.slot_partuuid(boot, slot)?;
     if partuuid == backend.running_root()? {
-        return Err(refuse(format!("slot {slot}'s entry names the running root (PARTUUID={partuuid}); refusing to overwrite it")));
+        return Err(refuse(format!(
+            "slot {slot}'s entry names the running root (PARTUUID={partuuid}); refusing to overwrite it"
+        )));
     }
     let device = target_root::device_with_tag("PARTUUID", &partuuid)?.ok_or_else(|| {
         refuse(format!(
@@ -406,10 +429,7 @@ or pass --change-flavour to change this machine to the {staged} system",
             }
         }
     }
-    Ok(Image {
-        list,
-        accounts,
-    })
+    Ok(Image { list, accounts })
 }
 
 /// Merge an account file by its kind: passwd and group by name with their
@@ -571,7 +591,9 @@ fn check_inode_capacity(slot: Slot, bytes: u64, required: u64) -> Result<()> {
     // mke2fs opens even a -n target writable. Probe identical geometry on an
     // anonymous sparse file so preflight never unlocks the real fallback.
     let fd = unsafe { libc::memfd_create(c"recab-mkfs-preflight".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     let probe = unsafe { fs::File::from_raw_fd(fd) };
     probe.set_len(bytes)?;
     let path = format!("/proc/{}/fd/{}", std::process::id(), probe.as_raw_fd());
@@ -630,7 +652,12 @@ pub(crate) struct Mounted {
 
 impl Mounted {
     /// `source` mounted at `point` with `mount`'s `options`.
-    pub(crate) fn new(target: &Target, options: &[&str], source: &Path, point: &Path) -> Result<Self> {
+    pub(crate) fn new(
+        target: &Target,
+        options: &[&str],
+        source: &Path,
+        point: &Path,
+    ) -> Result<Self> {
         target_root::run(
             Command::new(&target.programs.mount)
                 .args(options)

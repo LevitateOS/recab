@@ -7,7 +7,7 @@ an actual VM boot can establish PID 1, hardware-driver and service behavior.
 import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
 sys.dont_write_bytecode=True
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--stage-recstrap',type=Path,help='also exercise destructive staging through the shared finalizer');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--stage-recstrap',type=Path,help='also exercise destructive staging through the shared finalizer');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');args=p.parse_args()
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
 BIN=str(args.binary.resolve(strict=True));KERNEL=args.kernel.resolve(strict=True);MODULE=args.module.resolve(strict=True)
 GUID='4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
@@ -159,8 +159,9 @@ base=Path(tempfile.mkdtemp(prefix='recab-p05-ext4-' if args.installation else 'r
 try:
     image=base/'scratch.img'
     root_mib=2560 if args.stage_recstrap else 128
-    with image.open('wb') as f:f.truncate((root_mib*2+144)*1024*1024)
-    run('sfdisk',str(image),input=f'label:gpt\nsize={root_mib}M,type=L,name=TEST_A\nsize={root_mib}M,type=L,name=TEST_B\nsize=32M,type=L,name=TEST_STATE\nsize=96M,type=U,name=TEST_ESP\n'.encode())
+    state_mib=128 if args.release_builder else 32
+    with image.open('wb') as f:f.truncate((root_mib*2+state_mib+112)*1024*1024)
+    run('sfdisk',str(image),input=f'label:gpt\nsize={root_mib}M,type=L,name=TEST_A\nsize={root_mib}M,type=L,name=TEST_B\nsize={state_mib}M,type=L,name=TEST_STATE\nsize=96M,type=U,name=TEST_ESP\n'.encode())
     loop=run('losetup','--find','--show','--partscan',str(image)).stdout.decode().strip()
     check(Path(run('losetup','-n','-O','BACK-FILE',loop).stdout.decode().strip()).resolve()==image.resolve(),'loop is not the scratch image')
     run('udevadm','settle')
@@ -192,6 +193,9 @@ try:
         (root/'sbin/init').symlink_to('../usr/lib/systemd/systemd' if args.init=='systemd' else 'openrc-init')
         install_elf(root,Path('/usr/bin/true'),'usr/bin/sh');install_elf(root,stripped,'usr/bin/recab')
         (root/'etc/os-release').write_text(f'ID=lev\nNAME=LevitateOS\nREC_INIT={args.init}\nREC_LIBC=glibc\nREC_FLAVOUR=base\nREC_PACKAGES=rpm\nREC_PRIVILEGE=sudo\nREC_DESKTOP=plasma\nREC_KERNEL_LINE=latest\n')
+        if args.release_builder:
+            (root/'etc/os-release').write_text((root/'etc/os-release').read_text().replace('ID=lev\n','ID=levitateos\n')+'VERSION_ID=1.0\n')
+            (root/'usr/lib/recab/update-source.json').write_text(json.dumps({'channel':'development','sequence':1,'source':None,'trust':None}))
         (root/'etc/fstab').write_text(f'PARTUUID={uuid[slot]} / ext4 ro 0 0\nPARTUUID={uuid["state"]} /var ext4 defaults 0 0\n/var/roothome /root none bind 0 0\ntmpfs /tmp tmpfs mode=1777,nosuid,nodev 0 0\nPARTUUID={uuid["esp"]} /boot vfat defaults 0 0\n')
         (root/'usr/lib/recab/immutable').write_text(f'{slot} PARTUUID={uuid["state"]}\n')
         (root/'etc/machine-id').write_text('123456789abcdef0123456789abcdef0\n');(root/'etc/machine-id').chmod(0o444)
@@ -222,16 +226,17 @@ try:
     if args.stage_recstrap:
         release_image=base/'fixture.erofs';run('mkfs.erofs',str(release_image),str(roots['A']))
         env['RECAB_RECSTRAP_BIN']=str(args.stage_recstrap.resolve(strict=True))
+    fixture_prefix="levitateos" if args.release_builder else "lev"
     def legacy_entry(slot,g):
-        (esp/f'loader/entries/lev-{slot.lower()}.conf').write_text(f'title {slot}\nlinux /legacy/vmlinuz\ninitrd /legacy/initrd.img\noptions root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n')
+        (esp/f'loader/entries/{fixture_prefix}-{slot.lower()}.conf').write_text(f'title {slot}\nlinux /legacy/vmlinuz\ninitrd /legacy/initrd.img\noptions root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n')
     for slot,g in [('A',ga),('B',gb)]:legacy_entry(slot,g)
     ledger={'schema':{'major':2,'minor':1},'slots':[{'slot':s,'partuuid':uuid[s],'generation':g,'readiness':'committed' if s=='A' else 'ready'} for s,g in [('A',ga),('B',gb)]],'known_good_slot':'A','previous_good_slot':'B'}
-    (state/'state.json').write_bytes(packed(ledger));(esp/'loader/loader.conf').write_text('default lev-a.conf\ntimeout 5\n')
+    (state/'state.json').write_bytes(packed(ledger));(esp/'loader/loader.conf').write_text(f'default {fixture_prefix}-a.conf\ntimeout 5\n')
     def variable(name,value):
         file=efi/f'efivars/LoaderEntry{name}-{GUID}'
         if value is None:file.unlink(missing_ok=True)
         else:file.write_bytes((7).to_bytes(4,'little')+(value+'\0').encode('utf-16le'))
-    variable('Default','lev-a.conf')
+    variable('Default',fixture_prefix+'-a.conf')
     run('umount',str(roots['B']));mounts.remove('B');run('mount','-o','remount,ro',str(roots['A']));run('mount','--bind',str(roots['state']),str(roots['A']/'var'));mounts.add('A/var')
     for s in ['A','B']:run('blockdev','--setro',dev[s])
     def running(slot,g):
@@ -246,6 +251,9 @@ try:
         check(run('blockdev','--getro',dev['B']).stdout.strip()==b'1','staging left candidate unprotected')
         staged=stage_status['preparation'];cli(active,'discard','--preparation',staged['id'],'--revision',str(staged['revision']))
     prepared=cli(active,'prepare');check(prepared['phase']=='prepared','preparation did not complete')
+    if args.release_builder:
+        from release import exercise
+        result=exercise(globals(),active);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     changes=None
     if args.changes:
         from changes import Changes

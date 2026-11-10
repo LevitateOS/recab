@@ -82,7 +82,7 @@ fn receipt(root: &Path) -> Result<Receipt> {
             .as_deref(),
     )
 }
-fn logical(node: &Node) -> Result<Entry> {
+pub(crate) fn logical(node: &Node) -> Result<Entry> {
     Ok(Entry {
         kind: if node.hardlink.is_some() {
             "hardlink"

@@ -83,7 +83,9 @@ from its purpose. The commands below describe the existing implementation.
 - `recab finalize [--preparation <id> --revision <n>] [--kernel <vmlinuz> --initrd <img>] [--change-flavour] [--json]`
 - `recab discard --preparation <id> --revision <n>`
 - `recab inventory --root <dir> [--json]`
-- `recab stage --from-media <device|dir>`, or `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> --initrd <img> [--change-flavour]`
+- `recab release import <release.json> [--trusted-local] [--root <dir>]`
+- `recab stage --manifest <release.json> [--trusted-local]`
+- `recab stage --from-media <device|dir> [--trusted-local]`, or `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> --initrd <img> [--change-flavour]`
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
@@ -97,7 +99,7 @@ A release-image update with today's destructive staging path, starting in A
 system. It refuses to run while a preparation exists:
 
 ```sh
-recab stage --from-media /dev/sr0   # the release medium: its rootfs, kernel and installed initramfs
+recab stage --from-media /dev/sr0   # verifies its release.json and complete bound set
 recab set-next B      # one trial boot of the staged slot
 reboot                # into B: committed if it comes up healthy, else back to A
 recab rollback        # later, if wanted: back to A, while A still holds its system
@@ -437,6 +439,52 @@ invalidation. It supplies scratch firmware/boot records and does not validate
 finalization or a kernel boot. Its verified temporary loop image is cleaned
 up on success; failure artifacts are retained unmounted for inspection.
 
+## Release manifest and verified inputs
+
+The builder and recab now share the typed `distro-contract::release` format.
+Media and online bundles use one `release.json`, binding distro, architecture,
+init/libc/flavour, channel/sequence/version, source provenance, intended system
+inventory, kernel/module release, exact artifact hashes/sizes and minimum
+recab/state/boot compatibility. See the
+[shared format and trust rules](../../distro/contract/docs/releases.md).
+
+```sh
+recab release import /mnt/release/release.json --trusted-local
+# Import verifies/caches inputs while an existing preparation still holds X.
+# It does not apply the release, reset the preparation or change boot selection.
+```
+
+`--trusted-local` explicitly permits unsigned local input only when no
+installed distribution key is configured. With a key, a detached Ed25519
+signature of the exact manifest bytes is mandatory. Trust comes from
+`/usr/lib/recab/update-source.json`, never the incoming release. The current
+variant defaults have no production endpoint/key. Online discovery/acquisition
+and preserving X while merging a release remain P08/P09.
+
+Import verifies identity/compatibility, copies and hashes the exact inputs into
+a private read-only set, mounts its actual EROFS image and checks the complete
+intended inventory, runtime, ELF architecture/libc, kernel/module binding and
+full installed initramfs. The verified set remains frozen through use, so
+replacing a mutable source pathname cannot change the consumed bytes. Import
+moves it into a content-addressed cache without a second full-payload copy;
+existing cache bytes are rechecked. It does not mutate a candidate or ledger.
+
+`stage --manifest PATH` and `stage --from-media MEDIA` use the same verifier
+before invalidating the candidate. Media must carry the release manifest;
+matching filenames alone no longer establish a release set. For unsigned
+local/development media add `--trusted-local` explicitly. These staging commands
+still replace the inactive system and refuse an existing preparation. Explicit
+legacy `--rootfs/--kernel/--initrd` staging remains available pending P12 and does
+not provide manifest authentication.
+
+The focused fixture extends `tests/finalization.py` with
+`--release-builder /absolute/path/to/distro-builder`. Build only those CLI/library
+targets first and set `RECAB_TEST_RUSTC` to the absolute compiler binary (from
+`rustup which rustc`) when running under sudo. It produces tiny native LZ4 EROFS
+images using the real image writer and existing kernel/module artifacts; tests
+real signatures, byte binding and refusal without changing A, B or pending X.
+It is not a full OS build or a kernel/VM boot.
+
 ## Prepared system changes
 
 On an immutable A/B installation, root's `recipe install`, `update`, and
@@ -585,3 +633,7 @@ copy/sealing/publication checks, including failed initialization, copy terminati
 publication failure, retry without repeating passwords/settings, and zero payload
 writes on the first continuation. Boot observations remain structural fixtures;
 this does not establish a kernel/PID 1 or distro-service boot.
+
+Release policy is a regular slot-owned root file. Recab refuses symlinked or
+group/world-writable policy so shared mutable state cannot replace the
+distribution trust authority.

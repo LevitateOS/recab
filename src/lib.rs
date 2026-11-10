@@ -30,6 +30,7 @@ mod installation;
 mod init_system;
 mod package;
 mod prepare;
+pub mod release;
 mod runtime;
 mod slot_mount;
 mod stage;

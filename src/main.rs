@@ -28,6 +28,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Verify/import one complete release set without changing the candidate.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
     /// Apply Recipe software to the prepared inactive system; activation needs reboot.
     Change {
         #[arg(value_parser=["install","update","remove","recover","list","check"])]
@@ -126,6 +131,12 @@ enum Command {
 
     /// Write a prebuilt system into the inactive slot (formats the slot).
     Stage {
+        /// Verify one release manifest and its bound payloads before staging.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        /// Explicitly trust unsigned local media when no distribution key is configured.
+        #[arg(long)]
+        trusted_local: bool,
         /// A release medium (its device, or where it is mounted): stage its
         /// rootfs, kernel and, when it carries one, the installed initramfs.
         #[arg(long, value_name = "MEDIA")]
@@ -199,6 +210,18 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ReleaseCommand {
+    /// Verify identity, signature, inventory and boot bindings, then cache the exact set.
+    Import {
+        manifest: PathBuf,
+        #[arg(long)]
+        trusted_local: bool,
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = cli.json;
@@ -217,6 +240,17 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
+        Command::Release {
+            command:
+                ReleaseCommand::Import {
+                    manifest,
+                    trusted_local,
+                    root,
+                },
+        } => {
+            let result = recab::release::import(&manifest, trusted_local, root.as_deref())?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Command::Change {
             action,
             recipe,
@@ -343,20 +377,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             print_status(&st, cli.json)?;
         }
         Command::Stage {
+            manifest,
+            trusted_local,
             from_media,
             rootfs,
             kernel,
             initrd,
             change_flavour,
         } => {
-            let source = match (from_media, rootfs, kernel, initrd) {
-                (Some(media), None, None, None) => StageSource::Media(media),
-                (None, Some(rootfs), Some(kernel), initrd) => StageSource::Files(StageRequest {
-                    rootfs,
-                    kernel,
-                    initrd,
-                }),
-                _ => usage("stage takes --from-media, or --rootfs and --kernel (and --initrd)"),
+            let source = match (manifest, from_media, rootfs, kernel, initrd) {
+                (Some(path), None, None, None, None) => StageSource::Manifest {
+                    path,
+                    trusted_local,
+                },
+                (None, Some(media), None, None, None) => {
+                    if trusted_local {
+                        StageSource::LocalMedia(media)
+                    } else {
+                        StageSource::Media(media)
+                    }
+                }
+                (None, None, Some(rootfs), Some(kernel), initrd) if !trusted_local => {
+                    StageSource::Files(StageRequest {
+                        rootfs,
+                        kernel,
+                        initrd,
+                    })
+                }
+                _ => usage(
+                    "stage takes --manifest, --from-media, or explicit legacy --rootfs/--kernel/--initrd; --trusted-local applies only to a release manifest/media",
+                ),
             };
             recab::stage(&source, change_flavour)?;
             if !cli.json {

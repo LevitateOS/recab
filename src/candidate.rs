@@ -667,3 +667,25 @@ fn module_stream(input: &mut impl Read, release: &str) -> Result<(String, u16, b
         version,
     ))
 }
+
+/// Release-set validation before any candidate mutation. Personalization and
+/// slot identities are checked later by the shared finalizer.
+pub(crate) fn release(root:&Path,kernel_path:&Path,initrd_path:&Path,manifest:&distro_contract::release::ReleaseManifest)->Result<()> {
+    use anyhow::ensure;
+    let root=Root::open(root)?;
+    let (machine,release)=kernel(kernel_path)?;
+    ensure!(machine==manifest.identity.architecture.machine() && release==manifest.kernel.release,"release kernel architecture/release differs from manifest");
+    let libc=manifest.identity.libc.as_str();
+    crate::elf::executable(&root,Path::new("sbin/init"),machine,libc)?;
+    crate::elf::executable(&root,Path::new("bin/sh"),machine,libc)?;
+    runtime(&root,machine,libc)?;
+    let archive=recinit::installed::inspect_installed(initrd_path)?;
+    ensure!(archive.kernel_release==release && !archive.machines.is_empty() && archive.machines.iter().all(|m|*m==machine),"release initramfs does not match kernel");
+    let base=format!("usr/lib/modules/{release}");
+    let entry=root.entry(relative(&base)?,false)?;
+    ensure!(recinit::installed::modules_digest(&entry.path())?==manifest.kernel.modules_sha256,"release module tree differs from manifest");
+    let binding:serde_json::Value=serde_json::from_str(&text(&root,"usr/lib/recab/kernel.json")?)?;
+    ensure!(binding["version"]==1 && binding["release"]==release && binding["kernel_digest"]==manifest.artifacts.kernel.sha256 && binding["modules_digest"]==manifest.kernel.modules_sha256,"release kernel/module binding differs from manifest");
+    modules(&root,&base,&release,machine,&archive.files)?;
+    Ok(())
+}

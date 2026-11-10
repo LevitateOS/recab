@@ -199,6 +199,44 @@ are not SSD or SMART totals. Compiler-runtime extraction remains producer I/O;
 this does not claim zero total writes or optimal binary deltas. Actual distro
 boots, full builds, and downloaded-release merging remain deferred.
 
+P07 now defines one typed version 1 release manifest and system inventory in
+`distro/contract::release`, shared by builder emission and recab import/staging.
+It binds distro/profile, architecture, channel, publisher-controlled sequence,
+version/source digest, exact payload paths/hashes/sizes, kernel/module release,
+and minimum recab/state/boot compatibility. Optional source/trust fields are
+validated in the variant contract and installed at
+`usr/lib/recab/update-source.json`. The development variants declare sequence 1
+without inventing a production endpoint or distribution key.
+
+The image writer captures intended UID/GID/mode/xattrs/link/content metadata from
+the exact tar stream passed to mkfs and binds it to the output EROFS digest in
+local image-writer provenance. Release emission checks that proof, the prepared
+tree and boot bindings, then publishes `release.json` last. The ISO carries the
+same manifest/inventory/signature as the online payload layout. Producer checks
+do not require the host kernel to support the target's EROFS compression.
+
+Recab `release import` verifies installed identity/order/compatibility and
+configured distribution Ed25519 trust, hashes/copies artifacts to a private
+read-only set and checks the actual mounted EROFS inventory, ELF/runtime,
+kernel/module tree and complete installed initramfs before any candidate change.
+Source paths are never reopened for use after verification. Import moves those
+same files into a content-addressed cache without another full payload copy;
+cache reuse is rehashed. `stage --manifest` and `stage --from-media` use the same
+verifier before invalidation, while retaining the frozen inputs through use.
+Unsigned local use requires explicit `--trusted-local`; it cannot bypass a
+configured key. Explicit legacy raw-file staging remains pending P12.
+
+Focused CLI/library compilation and a real native EROFS builder/consumer
+integration passed. The fixture uses existing kernel/module artifacts and actual
+image packing, intended non-root ownership/mode/xattrs/hardlinks, wrong
+identity/protocol/digest/set refusals, exact-byte Ed25519 signatures with a local
+test key, cache alteration refusal, source replacement after verification and
+read-only verified inputs. Running A, prepared B with pending X, state and boot
+entries remain unchanged. The host lacks EROFS zstd, so mounted consumer checks
+use a genuine small LZ4 fixture; producer provenance avoids that host limitation.
+No full distro/ISO/kernel builds or VM boots were run. P08 acquisition/index
+publishing and P09 release merging remain outstanding.
+
 The starting-point description below records the pre-implementation audit.
 
 ## Starting point
