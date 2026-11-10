@@ -72,7 +72,7 @@ pub(crate) enum StateSchema {
 }
 impl Default for StateSchema {
     fn default() -> Self {
-        Self::Current { major: 2, minor: 0 }
+        Self::Current { major: 2, minor: 1 }
     }
 }
 
@@ -117,6 +117,11 @@ pub struct Preparation {
     pub phase: PreparationPhase,
     pub completed_steps: u64,
     pub failure: Option<String>,
+    /// Once synchronized, reopening must never reseed pending system changes.
+    #[serde(default)]
+    pub synchronized: bool,
+    #[serde(default)]
+    pub synchronization: Option<crate::SyncReport>,
 }
 
 /// What recab keeps in its state file.
@@ -153,7 +158,11 @@ pub(crate) struct PersistentState {
 impl PersistentState {
     pub fn check_schema(&self) -> Result<(), String> {
         match self.schema {
-            StateSchema::Legacy(1) | StateSchema::Current { major: 2, minor: 0 } => Ok(()),
+            StateSchema::Legacy(1)
+            | StateSchema::Current {
+                major: 2,
+                minor: 0 | 1,
+            } => Ok(()),
             _ => Err("unsupported recab state format; use a compatible recovery tool".into()),
         }
     }
@@ -547,6 +556,7 @@ pub(crate) fn plan(
                     let reopened = next.preparation.as_mut().unwrap();
                     reopened.phase = PreparationPhase::Prepared;
                     reopened.operation = "prepare".into();
+                    reopened.synchronized = true;
                     reopened.revision += 1;
                     next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
                     return Ok(Some(Transition {
@@ -581,6 +591,8 @@ pub(crate) fn plan(
                 phase: PreparationPhase::Intent,
                 completed_steps: 0,
                 failure: None,
+                synchronized: false,
+                synchronization: None,
             });
             Transition {
                 operation: Operation::Prepare(inactive),
@@ -649,6 +661,8 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {inactive}."
                 phase: PreparationPhase::Staging,
                 completed_steps: 0,
                 failure: None,
+                synchronized: false,
+                synchronization: None,
             });
             next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
             next.slot_mut(inactive)?.generation = None;

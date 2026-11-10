@@ -25,8 +25,8 @@ P02 now implements complete system inventories, normalized generation/boot
 identities, independent slot mappings, structured major state compatibility,
 durable preparation ID/source/revision/progress, incomplete/readiness checks,
 reopen and explicit discard. Preparing removes the inactive entry after saving
-intent. It currently stops at `awaiting_synchronization`: P03 must supply the
-actual continuation copy. Release staging refuses an existing preparation.
+intent. At the P02 checkpoint it stopped at `awaiting_synchronization`.
+Release staging refuses an existing preparation.
 
 Focused validation: recab/recinit library and CLI compilation; actual CLI runs
 against read-only bind-mounted scratch roots in a user/mount namespace; xattrs,
@@ -40,9 +40,43 @@ CLI checks also exercised xattr recording, symlink confinement and FIFO refusal.
 Public schemas and the TUI contract are generated through recab's existing
 contract exporter; the TUI and documentation TypeScript checks pass. No unit suites, full system builds or VM scenarios were run.
 
-These checks do not establish installed boot behavior, destructive staging on
-real slot devices, or the complete X+update→Y lifecycle. P03 synchronization,
-P04 runtime migration/finalization and P05 equivalent initial B remain next.
+P03 now synchronizes the inactive ext4 partition in place in either direction.
+It preflights identity, mount boundaries, bytes and inodes read-only before ending
+old rollback. Durable intent and entry invalidation precede writable mounting;
+the delta journal precedes file mutations. Range comparisons write only differing
+1 MiB ranges and preserve sparse holes, deletions, types, raw paths, hardlinks
+(including symlinks), UID/GID/modes, ACLs, capabilities and xattr removal. Changes
+detach inodes whose other aliases could affect excluded data. Directory metadata
+is restored last. Source references are materialized for the destination slot.
+
+The operation journal contains actual changes and affected parents. Recovery
+re-inventories and checks actual ranges, rather than trusting saved completion.
+A verified, flushed and unmounted result becomes `prepared`, remains incomplete
+for boot, and reopens without reseeding X. Plans are removed after successful
+preparation/discard. Saved reports separate logical payload writes, metadata
+operations, identity bytes and plan bytes. Filesystem metadata/journal and other
+state byte totals remain unmeasured; interrupted prior writes are explicitly
+unknown. These are not physical SSD/SMART write totals.
+
+The reusable real CLI check is `tests/synchronization.py --binary <recab>`.
+It passed with two temporary GPT/ext4 roots: A→B, kill after a payload write,
+resume, preserve pending X, B→A, and another equal-root continuation. Recovery
+skipped the already written 1 MiB range and wrote the remaining 15 MiB of the
+interrupted file. Reverse synchronization wrote one 1 MiB range plus 108 bytes
+of configuration/slot-reference changes. Equal roots wrote zero payload and zero
+generation-marker bytes (616 serialized plan bytes and one directory metadata
+update were recorded separately). ACL/capability/xattr/ownership, sparse files,
+file/symlink hardlink groups, excluded aliases, raw paths, deletions/type changes,
+unsupported special files, same-device bind mounts and space refusal were checked.
+Insufficient space left the ledger and existing boot entry unchanged. The check
+supplies scratch firmware/boot records; it does not boot a system.
+
+Writes now promote state 2.0 to 2.1; P02's reader refuses 2.1, preventing it from
+dropping synchronization progress and reseeding pending changes. Status schema 4
+and generated schemas/TypeScript expose the saved synchronization report.
+Focused Rust compilation and TUI/docs typechecks pass. No full builds, unit
+suites or VM runs were performed. P04 runtime migration/finalization and P05
+initial equivalent B remain outstanding, along with Recipe/update integration.
 The starting-point description below records the pre-implementation audit.
 
 ## Starting point

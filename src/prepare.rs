@@ -1,5 +1,4 @@
-//! Preparation identity and boot invalidation. P03 supplies synchronization;
-//! recording intent must never claim that an unchanged inactive root is cloned.
+//! Durable, reversible-direction preparation and in-place system synchronization.
 
 use anyhow::Result;
 use std::io::Read;
@@ -16,15 +15,16 @@ pub(crate) fn new_id() -> Result<String> {
 
 pub fn prepare(expected_id: Option<&str>, expected_revision: Option<u64>) -> Result<Preparation> {
     let sys = System::locked("prepare")?;
+    crate::filesystem::private_mounts()?;
     crate::immutable::require_readonly(&sys.target)?;
     let active = sys.boot.selection.active;
-    sys.state.require_ready(active)?.verify_root(
+    let source = sys.state.require_ready(active)?;
+    source.verify_root(
         &sys.target.root,
         active,
         &sys.backend.slot_partuuid(&sys.boot, active)?,
     )?;
-    sys.backend
-        .verify_generation(&sys.boot, active, sys.state.require_ready(active)?)?;
+    sys.backend.verify_generation(&sys.boot, active, source)?;
     let transition = plan(
         Request::Prepare {
             id: new_id()?,
@@ -34,41 +34,127 @@ pub fn prepare(expected_id: Option<&str>, expected_revision: Option<u64>) -> Res
         &sys.boot.selection,
         &sys.state,
     )?;
-    let mut next = match transition {
-        Some(transition) => {
-            sys.backend.can_change()?;
-            sys.apply(&transition)?
-        }
-        None => sys.state.clone(),
-    };
-    let preparation = next
+    let planned = transition.as_ref().map(|t| &t.next).unwrap_or(&sys.state);
+    let preparation = planned
         .preparation
         .as_ref()
         .ok_or_else(|| refuse("preparation was not recorded"))?;
     let slot = preparation.slot;
-    // Repeating prepare also finishes an interrupted entry invalidation; never
-    // reseed or touch candidate payloads here.
-    if let Err(error) = sys.backend.invalidate_entry(&sys.boot, slot) {
+    let id = preparation.id.clone();
+    let uuid = sys.backend.slot_partuuid(&sys.boot, slot)?;
+    let preserve = preparation.synchronized || preparation.phase == PreparationPhase::Prepared;
+    sys.backend.can_change()?;
+    // A fresh continuation gets read-only preflight before ending old rollback.
+    // An interrupted continuation can require ext4 journal recovery first.
+    let mut mounted = if preserve {
+        None
+    } else {
+        Some(
+            crate::slot_mount::SlotMount::open(&sys, slot, &id)
+                .map_err(|error| crate::error::or_class(error, ErrorClass::StateOrDetection))?,
+        )
+    };
+    if let Some(mount) = &mounted {
+        if sys.state.preparation.is_none() {
+            crate::sync::Synchronization::check(&sys.target.root, &mount.point, slot, &uuid, &id)
+                .map_err(|error| crate::error::or_class(error, ErrorClass::StateOrDetection))?;
+        }
+    }
+    let mut next = if let Some(transition) = transition {
+        sys.apply(&transition)?
+    } else {
+        sys.state.clone()
+    };
+    let result = (|| -> Result<()> {
+        sys.backend.invalidate_entry(&sys.boot, slot)?;
+        if preserve {
+            let p = next.preparation.as_mut().unwrap();
+            if p.phase != PreparationPhase::Prepared || !p.synchronized {
+                p.phase = PreparationPhase::Prepared;
+                p.synchronized = true;
+                p.failure = None;
+                p.revision += 1;
+                sys.store.save(&next)?;
+            }
+            return Ok(());
+        }
+        let p = next.preparation.as_mut().unwrap();
+        p.phase = PreparationPhase::AwaitingSynchronization;
+        p.completed_steps = 1;
+        p.revision += 1;
+        p.failure = None;
+        sys.store.save(&next)?;
+        let mut mount = mounted.take().unwrap();
+        mount.writable(&sys)?;
+        // Re-inventory after journal recovery; neither an old plan nor an old
+        // completed-step counter is evidence that a range reached disk.
+        let sync =
+            crate::sync::Synchronization::check(&sys.target.root, &mount.point, slot, &uuid, &id)?;
+        let (_, bytes, resumed) = sync.save_plan(&sys.target.state_dir, &id, &source.id)?;
+        let report = crate::SyncReport {
+            plan_bytes_written: bytes,
+            resumed,
+            accounting_complete: !resumed,
+            ..Default::default()
+        };
+        let mut report = sync.apply(report)?;
+        report.identity_bytes_written = mark_candidate(source, &mount.point, slot, &uuid)?;
+        crate::filesystem::flush(&crate::filesystem::Root::open(&mount.point)?)?;
+        sync.verify(&mount.point)?;
+        drop(sync);
+        mount.close()?;
+        next.slot_mut(slot)?.generation = Some(source.clone());
+        let p = next.preparation.as_mut().unwrap();
+        p.phase = PreparationPhase::Prepared;
+        p.synchronized = true;
+        p.synchronization = Some(report);
+        p.completed_steps = 2;
+        p.revision += 1;
+        sys.store.save(&next)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
         interrupted(&sys, &mut next, &error);
         return Err(classified(
             ErrorClass::PartialUpdate,
-            format!("preparation is incomplete; boot entry invalidation failed: {error:#}"),
+            format!("preparation is incomplete: {error:#}"),
         ));
     }
-    let preparation = next.preparation.as_mut().unwrap();
-    if preparation.phase != PreparationPhase::Prepared
-        && preparation.phase != PreparationPhase::AwaitingSynchronization
-    {
-        preparation.phase = PreparationPhase::AwaitingSynchronization;
-        preparation.completed_steps = 1;
-        preparation.revision += 1;
-        preparation.failure = None;
-    }
-    if next != sys.state {
-        sys.store.save(&next).map_err(|error| classified(ErrorClass::PartialUpdate,
-            format!("boot entry was invalidated but preparation progress could not be saved: {error:#}")))?;
-    }
+    cleanup_plan(&sys, &id);
     Ok(next.preparation.unwrap())
+}
+
+fn mark_candidate(
+    generation: &crate::Generation,
+    root: &std::path::Path,
+    slot: crate::Slot,
+    uuid: &str,
+) -> Result<u64> {
+    let marker =
+        serde_json::json!({"version":1,"generation":generation.id,"slot":slot,"partuuid":uuid});
+    let bytes = serde_json::to_vec(&marker)?;
+    let opened = crate::filesystem::Root::open(root)?;
+    let entry = opened.entry(std::path::Path::new(crate::generation::MARKER), false)?;
+    if let Some(meta) = entry.metadata()? {
+        if !meta.is_file() {
+            return Err(refuse("generation marker must be a regular file"));
+        }
+        if meta.len() <= 4096 {
+            let mut current = Vec::new();
+            entry.open()?.take(4097).read_to_end(&mut current)?;
+            if serde_json::from_slice::<serde_json::Value>(&current)
+                .ok()
+                .as_ref()
+                == Some(&marker)
+            {
+                return Ok(0);
+            }
+        }
+        // Never write a generation marker through an alias into shared data.
+        std::fs::remove_file(entry.path())?;
+    }
+    entry.write(&bytes, 0o600)?;
+    Ok(bytes.len() as u64)
 }
 
 pub fn discard(id: &str, revision: u64) -> Result<()> {
@@ -103,7 +189,9 @@ pub fn discard(id: &str, revision: u64) -> Result<()> {
             format!("discard could not invalidate the candidate: {error:#}"),
         ));
     }
-    sys.apply(&transition).map(|_| ())
+    sys.apply(&transition)?;
+    cleanup_plan(&sys, id);
+    Ok(())
 }
 
 fn interrupted(sys: &System, next: &mut PersistentState, error: &anyhow::Error) {
@@ -129,4 +217,16 @@ fn interrupted(sys: &System, next: &mut PersistentState, error: &anyhow::Error) 
         &sys.state,
         next,
     );
+}
+
+fn cleanup_plan(sys: &System, id: &str) {
+    let path = sys.target.state_dir.join(format!("synchronize-{id}.json"));
+    let result = match std::fs::remove_file(path) {
+        Ok(()) => target_root::sync_dir(&sys.target.state_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        eprintln!("recab: warning: completed synchronization plan could not be removed: {error}");
+    }
 }

@@ -41,7 +41,7 @@ pub struct SlotView {
 }
 
 /// The schema of [`Status`].
-pub const STATUS_SCHEMA_VERSION: u32 = 3;
+pub const STATUS_SCHEMA_VERSION: u32 = 4;
 
 /// A change a person or front end can ask recab for.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]

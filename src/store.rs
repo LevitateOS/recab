@@ -106,7 +106,9 @@ impl Store {
 
     pub fn save(&self, state: &PersistentState) -> Result<()> {
         state.check_mutable()?;
-        let payload = serde_json::to_vec_pretty(state).context("serializing recab state")?;
+        let mut current = state.clone();
+        current.schema = crate::state::StateSchema::default();
+        let payload = serde_json::to_vec_pretty(&current).context("serializing recab state")?;
         target_root::write_durable(&self.state_path, &payload, None).map_err(|err| {
             classified(
                 ErrorClass::StateOrDetection,

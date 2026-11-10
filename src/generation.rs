@@ -17,7 +17,7 @@ use crate::filesystem::{self, Root};
 use crate::state::Slot;
 
 pub(crate) const MARKER: &str = "usr/lib/recab/generation.json";
-const EXCLUDED: &[&[u8]] = &[
+pub(crate) const EXCLUDED: &[&[u8]] = &[
     b"boot",
     b"var",
     b"home",
@@ -41,37 +41,44 @@ pub struct Generation {
 
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct Extent {
-    offset: u64,
-    length: u64,
+pub(crate) struct Extent {
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
 }
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct Node {
-    path: Vec<u8>,
-    kind: String,
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    modified: i64,
-    modified_ns: i64,
-    xattrs: Vec<(Vec<u8>, Vec<u8>)>,
-    content: Option<String>,
-    normalized: Option<String>,
-    link: Option<Vec<u8>>,
-    hardlink: Option<Vec<u8>>,
-    extents: Option<Vec<Extent>>,
+pub(crate) struct Node {
+    pub(crate) path: Vec<u8>,
+    pub(crate) kind: String,
+    pub(crate) mode: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    pub(crate) size: u64,
+    pub(crate) modified: i64,
+    pub(crate) modified_ns: i64,
+    pub(crate) xattrs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub(crate) content: Option<String>,
+    pub(crate) normalized: Option<String>,
+    pub(crate) link: Option<Vec<u8>>,
+    pub(crate) hardlink: Option<Vec<u8>>,
+    pub(crate) extents: Option<Vec<Extent>>,
 }
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Inventory {
-    version: u32,
-    entries: Vec<Node>,
+    pub(crate) version: u32,
+    pub(crate) entries: Vec<Node>,
 }
 
 impl Inventory {
     pub fn capture(path: &Path) -> Result<Self> {
+        Self::capture_with(path, true)
+    }
+    pub(crate) fn capture_candidate(path: &Path) -> Result<Self> {
+        Self::capture_with(path, false)
+    }
+    fn capture_with(path: &Path, normalize: bool) -> Result<Self> {
+        crate::filesystem::check_system_mounts(path)?;
         let root = Root::open(path)?;
         let entry = root.root_entry()?;
         let metadata = entry.metadata()?.context("system root disappeared")?;
@@ -98,6 +105,7 @@ impl Inventory {
             root.device()?,
             &mut links,
             &mut entries,
+            normalize,
         )?;
         Ok(Self {
             version: 1,
@@ -144,6 +152,7 @@ fn scan(
     device: u64,
     links: &mut BTreeMap<(u64, u64), Vec<u8>>,
     entries: &mut Vec<Node>,
+    normalize: bool,
 ) -> Result<()> {
     for name in root.names(relative)? {
         let path = relative.join(&name);
@@ -199,14 +208,7 @@ fn scan(
             let mut input = entry.open()?;
             node.content = Some(hash_reader(&mut input)?);
             node.extents = extents(&input, metadata.len())?;
-            if metadata.nlink() > 1 {
-                if let Some(first) = links.get(&(metadata.dev(), metadata.ino())) {
-                    node.hardlink = Some(first.clone());
-                } else {
-                    links.insert((metadata.dev(), metadata.ino()), node.path.clone());
-                }
-            }
-            if path == Path::new("etc/fstab") {
+            if normalize && path == Path::new("etc/fstab") {
                 let text = root
                     .optional_text(&path)?
                     .context("fstab disappeared during inventory")?;
@@ -224,7 +226,7 @@ fn scan(
                     .collect::<Vec<_>>()
                     .join("\n");
                 node.normalized = Some(digest(normalized.as_bytes()));
-            } else if path == Path::new("usr/lib/recab/immutable") {
+            } else if normalize && path == Path::new("usr/lib/recab/immutable") {
                 let text = root
                     .optional_text(&path)?
                     .context("immutable configuration disappeared")?;
@@ -237,9 +239,16 @@ fn scan(
         } else if kind == "link" {
             node.link = Some(fs::read_link(entry.path())?.as_os_str().as_bytes().to_vec());
         }
+        if !directory && metadata.nlink() > 1 {
+            if let Some(first) = links.get(&(metadata.dev(), metadata.ino())) {
+                node.hardlink = Some(first.clone());
+            } else {
+                links.insert((metadata.dev(), metadata.ino()), node.path.clone());
+            }
+        }
         entries.push(node);
         if directory {
-            scan(root, &path, device, links, entries)?;
+            scan(root, &path, device, links, entries, normalize)?;
         }
         let after = root
             .metadata(&path)?
@@ -256,7 +265,7 @@ fn scan(
     }
     Ok(())
 }
-fn extents(file: &fs::File, size: u64) -> Result<Option<Vec<Extent>>> {
+pub(crate) fn extents(file: &fs::File, size: u64) -> Result<Option<Vec<Extent>>> {
     let mut ranges = Vec::new();
     let mut offset = 0u64;
     while offset < size {

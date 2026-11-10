@@ -27,7 +27,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Record/reopen a continuation and invalidate its old boot entry (synchronization follows in P03).
+    /// Synchronize the inactive slot in place, or reopen its existing preparation.
     Prepare {
         #[arg(long, requires = "revision")]
         preparation: Option<String>,
@@ -186,7 +186,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string(&preparation)?);
             } else {
-                println!("Preparation {} for slot {}, revision {}: {:?}. Incremental synchronization is not implemented yet.", preparation.id, preparation.slot, preparation.revision, preparation.phase);
+                println!(
+                    "Preparation {} for slot {}, revision {}: {:?}.",
+                    preparation.id, preparation.slot, preparation.revision, preparation.phase
+                );
+                if let Some(report) = preparation.synchronization {
+                    println!("Last synchronization: {} payload bytes written in {} ranges; {} metadata updates. Boot finalization is still required.", report.payload_bytes_written, report.range_writes, report.metadata_updates);
+                    if !report.accounting_complete {
+                        println!("Earlier interrupted writes are unknown; counters cover the completed attempt.");
+                    }
+                }
             }
         }
         Command::Discard {

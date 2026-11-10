@@ -271,7 +271,11 @@ pub(crate) fn set_xattrs(path: &Path, wanted: &[(Vec<u8>, Vec<u8>)]) -> Result<(
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    for (name, value) in wanted {
+    for (name, value) in wanted.iter().filter(|(name, value)| {
+        !existing
+            .iter()
+            .any(|(old, bytes)| old == name && bytes == value)
+    }) {
         let name = CString::new(name.as_slice())?;
         if unsafe {
             libc::lsetxattr(
@@ -307,6 +311,30 @@ pub(crate) fn private_mounts() -> Result<()> {
     } < 0
     {
         return Err(std::io::Error::last_os_error()).context("disabling staging mount propagation");
+    }
+    Ok(())
+}
+
+/// Also catch bind mounts of the same device: st_dev alone cannot identify them.
+pub(crate) fn check_system_mounts(path: &Path) -> Result<()> {
+    let root = fs::canonicalize(path)?;
+    for mount in target_root::mount_table_at(Path::new("/proc/self/mountinfo"))? {
+        if let Ok(relative) = mount.mount_point.strip_prefix(&root) {
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            let first = relative.components().next().unwrap().as_os_str();
+            if !crate::generation::EXCLUDED.contains(&first.as_bytes()) {
+                bail!("unexpected mount inside system at '{}'", relative.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn flush(root: &Root) -> Result<()> {
+    if unsafe { libc::syncfs(root.0.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("flushing synchronized system");
     }
     Ok(())
 }

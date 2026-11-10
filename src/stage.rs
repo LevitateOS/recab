@@ -631,7 +631,7 @@ pub(crate) struct Mounted {
 
 impl Mounted {
     /// `source` mounted at `point` with `mount`'s `options`.
-    fn new(target: &Target, options: &[&str], source: &Path, point: &Path) -> Result<Self> {
+    pub(crate) fn new(target: &Target, options: &[&str], source: &Path, point: &Path) -> Result<Self> {
         target_root::run(
             Command::new(&target.programs.mount)
                 .args(options)
@@ -645,9 +645,9 @@ impl Mounted {
         })
     }
 
-    fn unmount(mut self) -> Result<()> {
-        self.active = false;
+    pub(crate) fn unmount(mut self) -> Result<()> {
         target_root::run(Command::new(&self.umount).arg(&self.point))?;
+        self.active = false;
         Ok(())
     }
 }

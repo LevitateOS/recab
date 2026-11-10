@@ -51,10 +51,12 @@ rollback. It does **not yet implement the full lifecycle above**:
 - `stage` reformats the inactive slot and carries selected configuration from
   the running slot. It cannot continue a system incrementally or preserve X
   already prepared in the inactive slot when applying an update.
-- Generation inventories, durable preparation identity/revisions and readiness
-  checks now exist. `prepare` records intent and invalidates the candidate entry;
-  incremental synchronization (P03) and writable continuation editing are still
-  missing. It does not yet clone the active system.
+- `prepare` now synchronizes the inactive ext4 filesystem in place in either
+  direction, with whole-system inventories, range writes, durable preparation
+  identity/revisions and recovery. Reopening preserves pending changes.
+- Synchronization finishes in `prepared`, while the slot remains incomplete for
+  boot. Candidate finalization, runtime migration and supported Recipe editing
+  still require P04/P06; this is not yet the complete X+update→Y lifecycle.
 - Update discovery/download, conflict handling and Recipe integration with an
   inactive system remain missing. `stage` refuses an existing preparation so it
   cannot silently discard X.
@@ -100,14 +102,37 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
 
 - `prepare` requires the committed active generation to be read-only, match its
   inventory and boot artifacts, and be the default with no pending trial. It
-  records a random preparation ID, source generation, revision and durable intent
-  before removing the inactive boot entry. The inactive slot becomes incomplete
-  and stops being a rollback target. At this implementation step it reports
-  `awaiting_synchronization`; **it has not copied a continuation**. P03 will add
-  synchronization. Repeating the command preserves its ID and payloads and can
-  finish interrupted invalidation. Supply both ID and revision to reject stale
-  requests. Reopening a completed candidate preserves its contents while making
-  it incomplete again.
+  checks the inactive partition's identity, mount status, available bytes and
+  inodes read-only before saving intent and removing its boot entry. It then
+  mounts only that inactive ext4 partition writable in a private namespace,
+  synchronizes it without formatting, verifies the resulting inventory, flushes
+  and unmounts it, and saves phase `prepared`. The old rollback ends when intent
+  is saved; the committed active system remains protected.
+
+  File writes compare fixed aligned 1 MiB ranges and write only differing data
+  ranges, including a partial final range. New files stream in; sparse holes,
+  deletions, hardlink groups (including symlinks), ownership, modes, ACLs,
+  capabilities and xattr removals are preserved. Directory metadata is restored
+  after child operations. A mutation detaches an inode when aliases outside the
+  intended group could otherwise modify excluded data or cached publications.
+  Unexpected mounts (including same-device binds), devices, FIFOs and sockets
+  in system content are refused. Shared/runtime and ESP contents are excluded.
+
+  Source root references and immutable configuration are materialized with the
+  destination's slot/PARTUUID. The journal records only changed operations and
+  affected parents, not an expanded third root. After interruption, retry
+  re-inventories actual contents and re-compares ranges; completed-step counters
+  do not authorize skipping data checks. Supply both preparation ID and revision
+  to reject stale requests. Once synchronized, reopening preserves its ID and
+  pending changes and does not reseed it. No writable mount is left open between
+  commands. `prepared` is not boot-ready: P04 finalization remains required.
+
+  `synchronization` in the preparation reports the last completed attempt's
+  logical payload bytes/range writes, comparisons, hole punching, creations,
+  removals, metadata operations, marker bytes and serialized plan bytes.
+  Filesystem metadata/journal bytes and other recab state bytes are `null`
+  (unmeasured), not zero. These counters are not SSD SMART totals. After a killed
+  attempt, `accounting_complete=false`: earlier payload writes are unknown.
 - `discard` explicitly abandons the matching ID/revision and removes its entry.
   It does not restore an older rollback or claim the remaining payload is ready.
 - `inventory` reads the complete system tree using path bytes, content digests,
@@ -136,7 +161,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   trial is pending, the next boot, and how the last trial ended. It only reads,
   so it also works off UEFI. `slots` lists each slot's entry, kernel
   directory, `root=`, device, whether it can boot and whether it carries the
-  trial options. Status schema 3 also reports generation identities, readiness,
+  trial options. Status schema 4 also reports generation identities, readiness,
   preparation progress and a recovery reason. `bootable` checks ESP-file presence;
   `generation_ready` additionally requires a complete recorded generation and
   matching boot-artifact digests. Boot scheduling requires that stronger check. With `--root <dir>` it reads the system installed there (its
@@ -273,7 +298,10 @@ The A/B layout mounts its state partition at `/var`, so both slots share recab's
 - Audit log (JSON lines): `/var/lib/recab/audit.log`
 - Lock: `/run/lock/recab.lock`, held by every run that changes anything
 
-Both slots share state format `{"major":2,"minor":0}`. The structured major
+Both slots now write state format `{"major":2,"minor":1}`. The new reader also
+accepts 2.0 and promotes it only when saving a successful mutation. The P02
+reader refuses 2.1, so it cannot drop synchronization progress and reseed pending
+changes. Both slot runtimes need a compatible version before deployment. The structured major
 version intentionally cannot be read by the old numeric-schema writer, which
 would otherwise ignore new safety restrictions. Numeric schema 1 is inspectable
 but read-only; adoption with compatible runtimes is still required. Unsupported
@@ -285,6 +313,9 @@ generation and kernel/initramfs digests; the boot command line identifies the
 booted generation, and pending trials bind to that generation rather than only
 its reusable slot letter. Inventories live under `/var/lib/recab/inventories/`;
 the system's slot/generation marker is `/usr/lib/recab/generation.json`.
+An unfinished synchronization has a protected `synchronize-<preparation>.json`
+operation plan in `/var/lib/recab/`. It is removed after successful preparation or
+discard; a remaining plan triggers conservative interrupted-write accounting.
 
 A boot-selection change writes the boot selection first and recab's state
 second: after a crash between the two, the machine boots what was asked and
@@ -296,7 +327,7 @@ guaranteed atomic.) A failed audit-log append is reported as a warning.
 
 ## Backend Preconditions
 
-Changing the boot selection, and `stage`, need UEFI with efivarfs, and fail
+Changing the boot selection, `prepare`, and `stage` need UEFI with efivarfs, and fail
 fast without:
 
 - `/sys/firmware/efi`
@@ -308,7 +339,8 @@ efivarfs sets, one write per variable), as `bootctl` would, so it needs no
 
 `stage` also uses `blkid`, `mkfs.ext4` and `mount` (util-linux, e2fsprogs),
 `chroot` and `recstrap`; it copies files itself, so busybox systems work. `init`
-uses `blkid`.
+uses `blkid`. `prepare` uses `blkid`, `mount` and `umount`, requires mount
+namespace/device access, and refuses an already mounted inactive partition.
 
 ## Security
 
@@ -327,7 +359,9 @@ Every operation that writes (`init`, `stage`, `set-next`, `commit`, `rollback`,
 | `src/immutable.rs` | Read-only system configuration and immutable-initramfs compatibility |
 | `src/filesystem.rs` | Directory-FD-confined filesystem access and complete xattrs |
 | `src/generation.rs` | Deterministic system inventories, generation identity and slot markers |
-| `src/prepare.rs` | Preparation identity, entry invalidation, interruption and explicit discard |
+| `src/prepare.rs` | Preparation identity, synchronization, interruption and explicit discard |
+| `src/sync.rs` | Delta operation planning, capacity, range writes, sparse files, links and metadata |
+| `src/slot_mount.rs` | Checked inactive ext4 mounts and device protection restoration |
 | `src/init_system.rs` | The init adapter: startup and failures (`health`), reboot, the crash option |
 | `src/package.rs`, `src/services/` | The trial service files and the carried-state list recab's package carries |
 | `src/carry.rs` | The carried-state list, configuration baseline, copying and account merge |
@@ -342,6 +376,22 @@ sets, and a fake OpenRC state directory. No disk is touched. Runs that need root
 (`unshare --user --map-root-user`). Some fixtures still encode the old empty-B
 installation, use legacy state and lack the initramfs now required by this checkout. These checks
 do not establish the required continuation lifecycle.
+
+The explicit P03 CLI check uses temporary GPT/ext4 loop partitions and requires
+root plus `sfdisk`, `losetup`, `blkid`, `mkfs.ext4`, `mount`, `umount`, `fallocate`
+and Python 3. From the superproject root, using the existing focused CLI binary:
+
+```sh
+sudo python3 tools/recab/tests/synchronization.py --binary target/debug/recab
+```
+
+It checks both synchronization directions, a kill after a real payload write,
+resume, preservation of pending changes, bounded range writes, equal-root zero
+payload writes, metadata/ACL/capability/xattr and link fidelity, sparse files,
+shared-data isolation, mount/special-file refusal, and space refusal before boot
+invalidation. It supplies scratch firmware/boot records and does not validate
+P04 finalization or a kernel boot. Its verified temporary loop image is cleaned
+up on success; failure artifacts are retained unmounted for inspection.
 
 ## End-to-End Validation
 
