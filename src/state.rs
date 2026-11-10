@@ -6,6 +6,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::error::refuse;
+use crate::generation::Generation;
 
 /// System slot identifier (A/B). Its one spelling (`A`, `B`) is used by the
 /// CLI, the JSON and the state file.
@@ -61,17 +62,73 @@ pub struct TrialRecord {
     pub unix_time: u64,
 }
 
-/// The schema recab writes. Both slots' recab read the same file (it lives
-/// on the shared /var), so newer schemas only add fields: an older recab
-/// reads them, keeps the fields it does not know, and never lowers the number.
-pub(crate) const STATE_SCHEMA_VERSION: u32 = 1;
-/// The oldest schema recab has written.
-const FIRST_STATE_SCHEMA: u32 = 1;
+/// A structured major version intentionally cannot be parsed by the old
+/// numeric-schema reader, which otherwise ignores future safety restrictions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum StateSchema {
+    Legacy(u32),
+    Current { major: u32, minor: u32 },
+}
+impl Default for StateSchema {
+    fn default() -> Self {
+        Self::Current { major: 2, minor: 0 }
+    }
+}
+
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Readiness {
+    Empty,
+    Incomplete,
+    Ready,
+    Committed,
+}
+
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SlotState {
+    pub slot: Slot,
+    pub partuuid: String,
+    pub generation: Option<Generation>,
+    pub readiness: Readiness,
+}
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationPhase {
+    Intent,
+    AwaitingSynchronization,
+    Prepared,
+    Staging,
+    Ready,
+    Interrupted,
+}
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Preparation {
+    pub id: String,
+    pub slot: Slot,
+    pub source_slot: Slot,
+    pub source_generation: String,
+    pub revision: u64,
+    pub operation: String,
+    pub phase: PreparationPhase,
+    pub completed_steps: u64,
+    pub failure: Option<String>,
+}
 
 /// What recab keeps in its state file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct PersistentState {
-    pub schema: u32,
+    pub schema: StateSchema,
+    #[serde(default)]
+    pub slots: Vec<SlotState>,
+    #[serde(default)]
+    pub preparation: Option<Preparation>,
+    #[serde(default)]
+    pub pending_trial_generation: Option<String>,
     #[serde(default)]
     pub known_good_slot: Option<Slot>,
     /// The slot that was known-good before `known_good_slot`, while it still
@@ -94,20 +151,129 @@ pub(crate) struct PersistentState {
 }
 
 impl PersistentState {
-    /// A state file of a schema recab can read: the first schema or any
-    /// newer one, since newer schemas only add fields.
     pub fn check_schema(&self) -> Result<(), String> {
-        if self.schema < FIRST_STATE_SCHEMA {
-            return Err(format!("schema {} is not a recab state schema", self.schema));
+        match self.schema {
+            StateSchema::Legacy(1) | StateSchema::Current { major: 2, minor: 0 } => Ok(()),
+            _ => Err("unsupported recab state format; use a compatible recovery tool".into()),
+        }
+    }
+    pub fn slot(&self, slot: Slot) -> Option<&SlotState> {
+        self.slots.iter().find(|record| record.slot == slot)
+    }
+    pub fn slot_mut(&mut self, slot: Slot) -> Result<&mut SlotState> {
+        self.slots
+            .iter_mut()
+            .find(|record| record.slot == slot)
+            .ok_or_else(|| refuse("slot mapping is not initialized"))
+    }
+    pub fn check_mutable(&self) -> Result<()> {
+        self.check_schema().map_err(refuse)?;
+        if matches!(self.schema, StateSchema::Legacy(_)) {
+            return Err(refuse(
+                "legacy slot-only state is read-only; explicit adoption with compatible runtimes is required",
+            ));
+        }
+        if self.slots.len() != 2 {
+            return Err(refuse(
+                "recab generation state is not initialized for both partitions",
+            ));
+        }
+        let a = self
+            .slot(Slot::A)
+            .ok_or_else(|| refuse("slot A mapping is missing"))?;
+        let b = self
+            .slot(Slot::B)
+            .ok_or_else(|| refuse("slot B mapping is missing"))?;
+        if [a, b].iter().any(|record| {
+            record.partuuid.is_empty()
+                || !record
+                    .partuuid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+        }) || a.partuuid.eq_ignore_ascii_case(&b.partuuid)
+        {
+            return Err(refuse("invalid or duplicate slot partition identity"));
+        }
+        for record in &self.slots {
+            if record
+                .generation
+                .as_ref()
+                .is_some_and(|generation| !generation.valid())
+            {
+                return Err(refuse("invalid system generation digest"));
+            }
+            if matches!(record.readiness, Readiness::Ready | Readiness::Committed)
+                && record.generation.is_none()
+            {
+                return Err(refuse("a complete slot has no generation identity"));
+            }
+        }
+        for slot in [self.known_good_slot, self.previous_good_slot]
+            .into_iter()
+            .flatten()
+        {
+            self.require_ready(slot)?;
+        }
+        match (
+            self.pending_trial_slot,
+            self.pending_trial_generation.as_ref(),
+        ) {
+            (Some(slot), Some(id)) if self.require_ready(slot)?.id == *id => {}
+            (None, None) => {}
+            _ => {
+                return Err(refuse(
+                    "pending trial does not identify a complete generation",
+                ))
+            }
+        }
+        if let Some(preparation) = &self.preparation {
+            let source = self
+                .slot(preparation.source_slot)
+                .and_then(|slot| slot.generation.as_ref());
+            if preparation.slot == preparation.source_slot
+                || source.is_none_or(|source| source.id != preparation.source_generation)
+                || preparation.id.len() != 64
+                || !preparation.id.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(refuse("invalid preparation source or identity"));
+            }
+            self.require_ready(preparation.source_slot)?;
+            let candidate = self.slot(preparation.slot).unwrap();
+            if (preparation.phase == PreparationPhase::Ready
+                && candidate.readiness != Readiness::Ready)
+                || (preparation.phase != PreparationPhase::Ready
+                    && candidate.readiness != Readiness::Incomplete)
+            {
+                return Err(refuse(
+                    "preparation phase conflicts with candidate readiness",
+                ));
+            }
         }
         Ok(())
+    }
+    pub fn require_ready(&self, slot: Slot) -> Result<&Generation> {
+        let record = self
+            .slot(slot)
+            .ok_or_else(|| refuse("slot has no generation mapping"))?;
+        if !matches!(record.readiness, Readiness::Ready | Readiness::Committed) {
+            return Err(refuse(format!(
+                "slot {slot} is incomplete; kernel files do not establish a finalized candidate"
+            )));
+        }
+        record
+            .generation
+            .as_ref()
+            .ok_or_else(|| refuse("slot has no generation identity"))
     }
 }
 
 impl Default for PersistentState {
     fn default() -> Self {
         Self {
-            schema: STATE_SCHEMA_VERSION,
+            schema: StateSchema::default(),
+            slots: Vec::new(),
+            preparation: None,
+            pending_trial_generation: None,
             known_good_slot: None,
             previous_good_slot: None,
             pending_trial_slot: None,
@@ -121,10 +287,11 @@ impl Default for PersistentState {
 
 /// What the boot loader selects, as recab's decisions need it. Entries whose
 /// files are missing from the ESP are never selected: systemd-boot skips them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Selection {
     /// The slot that booted.
     pub active: Slot,
+    pub active_generation: Option<String>,
     /// The slot booted by default.
     pub default: Option<Slot>,
     /// The slot of a one-shot entry not taken yet.
@@ -155,6 +322,13 @@ pub(crate) fn known_good(state: &PersistentState, sel: &Selection) -> Option<Slo
 
 pub(crate) fn committed(state: &PersistentState, sel: &Selection) -> bool {
     known_good(state, sel) == Some(sel.active)
+        && (matches!(state.schema, StateSchema::Legacy(_))
+            || state
+                .slot(sel.active)
+                .and_then(|slot| slot.generation.as_ref())
+                .is_some_and(|generation| {
+                    sel.active_generation.as_deref() == Some(generation.id.as_str())
+                }))
 }
 
 /// What rollback selects: from an uncommitted slot, or to cancel a pending
@@ -169,7 +343,7 @@ pub(crate) fn rollback_target(state: &PersistentState, sel: &Selection) -> Optio
 }
 
 /// What a command asks of the state machine.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum Request {
     /// Schedule one trial boot of the inactive slot.
     SetNext(Slot),
@@ -178,7 +352,18 @@ pub(crate) enum Request {
     /// Go back to the known-good slot, or the one good before it.
     Rollback,
     /// Write a new system into the inactive slot.
-    Stage,
+    Stage {
+        id: String,
+    },
+    Prepare {
+        id: String,
+        expected_id: Option<String>,
+        expected_revision: Option<u64>,
+    },
+    Discard {
+        id: String,
+        revision: u64,
+    },
 }
 
 /// A state transition; its names are used in the state file and audit log.
@@ -187,6 +372,8 @@ pub(crate) enum Operation {
     /// `recab init` set up the slots with this one holding the system.
     Init(Slot),
     Stage(Slot),
+    Prepare(Slot),
+    Discard(Slot),
     SetNext(Slot),
     Commit(Slot),
     Rollback(Slot),
@@ -201,6 +388,8 @@ impl Operation {
         match self {
             Operation::Init(_) => "init",
             Operation::Stage(_) => "stage",
+            Operation::Prepare(_) => "prepare",
+            Operation::Discard(_) => "discard",
             Operation::SetNext(_) => "set-next",
             Operation::Commit(_) => "commit",
             Operation::Rollback(_) => "rollback",
@@ -213,6 +402,8 @@ impl Operation {
         match self {
             Operation::Init(slot)
             | Operation::Stage(slot)
+            | Operation::Prepare(slot)
+            | Operation::Discard(slot)
             | Operation::SetNext(slot)
             | Operation::Commit(slot)
             | Operation::Rollback(slot)
@@ -254,7 +445,12 @@ impl Transition {
 /// The transition `request` makes from `state` and `sel`, `None` when the
 /// system already is where the request leads, or the reason it is refused.
 /// recab never selects a slot that cannot boot.
-pub(crate) fn plan(request: Request, sel: &Selection, state: &PersistentState) -> Result<Option<Transition>> {
+pub(crate) fn plan(
+    request: Request,
+    sel: &Selection,
+    state: &PersistentState,
+) -> Result<Option<Transition>> {
+    state.check_mutable()?;
     let active = sel.active;
     let inactive = active.other();
     let mut next = state.clone();
@@ -265,13 +461,17 @@ pub(crate) fn plan(request: Request, sel: &Selection, state: &PersistentState) -
             )));
         }
         Request::SetNext(slot) => {
+            let generation = state.require_ready(slot)?;
             if !committed(state, sel) {
                 return Err(refuse(format!(
                     "slot {active} is running uncommitted and slot {slot} is the known-good slot; run 'recab commit' to keep slot {active}, or 'recab rollback' to return to slot {slot}"
                 )));
             }
             // Already scheduled, in the firmware and in recab's state.
-            if sel.oneshot == Some(slot) && state.pending_trial_slot == Some(slot) {
+            if sel.oneshot == Some(slot)
+                && state.pending_trial_slot == Some(slot)
+                && state.pending_trial_generation.as_deref() == Some(generation.id.as_str())
+            {
                 return Ok(None);
             }
             if !sel.can_boot(slot) {
@@ -285,9 +485,18 @@ pub(crate) fn plan(request: Request, sel: &Selection, state: &PersistentState) -
                 )));
             }
             next.pending_trial_slot = Some(slot);
-            Transition { operation: Operation::SetNext(slot), next, boot: Some(BootChange::OneShot(slot)) }
+            next.pending_trial_generation = Some(generation.id.clone());
+            Transition {
+                operation: Operation::SetNext(slot),
+                next,
+                boot: Some(BootChange::OneShot(slot)),
+            }
         }
         Request::Commit => {
+            let generation = state.require_ready(active)?;
+            if sel.active_generation.as_deref() != Some(generation.id.as_str()) {
+                return Err(refuse("the booted generation does not match the candidate"));
+            }
             if committed(state, sel) && sel.default == Some(active) && sel.oneshot.is_none() {
                 return Ok(None);
             }
@@ -301,18 +510,111 @@ pub(crate) fn plan(request: Request, sel: &Selection, state: &PersistentState) -
                     "cannot rollback: no known-good slot is recorded and no default slot is set".to_string()
                 })
             })?;
+            state.require_ready(target)?;
             if !sel.can_boot(target) {
-                return Err(refuse(format!("cannot rollback: slot {target} cannot boot (its entry names files missing from the ESP)")));
+                return Err(refuse(format!(
+                    "cannot rollback: slot {target} cannot boot (its entry names files missing from the ESP)"
+                )));
             }
             if target != active && committed(state, sel) {
                 // Leaving a committed slot: it stays a slot to roll back to.
                 next.previous_good_slot = Some(active);
             }
             next.known_good_slot = Some(target);
+            next.pending_trial_generation = None;
             next.pending_trial_slot = None;
-            Transition { operation: Operation::Rollback(target), next, boot: Some(BootChange::Default(target)) }
+            Transition {
+                operation: Operation::Rollback(target),
+                next,
+                boot: Some(BootChange::Default(target)),
+            }
         }
-        Request::Stage => {
+        Request::Prepare {
+            id,
+            expected_id,
+            expected_revision,
+        } => {
+            ensure_preparation_allowed(state, sel)?;
+            if let Some(preparation) = &state.preparation {
+                check_preparation(
+                    preparation,
+                    sel,
+                    state,
+                    expected_id.as_deref(),
+                    expected_revision,
+                )?;
+                if preparation.phase == PreparationPhase::Ready {
+                    let reopened = next.preparation.as_mut().unwrap();
+                    reopened.phase = PreparationPhase::Prepared;
+                    reopened.operation = "prepare".into();
+                    reopened.revision += 1;
+                    next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
+                    return Ok(Some(Transition {
+                        operation: Operation::Prepare(inactive),
+                        next,
+                        boot: None,
+                    }));
+                }
+                if preparation.operation != "prepare" {
+                    return Err(refuse(
+                        "the previous operation requires recovery before reopening",
+                    ));
+                }
+                return Ok(None);
+            }
+            if expected_id.is_some() || expected_revision.is_some() {
+                return Err(refuse(
+                    "no existing preparation matches the expected revision",
+                ));
+            }
+            let source = state.require_ready(active)?;
+            next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
+            next.slot_mut(inactive)?.generation = None;
+            next.previous_good_slot = None;
+            next.preparation = Some(Preparation {
+                id,
+                slot: inactive,
+                source_slot: active,
+                source_generation: source.id.clone(),
+                revision: 0,
+                operation: "prepare".into(),
+                phase: PreparationPhase::Intent,
+                completed_steps: 0,
+                failure: None,
+            });
+            Transition {
+                operation: Operation::Prepare(inactive),
+                next,
+                boot: None,
+            }
+        }
+        Request::Discard { id, revision } => {
+            ensure_preparation_allowed(state, sel)?;
+            let preparation = state
+                .preparation
+                .as_ref()
+                .ok_or_else(|| refuse("there is no preparation to discard"))?;
+            check_preparation(preparation, sel, state, Some(&id), Some(revision))?;
+            if !committed(state, sel) || sel.oneshot.is_some() {
+                return Err(refuse(
+                    "cannot discard while a trial is pending or uncommitted",
+                ));
+            }
+            next.preparation = None;
+            next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
+            next.slot_mut(inactive)?.generation = None;
+            Transition {
+                operation: Operation::Discard(inactive),
+                next,
+                boot: None,
+            }
+        }
+        Request::Stage { id } => {
+            if state.preparation.is_some() {
+                return Err(refuse(
+                    "a preparation already exists; release staging cannot discard its pending work",
+                ));
+            }
             if !committed(state, sel) {
                 return Err(refuse(format!(
                     "slot {active} is running uncommitted, so slot {inactive} is the fallback; staging over it would leave no known-good system.\n\
@@ -336,6 +638,21 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {inactive}."
                     "the default is slot {inactive}; run 'recab commit' so it is slot {active} before staging slot {inactive}"
                 )));
             }
+            let source = state.require_ready(active)?;
+            next.preparation = Some(Preparation {
+                id,
+                slot: inactive,
+                source_slot: active,
+                source_generation: source.id.clone(),
+                revision: 0,
+                operation: "stage".into(),
+                phase: PreparationPhase::Staging,
+                completed_steps: 0,
+                failure: None,
+            });
+            next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
+            next.slot_mut(inactive)?.generation = None;
+            next.pending_trial_generation = None;
             next.known_good_slot = Some(active);
             // A new system in the slot ends any trial scheduled before.
             next.pending_trial_slot = None;
@@ -343,10 +660,56 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {inactive}."
             if next.previous_good_slot == Some(inactive) {
                 next.previous_good_slot = None;
             }
-            Transition { operation: Operation::Stage(inactive), next, boot: None }
+            Transition {
+                operation: Operation::Stage(inactive),
+                next,
+                boot: None,
+            }
         }
     };
     Ok(Some(transition))
+}
+
+fn ensure_preparation_allowed(state: &PersistentState, sel: &Selection) -> Result<()> {
+    if !committed(state, sel) {
+        return Err(refuse(
+            "the running slot is uncommitted; its fallback cannot be prepared",
+        ));
+    }
+    if sel.oneshot.is_some() || state.pending_trial_slot.is_some() {
+        return Err(refuse("cancel the pending trial before preparing a system"));
+    }
+    if sel.default != Some(sel.active) || sel.foreign_default {
+        return Err(refuse(
+            "the committed active generation must be the default before preparation",
+        ));
+    }
+    Ok(())
+}
+fn check_preparation(
+    preparation: &Preparation,
+    sel: &Selection,
+    state: &PersistentState,
+    id: Option<&str>,
+    revision: Option<u64>,
+) -> Result<()> {
+    if preparation.source_slot != sel.active
+        || preparation.slot != sel.active.other()
+        || state
+            .slot(sel.active)
+            .and_then(|slot| slot.generation.as_ref())
+            .is_none_or(|source| source.id != preparation.source_generation)
+    {
+        return Err(refuse(
+            "the preparation belongs to a different active generation; it cannot be silently rebased",
+        ));
+    }
+    if id.is_some_and(|id| id != preparation.id)
+        || revision.is_some_and(|revision| revision != preparation.revision)
+    {
+        return Err(refuse("stale preparation id or revision"));
+    }
+    Ok(())
 }
 
 /// Keep the running slot: known-good and the default; the slot that was
@@ -360,7 +723,22 @@ fn commit(state: &PersistentState, sel: &Selection) -> Transition {
     }
     next.known_good_slot = Some(active);
     next.pending_trial_slot = None;
-    Transition { operation: Operation::Commit(active), next, boot: Some(BootChange::Default(active)) }
+    next.pending_trial_generation = None;
+    if next
+        .preparation
+        .as_ref()
+        .is_some_and(|preparation| preparation.slot == active)
+    {
+        next.preparation = None;
+    }
+    if let Some(record) = next.slots.iter_mut().find(|record| record.slot == active) {
+        record.readiness = Readiness::Committed;
+    }
+    Transition {
+        operation: Operation::Commit(active),
+        next,
+        boot: Some(BootChange::Default(active)),
+    }
 }
 
 /// How system startup ended, as the init adapter reports it.
@@ -419,7 +797,10 @@ pub(crate) enum Judgment {
     Change(Transition),
     /// The trial failed: record it (`None` when there is no state to record
     /// in), and reboot.
-    Failed { transition: Option<Transition>, reboot: Reboot },
+    Failed {
+        transition: Option<Transition>,
+        reboot: Reboot,
+    },
 }
 
 /// Judge a boot. It is a trial when recab scheduled this slot's boot
@@ -433,20 +814,44 @@ pub(crate) fn judge(input: &TrialInput, view: Option<TrialView>) -> Judgment {
     }
     let failed = input.startup != Startup::Running;
     let one_shot = input.firmware_trial == Some(true);
-    let Some(TrialView { sel, state, state_found }) = view else {
+    let Some(TrialView {
+        sel,
+        state,
+        state_found,
+    }) = view
+    else {
         return if failed && one_shot {
-            Judgment::Failed { transition: None, reboot: Reboot::FirmwareDefault }
+            Judgment::Failed {
+                transition: None,
+                reboot: Reboot::FirmwareDefault,
+            }
         } else {
             Judgment::Ignore
         };
     };
+    if state.check_mutable().is_err() {
+        return if failed && one_shot {
+            Judgment::Failed {
+                transition: None,
+                reboot: Reboot::FirmwareDefault,
+            }
+        } else {
+            Judgment::Ignore
+        };
+    }
     let active = sel.active;
-    let is_trial = state.pending_trial_slot == Some(active) && !committed(state, sel);
+    let is_trial = state.pending_trial_slot == Some(active)
+        && !committed(state, sel)
+        && state.pending_trial_generation.as_deref() == sel.active_generation.as_deref()
+        && state.pending_trial_generation.is_some();
     if !is_trial {
         // No state on /var but a one-shot boot that failed: /var itself may
         // be what failed to mount; there is nothing to record it in.
         if failed && !state_found && one_shot {
-            return Judgment::Failed { transition: None, reboot: Reboot::FirmwareDefault };
+            return Judgment::Failed {
+                transition: None,
+                reboot: Reboot::FirmwareDefault,
+            };
         }
         // Another boot used up the one-shot of the trial recab scheduled: a
         // later boot of that slot from the menu is no trial.
@@ -454,12 +859,22 @@ pub(crate) fn judge(input: &TrialInput, view: Option<TrialView>) -> Judgment {
             if sel.oneshot.is_none() {
                 let mut next = state.clone();
                 next.pending_trial_slot = None;
-                return Judgment::Change(Transition { operation: Operation::TrialMissed(scheduled), next, boot: None });
+                next.pending_trial_generation = None;
+                return Judgment::Change(Transition {
+                    operation: Operation::TrialMissed(scheduled),
+                    next,
+                    boot: None,
+                });
             }
         }
         return Judgment::Ignore;
     }
-    let record = TrialRecord { slot: active, committed: !failed, detail: input.detail.clone(), unix_time: input.unix_time };
+    let record = TrialRecord {
+        slot: active,
+        committed: !failed,
+        detail: input.detail.clone(),
+        unix_time: input.unix_time,
+    };
     if !failed {
         let mut transition = commit(state, sel);
         transition.next.last_trial = Some(record);
@@ -468,14 +883,24 @@ pub(crate) fn judge(input: &TrialInput, view: Option<TrialView>) -> Judgment {
     let mut next = state.clone();
     next.pending_trial_slot = None;
     next.last_trial = Some(record);
+    next.pending_trial_generation = None;
     let reboot = match known_good(state, sel).filter(|slot| *slot != active) {
         None => Reboot::Not("there is no known-good slot to return to".to_string()),
-        Some(slot) if !sel.can_boot(slot) => Reboot::Not(format!("the known-good slot {slot} cannot boot")),
+        Some(slot) if !sel.can_boot(slot) => {
+            Reboot::Not(format!("the known-good slot {slot} cannot boot"))
+        }
         Some(slot) => Reboot::Into(slot),
     };
     let boot = match reboot {
         Reboot::Into(slot) if sel.next_boot() != Some(slot) => Some(BootChange::Default(slot)),
         _ => None,
     };
-    Judgment::Failed { transition: Some(Transition { operation: Operation::TrialFailed(active), next, boot }), reboot }
+    Judgment::Failed {
+        transition: Some(Transition {
+            operation: Operation::TrialFailed(active),
+            next,
+            boot,
+        }),
+        reboot,
+    }
 }

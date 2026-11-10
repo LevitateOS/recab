@@ -3,12 +3,13 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
-use crate::target::Target;
 use crate::error::{classified, refuse, ErrorClass};
 use crate::state::{Operation, PersistentState, Slot};
+use crate::target::Target;
 
 /// The audit log record's schema (one JSON object per line). Each record
 /// embeds the state before and after the transition, which carries its own
@@ -66,29 +67,53 @@ impl Store {
         Ok(Lock { _file: file })
     }
 
-
     /// recab's state, `None` when it has written none here.
     pub fn load(&self) -> Result<Option<PersistentState>> {
         let path = &self.state_path;
         let fail = |message: String| {
-            refuse(format!("failed loading recab state '{}': {message}", path.display()),
-            )
+            refuse(format!(
+                "failed loading recab state '{}': {message}",
+                path.display()
+            ))
         };
-        let Some(content) = target_root::read_optional(path).map_err(|err| fail(err.to_string()))? else {
-            return Ok(None);
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(fail(error.to_string())),
         };
+        if !file
+            .metadata()
+            .map_err(|error| fail(error.to_string()))?
+            .is_file()
+        {
+            return Err(fail("state is not a regular file".into()));
+        }
+        let mut content = String::new();
+        file.take(4 * 1024 * 1024 + 1)
+            .read_to_string(&mut content)
+            .map_err(|error| fail(error.to_string()))?;
+        if content.len() > 4 * 1024 * 1024 {
+            return Err(fail("state exceeds 4 MiB".into()));
+        }
         let state: PersistentState =
             serde_json::from_str(&content).map_err(|err| fail(err.to_string()))?;
-        state.check_schema().map_err(fail)?;
         Ok(Some(state))
     }
 
     pub fn save(&self, state: &PersistentState) -> Result<()> {
+        state.check_mutable()?;
         let payload = serde_json::to_vec_pretty(state).context("serializing recab state")?;
         target_root::write_durable(&self.state_path, &payload, None).map_err(|err| {
             classified(
                 ErrorClass::StateOrDetection,
-                format!("failed writing recab state to '{}': {err:#}", self.state_path.display()),
+                format!(
+                    "failed writing recab state to '{}': {err:#}",
+                    self.state_path.display()
+                ),
             )
         })
     }

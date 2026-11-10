@@ -47,7 +47,9 @@ pub fn entry_name(prefix: &str, slot: Slot) -> String {
 pub(crate) fn slot_of_entry(prefix: &str, id: &str) -> Option<Slot> {
     let id = id.trim().to_ascii_lowercase();
     let stem = id.strip_suffix(".conf").unwrap_or(&id);
-    Slot::ALL.into_iter().find(|slot| stem == layout_name(prefix, Some(*slot)))
+    Slot::ALL
+        .into_iter()
+        .find(|slot| stem == layout_name(prefix, Some(*slot)))
 }
 
 /// Two entry ids name the same entry (systemd-boot's matching).
@@ -65,28 +67,40 @@ fn key_value(line: &str) -> Option<(&str, &str)> {
     if line.is_empty() || line.starts_with('#') {
         return None;
     }
-    Some(line.split_once(char::is_whitespace).map_or((line, ""), |(key, value)| (key, value.trim())))
+    Some(
+        line.split_once(char::is_whitespace)
+            .map_or((line, ""), |(key, value)| (key, value.trim())),
+    )
 }
 
 /// A partition's PARTUUID as a `root=` names it, lower-cased: recab names
 /// roots by `root=PARTUUID=` (or the equivalent `/dev/disk/by-partuuid/`).
 fn root_partuuid(value: &str) -> Option<String> {
     let value = value.trim().trim_matches(['"', '\'']);
-    ["PARTUUID=", "/dev/disk/by-partuuid/"].iter().find_map(|prefix| {
-        (value.len() > prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix))
-            .then(|| value[prefix.len()..].to_ascii_lowercase())
-    })
+    ["PARTUUID=", "/dev/disk/by-partuuid/"]
+        .iter()
+        .find_map(|prefix| {
+            (value.len() > prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix))
+                .then(|| value[prefix.len()..].to_ascii_lowercase())
+        })
 }
 
 /// The kernel command line's root partition, when it names one by
 /// PARTUUID (the kernel uses the last `root=`).
 pub(crate) fn cmdline_root(cmdline: &str) -> Option<String> {
-    cmdline.split_whitespace().filter_map(|word| word.strip_prefix("root=")).next_back().and_then(root_partuuid)
+    cmdline
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("root="))
+        .next_back()
+        .and_then(root_partuuid)
 }
 
 /// The raw `root=` of a command line, for messages.
 pub(crate) fn cmdline_root_text(cmdline: &str) -> Option<&str> {
-    cmdline.split_whitespace().filter_map(|word| word.strip_prefix("root=")).next_back()
+    cmdline
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("root="))
+        .next_back()
 }
 
 /// One boot entry, as lines, so what recab does not edit stays as written.
@@ -97,13 +111,17 @@ pub(crate) struct Entry {
 
 impl Entry {
     pub fn parse(text: &str) -> Self {
-        Self { lines: text.lines().map(str::to_string).collect() }
+        Self {
+            lines: text.lines().map(str::to_string).collect(),
+        }
     }
 
     /// A new entry: `title`, the kernel (and initramfs) in `dir` on the ESP,
     /// the root by `partuuid`, the root options, `panic=` and `extra`.
     pub fn new(title: &str, dir: &str, initrd: bool, partuuid: &str, extra: &str) -> Self {
-        let mut entry = Self { lines: vec![format!("title {title}")] };
+        let mut entry = Self {
+            lines: vec![format!("title {title}")],
+        };
         entry.set_boot_files(dir, initrd);
         let mut options = vec![format!("root=PARTUUID={partuuid}")];
         options.extend(ROOT_OPTIONS.iter().map(|o| o.to_string()));
@@ -118,12 +136,16 @@ impl Entry {
     }
 
     fn values<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
-        self.lines.iter().filter_map(move |line| key_value(line).filter(|(k, _)| *k == key).map(|(_, v)| v))
+        self.lines
+            .iter()
+            .filter_map(move |line| key_value(line).filter(|(k, _)| *k == key).map(|(_, v)| v))
     }
 
     /// The kernel options, all `options` lines joined (as systemd-boot does).
     pub fn options(&self) -> Vec<String> {
-        self.values("options").flat_map(|v| v.split_whitespace().map(str::to_string)).collect()
+        self.values("options")
+            .flat_map(|v| v.split_whitespace().map(str::to_string))
+            .collect()
     }
 
     /// Replace the options with one `options` line where the first was, or
@@ -134,15 +156,33 @@ impl Entry {
 
     pub fn make_immutable(&mut self) {
         let mut options = self.options();
-        if !options.iter().any(|o| o == recinit::installed::IMMUTABLE_OPTION) {
+        if !options
+            .iter()
+            .any(|o| o == recinit::installed::IMMUTABLE_OPTION)
+        {
             options.push(recinit::installed::IMMUTABLE_OPTION.to_string());
         }
         self.set_options(options);
     }
 
+    pub fn set_generation(&mut self, id: &str) {
+        let mut options = self
+            .options()
+            .into_iter()
+            .filter(|option| !option.starts_with("recab.generation="))
+            .collect::<Vec<_>>();
+        options.push(format!("recab.generation={id}"));
+        self.set_options(options);
+    }
+
     /// The files the entry loads from the ESP.
     pub fn boot_files(&self) -> Vec<String> {
-        BOOT_FILE_KEYS.iter().flat_map(|key| self.values(key)).filter_map(|v| v.split_whitespace().next()).map(str::to_string).collect()
+        BOOT_FILE_KEYS
+            .iter()
+            .flat_map(|key| self.values(key))
+            .filter_map(|v| v.split_whitespace().next())
+            .map(str::to_string)
+            .collect()
     }
 
     /// Point the entry at the kernel (and initramfs) in `dir` on the ESP.
@@ -162,19 +202,22 @@ impl Entry {
     /// The PARTUUID of the root the entry boots, if it names one so.
     pub fn root_partuuid(&self) -> Option<String> {
         let options = self.options();
-        options.iter().filter_map(|o| o.strip_prefix("root=")).next_back().and_then(root_partuuid)
-    }
-
-    /// The entry's raw `root=`, for messages.
-    pub fn root_text(&self) -> Option<String> {
-        self.options().iter().filter_map(|o| o.strip_prefix("root=")).next_back().map(str::to_string)
+        options
+            .iter()
+            .filter_map(|o| o.strip_prefix("root="))
+            .next_back()
+            .and_then(root_partuuid)
     }
 
     /// Replace every line with one of `keys` by `new`, placed where the
     /// first of them was (or at the end).
     fn replace_keys(&mut self, keys: &[&str], new: Vec<String>) {
-        let at = self.lines.iter().position(|line| key_value(line).is_some_and(|(k, _)| keys.contains(&k)));
-        self.lines.retain(|line| !key_value(line).is_some_and(|(k, _)| keys.contains(&k)));
+        let at = self
+            .lines
+            .iter()
+            .position(|line| key_value(line).is_some_and(|(k, _)| keys.contains(&k)));
+        self.lines
+            .retain(|line| !key_value(line).is_some_and(|(k, _)| keys.contains(&k)));
         let at = at.unwrap_or(self.lines.len()).min(self.lines.len());
         self.lines.splice(at..at, new);
     }
@@ -196,7 +239,9 @@ pub(crate) fn loader_with_default(text: Option<&str>, entry: &str) -> String {
     let mut lines = vec![format!("default {entry}")];
     match text {
         Some(text) => lines.extend(
-            text.lines().filter(|line| !key_value(line).is_some_and(|(key, _)| key == "default")).map(str::to_string),
+            text.lines()
+                .filter(|line| !key_value(line).is_some_and(|(key, _)| key == "default"))
+                .map(str::to_string),
         ),
         None => lines.extend(["timeout 5".to_string(), "editor 0".to_string()]),
     }

@@ -107,7 +107,11 @@ fn os_release(root: &Path, file: Option<PathBuf>) -> Result<(String, PathBuf)> {
             Ok((text, file))
         }
         None => {
-            let text = target_root::os_release(root)?.ok_or_else(missing)?;
+            let opened = crate::filesystem::Root::open(root)?;
+            let text = match opened.optional_text(Path::new("etc/os-release"))? {
+                Some(text) => text,
+                None => opened.optional_text(Path::new("usr/lib/os-release"))?.ok_or_else(missing)?,
+            };
             Ok((text, under(root, "etc/os-release")))
         }
     }

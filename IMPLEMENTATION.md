@@ -12,6 +12,37 @@ recinit, release production, frontends and runtime validation. It is an
 implementation plan, not a claim that the proposed operations already exist.
 The acceptance case is the user's X plus update, then Y, across A→B→A.
 
+## Implementation progress (2026-11-10)
+
+P01 is implemented in recinit `903a504` and recab `aa8f2e7`, with account-label
+and numeric-identity safeguards completed alongside P02. Existing root-protection
+work was retained. General writable `/etc` overlays were removed; nonempty legacy
+uppers refuse boot until explicit adoption. Staging preflights carried parents,
+types, accounts, fstab, expanded capacity and inode demand before invalidation.
+Filesystem reads/writes use opened roots and pinned directory descriptors.
+
+P02 now implements complete system inventories, normalized generation/boot
+identities, independent slot mappings, structured major state compatibility,
+durable preparation ID/source/revision/progress, incomplete/readiness checks,
+reopen and explicit discard. Preparing removes the inactive entry after saving
+intent. It currently stops at `awaiting_synchronization`: P03 must supply the
+actual continuation copy. Release staging refuses an existing preparation.
+
+Focused validation: recab/recinit library and CLI compilation; actual CLI runs
+against read-only bind-mounted scratch roots in a user/mount namespace; xattrs,
+raw path bytes, hardlinks, sparse extents and shared tmpfs exclusion; generation
+artifact mismatch and incomplete candidate refusals; stale ID/revision refusal;
+process termination after durable intent followed by reopening that same ID;
+discard; and uncommitted-source, legacy and future-format refusal. P01 baseline
+CLI checks also exercised xattr recording, symlink confinement and FIFO refusal.
+Public schemas and the TUI contract are generated through recab's existing
+contract exporter. No unit suites, full system builds or VM scenarios were run.
+
+These checks do not establish installed boot behavior, destructive staging on
+real slot devices, or the complete X+update→Y lifecycle. P03 synchronization,
+P04 runtime migration/finalization and P05 equivalent initial B remain next.
+The starting-point description below records the pre-implementation audit.
+
 ## Starting point
 
 The documentation baseline is recab `d5da60b`, with superproject `cceed07` and

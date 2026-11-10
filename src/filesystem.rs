@@ -2,7 +2,7 @@
 //! descriptors stay alive through each operation; symlinks are never parents
 //! of writes, and reads that follow links resolve them inside this root.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -149,6 +149,13 @@ impl Root {
 
     pub fn device(&self) -> Result<u64> {
         Ok(self.0.metadata()?.dev())
+    }
+
+    pub fn root_entry(&self) -> Result<Entry> {
+        Ok(Entry {
+            parent: self.0.try_clone()?,
+            name: ".".into(),
+        })
     }
 }
 

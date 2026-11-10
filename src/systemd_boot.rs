@@ -11,13 +11,14 @@ use std::path::{Path, PathBuf};
 
 use crate::efivars::{EfiVars, Var};
 use crate::entry::{
-    cmdline_root, cmdline_root_text, entry_file, entry_name, layout_name, loader_default, loader_with_default,
-    same_entry, slot_of_entry, Entry, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
+    cmdline_root, cmdline_root_text, entry_file, entry_name, layout_name, loader_default,
+    loader_with_default, same_entry, slot_of_entry, Entry, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE,
+    LOADER_CONF,
 };
-use crate::trial_options::{make_default, make_trial};
 use crate::error::refuse;
-use crate::state::{BootChange, Selection, Slot};
+use crate::state::{BootChange, PersistentState, Selection, Slot};
 use crate::target::{partuuid, Kind, Target};
+use crate::trial_options::{make_default, make_trial};
 
 /// Where the target ships systemd-boot's EFI binaries, relative to its root.
 const SYSTEMD_BOOT_SOURCE_DIR: &str = "usr/lib/systemd/boot/efi";
@@ -39,6 +40,7 @@ pub(crate) struct Boot {
     /// The `LoaderEntryDefault` and `LoaderEntryOneShot` variables as set,
     /// including a value `selection` dropped because its entry cannot boot
     /// now (it can once that slot is staged).
+    pub slot_partuuids: [Option<String>; 2],
     raw_default: Option<String>,
     raw_oneshot: Option<String>,
 }
@@ -56,7 +58,10 @@ pub(crate) struct SelectError {
 
 impl SystemdBoot {
     pub fn new(target: &Target) -> Self {
-        Self { vars: EfiVars::new(target.firmware.clone()), target: target.clone() }
+        Self {
+            vars: EfiVars::new(target.firmware.clone()),
+            target: target.clone(),
+        }
     }
 
     fn entries_dir(&self) -> PathBuf {
@@ -69,14 +74,20 @@ impl SystemdBoot {
 
     /// The entry `id` names (with or without `.conf`).
     fn entry_path(&self, id: &str) -> PathBuf {
-        let file = if id.to_ascii_lowercase().ends_with(".conf") { id.to_string() } else { format!("{id}.conf") };
+        let file = if id.to_ascii_lowercase().ends_with(".conf") {
+            id.to_string()
+        } else {
+            format!("{id}.conf")
+        };
         self.entries_dir().join(file)
     }
 
     /// The layout's entry (`None`: the mutable root's), if it exists.
     pub fn entry(&self, prefix: &str, slot: Option<Slot>) -> Result<Option<Entry>> {
         let path = self.entries_dir().join(entry_file(prefix, slot));
-        Ok(target_root::read_optional(&path)?.as_deref().map(Entry::parse))
+        Ok(target_root::read_optional(&path)?
+            .as_deref()
+            .map(Entry::parse))
     }
 
     /// The first file the entry `id` loads that the ESP lacks; the entry
@@ -87,7 +98,9 @@ impl SystemdBoot {
             return Ok(Some(path.display().to_string()));
         };
         let files = Entry::parse(&text).boot_files();
-        if files.is_empty() { return Ok(Some("entry has no boot loader target".into())); }
+        if files.is_empty() {
+            return Ok(Some("entry has no boot loader target".into()));
+        }
         for file in files {
             if !target_root::exists(&self.target.esp.join(file.trim_start_matches('/')))? {
                 return Ok(Some(file));
@@ -98,21 +111,72 @@ impl SystemdBoot {
 
     /// Every file the slot's entry loads is on the ESP.
     pub fn bootable(&self, boot: &Boot, slot: Slot) -> Result<bool> {
-        Ok(self.missing_boot_file(&entry_name(&boot.prefix, slot))?.is_none())
+        Ok(self
+            .missing_boot_file(&entry_name(&boot.prefix, slot))?
+            .is_none())
     }
 
     /// This is an A/B system: both slots' entries exist.
     pub fn is_ab(&self) -> Result<bool> {
         let prefix = self.target.entry_prefix()?;
-        Ok(self.entry(&prefix, Some(Slot::A))?.is_some() && self.entry(&prefix, Some(Slot::B))?.is_some())
+        if let Some(state) = crate::store::Store::new(&self.target).load()? {
+            if state.slots.len() == 2 {
+                return Ok(true);
+            }
+        }
+        Ok(self.entry(&prefix, Some(Slot::A))?.is_some()
+            && self.entry(&prefix, Some(Slot::B))?.is_some())
     }
 
-    pub fn read(&self) -> Result<Boot> {
+    pub fn read(&self, state: &PersistentState) -> Result<Boot> {
         let prefix = self.target.entry_prefix()?;
-        let active = self.active_slot(&prefix)?;
+        let mut slot_partuuids = [None, None];
+        for slot in Slot::ALL {
+            let entry_root = self
+                .entry(&prefix, Some(slot))?
+                .and_then(|entry| entry.root_partuuid());
+            let recorded = state.slot(slot).map(|record| record.partuuid.to_ascii_lowercase());
+            if recorded
+                .as_ref()
+                .zip(entry_root.as_ref())
+                .is_some_and(|(recorded, entry)| recorded != entry)
+            {
+                return Err(refuse(format!(
+                    "slot {slot}'s entry conflicts with its recorded partition"
+                )));
+            }
+            slot_partuuids[slot as usize] = recorded.or(entry_root);
+        }
+        let root = self.running_root()?;
+        let matches = Slot::ALL
+            .into_iter()
+            .filter(|slot| slot_partuuids[*slot as usize].as_deref() == Some(root.as_str()))
+            .collect::<Vec<_>>();
+        let active = match matches.as_slice() {
+            [slot] => *slot,
+            _ => {
+                return Err(refuse(
+                    "running root does not identify exactly one recorded slot",
+                ))
+            }
+        };
+        let active_generation = match self.target.kind {
+            Kind::Running => fs::read_to_string(self.target.cmdline_path())?
+                .split_whitespace()
+                .filter_map(|word| word.strip_prefix("recab.generation="))
+                .next_back()
+                .map(str::to_string),
+            Kind::Installed => crate::filesystem::Root::open(&self.target.root)?
+                .optional_text(Path::new(crate::generation::MARKER))?
+                .map(|text| serde_json::from_str::<serde_json::Value>(&text))
+                .transpose()?
+                .and_then(|marker| marker["generation"].as_str().map(str::to_string)),
+        };
         let raw_default = self.vars.get(Var::Default)?;
         let raw_oneshot = self.vars.get(Var::OneShot)?;
-        let conf_default = target_root::read_optional(&self.loader_conf())?.as_deref().and_then(loader_default);
+        let conf_default = target_root::read_optional(&self.loader_conf())?
+            .as_deref()
+            .and_then(loader_default);
         // systemd-boot boots the variable's entry, else loader.conf's,
         // skipping an entry it cannot boot.
         let mut effective = None;
@@ -122,18 +186,39 @@ impl SystemdBoot {
                 break;
             }
         }
-        let default = effective.as_deref().and_then(|id| slot_of_entry(&prefix, id));
+        let default = effective
+            .as_deref()
+            .and_then(|id| slot_of_entry(&prefix, id));
         let foreign_default = effective.is_some() && default.is_none();
-        let oneshot = match raw_oneshot.as_deref().and_then(|id| slot_of_entry(&prefix, id)) {
-            Some(slot) if self.missing_boot_file(&entry_name(&prefix, slot))?.is_none() => Some(slot),
+        let oneshot = match raw_oneshot
+            .as_deref()
+            .and_then(|id| slot_of_entry(&prefix, id))
+        {
+            Some(slot)
+                if self
+                    .missing_boot_file(&entry_name(&prefix, slot))?
+                    .is_none() =>
+            {
+                Some(slot)
+            }
             _ => None,
         };
         let mut bootable = [false; 2];
         for slot in Slot::ALL {
-            bootable[slot as usize] = self.missing_boot_file(&entry_name(&prefix, slot))?.is_none();
+            bootable[slot as usize] = self
+                .missing_boot_file(&entry_name(&prefix, slot))?
+                .is_none();
         }
         Ok(Boot {
-            selection: Selection { active, default, oneshot, foreign_default, bootable },
+            selection: Selection {
+                active,
+                active_generation,
+                default,
+                oneshot,
+                foreign_default,
+                bootable,
+            },
+            slot_partuuids,
             prefix,
             raw_default,
             raw_oneshot,
@@ -147,14 +232,22 @@ impl SystemdBoot {
     /// not name two slots.
     pub fn firmware_trial(&self) -> Result<Option<bool>> {
         let prefix = self.target.entry_prefix()?;
-        let Some(selected) = self.vars.get(Var::Selected)?.and_then(|id| slot_of_entry(&prefix, &id)) else {
+        let Some(selected) = self
+            .vars
+            .get(Var::Selected)?
+            .and_then(|id| slot_of_entry(&prefix, &id))
+        else {
             return Ok(None);
         };
         let default = match self.vars.get(Var::Default)? {
             Some(id) => Some(id),
-            None => target_root::read_optional(&self.loader_conf())?.as_deref().and_then(loader_default),
+            None => target_root::read_optional(&self.loader_conf())?
+                .as_deref()
+                .and_then(loader_default),
         };
-        Ok(default.and_then(|id| slot_of_entry(&prefix, &id)).map(|default| selected != default))
+        Ok(default
+            .and_then(|id| slot_of_entry(&prefix, &id))
+            .map(|default| selected != default))
     }
 
     /// Write `change` (`plan` checked the slot can boot), checking first
@@ -174,7 +267,12 @@ impl SystemdBoot {
         let mut entry_changed = false;
         macro_rules! step {
             ($e:expr) => {
-                $e.map_err(|cause| SelectError { cause, firmware: firmware.clone(), entry: entry_changed, restore: None })?
+                $e.map_err(|cause| SelectError {
+                    cause,
+                    firmware: firmware.clone(),
+                    entry: entry_changed,
+                    restore: None,
+                })?
             };
         }
         let slot = match change {
@@ -188,7 +286,11 @@ impl SystemdBoot {
                 // the default `plan` checked, not a stale value it skipped.
                 if let Some(default) = boot.selection.default {
                     let default_id = entry_name(&boot.prefix, default);
-                    if boot.raw_default.as_deref().is_some_and(|raw| !same_entry(raw, &default_id)) {
+                    if boot
+                        .raw_default
+                        .as_deref()
+                        .is_some_and(|raw| !same_entry(raw, &default_id))
+                    {
                         step!(self.vars.set(Var::Default, Some(&default_id)));
                         firmware.push(Var::Default.name());
                     }
@@ -207,15 +309,28 @@ impl SystemdBoot {
                 step!(self.rewrite_entry(&boot.prefix, slot, make_default));
                 entry_changed = true;
                 let loader_conf = self.loader_conf();
-                let before = step!(target_root::read_optional(&loader_conf).map_err(anyhow::Error::from));
-                step!(target_root::write_durable(&loader_conf, loader_with_default(before.as_deref(), &id).as_bytes(), None)
-                    .with_context(|| format!("writing '{}'", loader_conf.display())));
+                let before =
+                    step!(target_root::read_optional(&loader_conf).map_err(anyhow::Error::from));
+                step!(target_root::write_durable(
+                    &loader_conf,
+                    loader_with_default(before.as_deref(), &id).as_bytes(),
+                    None
+                )
+                .with_context(|| format!("writing '{}'", loader_conf.display())));
                 if let Err(cause) = self.vars.set(Var::Default, Some(&id)) {
                     let restore = match &before {
-                        Some(text) => target_root::write_durable(&loader_conf, text.as_bytes(), None).map_err(anyhow::Error::from),
+                        Some(text) => {
+                            target_root::write_durable(&loader_conf, text.as_bytes(), None)
+                                .map_err(anyhow::Error::from)
+                        }
                         None => fs::remove_file(&loader_conf).map_err(anyhow::Error::from),
                     };
-                    return Err(SelectError { cause, firmware, entry: entry_changed, restore: restore.err() });
+                    return Err(SelectError {
+                        cause,
+                        firmware,
+                        entry: entry_changed,
+                        restore: restore.err(),
+                    });
                 }
                 Ok(())
             }
@@ -225,7 +340,8 @@ impl SystemdBoot {
     /// Rewrite the slot's entry with `edit`, when it changes anything.
     fn rewrite_entry(&self, prefix: &str, slot: Slot, edit: impl FnOnce(&mut Entry)) -> Result<()> {
         let path = self.entries_dir().join(entry_name(prefix, slot));
-        let text = fs::read_to_string(&path).with_context(|| format!("reading entry '{}'", path.display()))?;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("reading entry '{}'", path.display()))?;
         let mut entry = Entry::parse(&text);
         edit(&mut entry);
         if entry.render() == text {
@@ -238,26 +354,75 @@ impl SystemdBoot {
     /// The PARTUUID the slot's entry names its root by: the entries are the
     /// record of which partition is which slot.
     pub fn slot_partuuid(&self, boot: &Boot, slot: Slot) -> Result<String> {
-        let id = entry_name(&boot.prefix, slot);
-        let entry = self.entry(&boot.prefix, Some(slot))?.ok_or_else(|| self.missing_entry(&id))?;
-        entry.root_partuuid().ok_or_else(|| {
-            refuse(format!(
-                "entry '{id}' names its root as '{}', not by root=PARTUUID=",
-                entry.root_text().unwrap_or_default()
-            ))
-        })
+        boot.slot_partuuids[slot as usize]
+            .clone()
+            .ok_or_else(|| refuse(format!("slot {slot} has no recorded partition identity")))
+    }
+
+    pub fn verify_generation(
+        &self,
+        boot: &Boot,
+        slot: Slot,
+        generation: &crate::generation::Generation,
+    ) -> Result<()> {
+        let entry = self
+            .entry(&boot.prefix, Some(slot))?
+            .ok_or_else(|| refuse("candidate entry is missing"))?;
+        let entry_generation = entry
+            .options()
+            .into_iter()
+            .find_map(|option| option.strip_prefix("recab.generation=").map(str::to_string));
+        if entry_generation.as_deref() != Some(generation.id.as_str()) {
+            return Err(refuse("boot entry does not match the recorded generation"));
+        }
+        let root = crate::filesystem::Root::open(&self.target.esp)?;
+        let mut kernel = None;
+        let mut initrd = None;
+        for line in entry.render().lines() {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next()) {
+                (Some("linux"), Some(path)) => {
+                    kernel = Some(path.trim_start_matches('/').to_string())
+                }
+                (Some("initrd"), Some(path)) if initrd.is_none() => {
+                    initrd = Some(path.trim_start_matches('/').to_string())
+                }
+                (Some("initrd"), Some(_)) => {
+                    return Err(refuse(
+                        "multiple initramfs files are not supported by this generation format",
+                    ))
+                }
+                _ => {}
+            }
+        }
+        let kernel = kernel.ok_or_else(|| refuse("generation entry has no kernel"))?;
+        let kernel = root.entry(Path::new(&kernel), false)?;
+        if crate::generation::hash_reader(&mut kernel.open()?)? != generation.kernel_digest {
+            return Err(refuse(
+                "kernel content does not match the recorded generation",
+            ));
+        }
+        let initrd = initrd
+            .map(|path| -> Result<String> {
+                let entry = root.entry(Path::new(&path), false)?;
+                crate::generation::hash_reader(&mut entry.open()?)
+            })
+            .transpose()?;
+        if initrd != generation.initrd_digest {
+            return Err(refuse(
+                "initramfs content does not match the recorded generation",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn stamp_generation(&self, prefix: &str, slot: Slot, generation: &str) -> Result<()> {
+        self.rewrite_entry(prefix, slot, |entry| entry.set_generation(generation))
     }
 
     /// The slot's kernel directory on the ESP.
     pub fn kernel_dir(&self, boot: &Boot, slot: Slot) -> PathBuf {
         self.target.esp.join(layout_name(&boot.prefix, Some(slot)))
-    }
-
-    fn missing_entry(&self, id: &str) -> anyhow::Error {
-        refuse(format!(
-            "required systemd-boot entry missing: '{}'",
-            self.entries_dir().join(id).display()
-        ))
     }
 
     /// Start writing the inactive `slot`: point firmware variables that would
@@ -268,20 +433,77 @@ impl SystemdBoot {
     pub fn begin_slot_write<'a>(&'a self, boot: &'a Boot, slot: Slot) -> Result<SlotWrite<'a>> {
         self.vars.can_change()?;
         let active = entry_name(&boot.prefix, boot.selection.active);
-        let unchanged = |var: Var| format!("could not point {} at '{active}'; slot {slot} was not changed", var.name());
-        if boot.raw_default.as_deref().is_some_and(|raw| !same_entry(raw, &active)) {
-            self.vars.set(Var::Default, Some(&active)).with_context(|| unchanged(Var::Default))?;
+        let unchanged = |var: Var| {
+            format!(
+                "could not point {} at '{active}'; slot {slot} was not changed",
+                var.name()
+            )
+        };
+        if boot
+            .raw_default
+            .as_deref()
+            .is_some_and(|raw| !same_entry(raw, &active))
+        {
+            self.vars
+                .set(Var::Default, Some(&active))
+                .with_context(|| unchanged(Var::Default))?;
         }
-        let names_slot = boot.raw_oneshot.as_deref().is_some_and(|raw| slot_of_entry(&boot.prefix, raw) == Some(slot));
+        let names_slot = boot
+            .raw_oneshot
+            .as_deref()
+            .is_some_and(|raw| slot_of_entry(&boot.prefix, raw) == Some(slot));
         if names_slot && boot.selection.oneshot.is_none() {
-            self.vars.set(Var::OneShot, None).with_context(|| unchanged(Var::OneShot))?;
+            self.vars
+                .set(Var::OneShot, None)
+                .with_context(|| unchanged(Var::OneShot))?;
         }
+        let entry = self.entry(&boot.prefix, Some(slot))?.unwrap_or(Entry::new(
+            &format!("{} (Slot {slot})", self.target.os_name()?),
+            &layout_name(&boot.prefix, Some(slot)),
+            true,
+            &self.slot_partuuid(boot, slot)?,
+            "",
+        ));
+        self.invalidate_entry(boot, slot)?;
         let dir = self.kernel_dir(boot, slot);
         if dir.exists() {
-            fs::remove_dir_all(&dir).with_context(|| format!("removing slot {slot}'s kernel '{}'", dir.display()))?;
+            fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing slot {slot}'s kernel '{}'", dir.display()))?;
             target_root::sync_dir(&self.target.esp)?;
         }
-        Ok(SlotWrite { backend: self, boot, slot })
+        Ok(SlotWrite {
+            backend: self,
+            boot,
+            slot,
+            entry,
+        })
+    }
+
+    pub fn invalidate_entry(&self, boot: &Boot, slot: Slot) -> Result<()> {
+        if slot == boot.selection.active {
+            return Err(refuse("cannot invalidate the running slot"));
+        }
+        if boot.selection.default != Some(boot.selection.active) || boot.selection.oneshot.is_some()
+        {
+            return Err(refuse(
+                "cancel the trial and select the committed active slot before invalidation",
+            ));
+        }
+        self.vars.can_change()?;
+        let active = entry_name(&boot.prefix, boot.selection.active);
+        if boot.raw_default.as_deref() != Some(active.as_str()) {
+            self.vars.set(Var::Default, Some(&active))?;
+        }
+        if boot.raw_oneshot.is_some() {
+            self.vars.set(Var::OneShot, None)?;
+        }
+        let path = self.entries_dir().join(entry_name(&boot.prefix, slot));
+        match fs::remove_file(&path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
+            _ => {}
+        }
+        target_root::sync_dir(&self.entries_dir())?;
+        Ok(())
     }
 
     /// Set up the boot layout of a freshly installed system: the target's
@@ -299,10 +521,19 @@ impl SystemdBoot {
         let prefix = self.target.entry_prefix()?;
         install_loader(&self.target.root, &self.target.esp)?;
         let entries_dir = self.entries_dir();
-        fs::create_dir_all(&entries_dir).with_context(|| format!("creating '{}'", entries_dir.display()))?;
+        fs::create_dir_all(&entries_dir)
+            .with_context(|| format!("creating '{}'", entries_dir.display()))?;
         for (slot, title, partuuid) in entries {
-            let mut entry = Entry::new(title, &layout_name(&prefix, *slot), initrd.is_some(), partuuid, options);
-            if slot.is_some() { entry.make_immutable(); }
+            let mut entry = Entry::new(
+                title,
+                &layout_name(&prefix, *slot),
+                initrd.is_some(),
+                partuuid,
+                options,
+            );
+            if slot.is_some() {
+                entry.make_immutable();
+            }
             let path = entries_dir.join(entry_file(&prefix, *slot));
             target_root::write_durable(&path, entry.render().as_bytes(), None)
                 .with_context(|| format!("writing '{}'", path.display()))?;
@@ -315,8 +546,12 @@ impl SystemdBoot {
         let id = entry_file(&prefix, installed);
         let loader_conf = self.loader_conf();
         let before = target_root::read_optional(&loader_conf)?;
-        target_root::write_durable(&loader_conf, loader_with_default(before.as_deref(), &id).as_bytes(), None)
-            .with_context(|| format!("writing '{}'", loader_conf.display()))?;
+        target_root::write_durable(
+            &loader_conf,
+            loader_with_default(before.as_deref(), &id).as_bytes(),
+            None,
+        )
+        .with_context(|| format!("writing '{}'", loader_conf.display()))?;
         Ok(id)
     }
 
@@ -344,7 +579,10 @@ impl SystemdBoot {
             Kind::Running => {
                 let path = self.target.cmdline_path();
                 let cmdline = fs::read_to_string(&path).map_err(|err| {
-                    refuse(format!("unable to determine the running slot: cannot read '{}': {err}", path.display()))
+                    refuse(format!(
+                        "unable to determine the running slot: cannot read '{}': {err}",
+                        path.display()
+                    ))
                 })?;
                 cmdline_root(&cmdline).ok_or_else(|| {
                     refuse(format!(
@@ -356,34 +594,18 @@ impl SystemdBoot {
             Kind::Installed => {
                 let root = &self.target.root;
                 let table = self.target.mount_table()?;
-                let mount = table.iter().rev().find(|m| m.mount_point == *root).ok_or_else(|| {
-                    refuse(format!("'{}' is not a mount point; mount the installed system's root there", root.display()))
-                })?;
+                let mount = table
+                    .iter()
+                    .rev()
+                    .find(|m| m.mount_point == *root)
+                    .ok_or_else(|| {
+                        refuse(format!(
+                            "'{}' is not a mount point; mount the installed system's root there",
+                            root.display()
+                        ))
+                    })?;
                 partuuid(Path::new(&mount.source))
             }
-        }
-    }
-
-    /// The active slot: the slot entry whose root is the running root. The
-    /// entries' `root=`, written at install time, are the record of which
-    /// partition is which slot.
-    fn active_slot(&self, prefix: &str) -> Result<Slot> {
-        let root = self.running_root()?;
-        let mut matched = Vec::new();
-        for slot in Slot::ALL {
-            if self.entry(prefix, Some(slot))?.and_then(|e| e.root_partuuid()).as_deref() == Some(root.as_str()) {
-                matched.push(slot);
-            }
-        }
-        match matched.as_slice() {
-            [slot] => Ok(*slot),
-            [] => Err(refuse(format!(
-                "unable to map the running root (PARTUUID={root}) to the A/B entries '{}' and '{}' under '{}'",
-                entry_name(prefix, Slot::A),
-                entry_name(prefix, Slot::B),
-                self.entries_dir().display()
-            ))),
-            _ => Err(refuse(format!("both slot entries name the running root (PARTUUID={root})"))),
         }
     }
 }
@@ -393,23 +615,31 @@ pub(crate) struct SlotWrite<'a> {
     backend: &'a SystemdBoot,
     boot: &'a Boot,
     slot: Slot,
+    entry: Entry,
 }
 
 impl SlotWrite<'_> {
     /// Install the slot's kernel (and initrd) and point its entry at them,
     /// with the trial options for `init` (the slot is uncommitted). The entry is written first and the kernel last, so the slot
     /// can boot only once everything is in place.
-    pub fn finish(self, kernel: &Path, initrd: Option<&Path>, init: InitSystem) -> Result<()> {
+    pub fn finish(
+        self,
+        kernel: &Path,
+        initrd: Option<&Path>,
+        init: InitSystem,
+        generation: &str,
+    ) -> Result<()> {
         let (backend, prefix, slot) = (self.backend, &self.boot.prefix, self.slot);
         let id = entry_name(prefix, slot);
-        let mut entry = backend.entry(prefix, Some(slot))?.ok_or_else(|| backend.missing_entry(&id))?;
+        let mut entry = self.entry;
+        entry.set_generation(generation);
         entry.set_boot_files(&layout_name(prefix, Some(slot)), initrd.is_some());
         entry.make_immutable();
         make_trial(&mut entry, init);
         let path = backend.entries_dir().join(&id);
+        install_kernel(&backend.kernel_dir(self.boot, slot), kernel, initrd)?;
         target_root::write_durable(&path, entry.render().as_bytes(), None)
-            .with_context(|| format!("writing '{}'", path.display()))?;
-        install_kernel(&backend.kernel_dir(self.boot, slot), kernel, initrd)
+            .with_context(|| format!("writing '{}'", path.display()))
     }
 }
 
@@ -444,12 +674,21 @@ fn install_loader(root: &Path, esp: &Path) -> Result<()> {
                 source_dir.display()
             )))
         }
-        _ => return Err(refuse(format!("'{}' has systemd-boot for more than one architecture", source_dir.display()))),
+        _ => {
+            return Err(refuse(format!(
+                "'{}' has systemd-boot for more than one architecture",
+                source_dir.display()
+            )))
+        }
     };
     let source = source_dir.join(&name);
-    for dest in [esp.join("EFI/systemd").join(&name), esp.join("EFI/BOOT").join(fallback)] {
+    for dest in [
+        esp.join("EFI/systemd").join(&name),
+        esp.join("EFI/BOOT").join(fallback),
+    ] {
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating '{}'", parent.display()))?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating '{}'", parent.display()))?;
         }
         target_root::copy_durable(&source, &dest)?;
     }

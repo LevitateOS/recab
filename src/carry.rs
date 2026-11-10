@@ -460,6 +460,15 @@ pub(crate) fn merge_accounts(
                 "account '{name}' is absent locally; structured baseline merging is required"
             )));
         };
+        if let Some(index) = id_field {
+            let release_id = line.split(':').nth(index).context("missing release account id")?
+                .parse::<u32>().map_err(|_| refuse("invalid release account id"))?;
+            let local_id = own.split(':').nth(index).context("missing local account id")?
+                .parse::<u32>().map_err(|_| refuse("invalid local account id"))?;
+            if release_id != local_id {
+                return Err(refuse(format!("account '{name}' changes numeric identity; structured ownership migration is required")));
+            }
+        }
         if let Some(index) = member_field {
             if line.split(':').nth(index) != own.split(':').nth(index) {
                 return Err(refuse(format!(

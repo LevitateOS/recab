@@ -41,7 +41,9 @@ impl System {
     pub fn locked(command: &str) -> Result<Self> {
         let target = Target::running()?;
         let lock = lock(&target, command)?;
-        Self::read_with(target, Some(lock))
+        let system = Self::read_with(target, Some(lock))?;
+        system.state.check_mutable()?;
+        Ok(system)
     }
 
     /// The view under a lock already held.
@@ -54,10 +56,14 @@ impl System {
         let store = Store::new(&target);
         // An ESP or state the run cannot read is "the slots or state could
         // not be read" (exit 21), whatever the I/O error.
-        let boot = backend
-            .read()
-            .map_err(|err| or_class(err.context("reading the boot selection"), ErrorClass::StateOrDetection))?;
         let loaded = store.load()?;
+        let state = loaded.clone().unwrap_or_default();
+        let boot = backend.read(&state).map_err(|err| {
+            or_class(
+                err.context("reading the boot selection"),
+                ErrorClass::StateOrDetection,
+            )
+        })?;
         Ok(Self {
             state_found: loaded.is_some(),
             state: loaded.unwrap_or_default(),
@@ -72,18 +78,41 @@ impl System {
     /// Plan `request` and apply it; nothing to do when the system already is
     /// where it leads.
     pub fn run(&self, request: Request) -> Result<()> {
+        let slot = match &request {
+            Request::SetNext(slot) => Some(*slot),
+            Request::Commit => Some(self.boot.selection.active),
+            Request::Rollback => crate::state::rollback_target(&self.state, &self.boot.selection),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            self.backend
+                .verify_generation(&self.boot, slot, self.state.require_ready(slot)?)?;
+        }
         match plan(request, &self.boot.selection, &self.state)? {
-            Some(transition) => self.apply(&transition),
+            Some(transition) => self.apply(&transition).map(|_| ()),
             None => Ok(()),
         }
     }
 
     /// Apply `transition`: its boot selection, then recab's state, stamped
     /// with the operation and time, then the audit record.
-    pub fn apply(&self, transition: &Transition) -> Result<()> {
+    pub fn apply(&self, transition: &Transition) -> Result<PersistentState> {
+        self.state.check_mutable()?;
+        transition.next.check_mutable()?;
         let name = transition.operation.name();
         if let Some(change) = transition.boot {
-            self.backend.select(&self.boot, change, || self.target.init()).map_err(|err| select_failed(name, err))?;
+            let slot = match change {
+                crate::state::BootChange::OneShot(slot)
+                | crate::state::BootChange::Default(slot) => slot,
+            };
+            self.backend.verify_generation(
+                &self.boot,
+                slot,
+                transition.next.require_ready(slot)?,
+            )?;
+            self.backend
+                .select(&self.boot, change, || self.target.init())
+                .map_err(|err| select_failed(name, err))?;
         }
         let mut next = transition.next.clone();
         next.last_operation = Some(transition.operation.label());
@@ -98,8 +127,13 @@ impl System {
                 err.context(format!("{name} aborted"))
             }
         })?;
-        self.store.audit(transition.operation, self.boot.selection.active, &self.state, &next);
-        Ok(())
+        self.store.audit(
+            transition.operation,
+            self.boot.selection.active,
+            &self.state,
+            &next,
+        );
+        Ok(next)
     }
 }
 
@@ -111,14 +145,22 @@ pub(crate) fn lock(target: &Target, command: &str) -> Result<Lock> {
 
 pub(crate) fn require_root(command: &str) -> Result<()> {
     if !target_root::is_root() {
-        return Err(classified(ErrorClass::Permission, format!("{command} must run as root")));
+        return Err(classified(
+            ErrorClass::Permission,
+            format!("{command} must run as root"),
+        ));
     }
     Ok(())
 }
 
 /// The error of a failed boot-selection change, saying what it changed.
 fn select_failed(name: &str, err: SelectError) -> anyhow::Error {
-    let SelectError { cause, firmware, entry, restore } = err;
+    let SelectError {
+        cause,
+        firmware,
+        entry,
+        restore,
+    } = err;
     if let Some(restore) = restore {
         return classified(
             ErrorClass::PartialUpdate,
@@ -137,6 +179,12 @@ primary error: {cause:#}\nrestore error: {restore:#}"
             ),
         );
     }
-    let entry = if entry { " (the slot's entry options were rewritten)" } else { "" };
-    cause.context(format!("{name} aborted; the boot selection is unchanged{entry}"))
+    let entry = if entry {
+        " (the slot's entry options were rewritten)"
+    } else {
+        ""
+    };
+    cause.context(format!(
+        "{name} aborted; the boot selection is unchanged{entry}"
+    ))
 }

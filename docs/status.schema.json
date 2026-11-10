@@ -7,7 +7,9 @@
         {
           "enum": [
             "commit",
-            "rollback"
+            "rollback",
+            "prepare",
+            "discard"
           ],
           "type": "string"
         },
@@ -114,6 +116,100 @@
       ],
       "type": "object"
     },
+    "Generation": {
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "initrd_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "inventory_digest": {
+          "type": "string"
+        },
+        "kernel_digest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "inventory_digest",
+        "kernel_digest"
+      ],
+      "type": "object"
+    },
+    "Preparation": {
+      "properties": {
+        "completed_steps": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failure": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "operation": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/PreparationPhase"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slot": {
+          "$ref": "#/$defs/Slot"
+        },
+        "source_generation": {
+          "type": "string"
+        },
+        "source_slot": {
+          "$ref": "#/$defs/Slot"
+        }
+      },
+      "required": [
+        "id",
+        "slot",
+        "source_slot",
+        "source_generation",
+        "revision",
+        "operation",
+        "phase",
+        "completed_steps"
+      ],
+      "type": "object"
+    },
+    "PreparationPhase": {
+      "enum": [
+        "intent",
+        "awaiting_synchronization",
+        "prepared",
+        "staging",
+        "ready",
+        "interrupted"
+      ],
+      "type": "string"
+    },
+    "Readiness": {
+      "enum": [
+        "empty",
+        "incomplete",
+        "ready",
+        "committed"
+      ],
+      "type": "string"
+    },
     "Slot": {
       "description": "System slot identifier (A/B). Its one spelling (`A`, `B`) is used by the\nCLI, the JSON and the state file.",
       "enum": [
@@ -143,6 +239,32 @@
         "entry": {
           "description": "The entry file, relative to the ESP (`loader/entries/<prefix>-a.conf`).",
           "type": "string"
+        },
+        "generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Generation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "generation_ready": {
+          "default": false,
+          "type": "boolean"
+        },
+        "readiness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Readiness"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "root": {
           "description": "The entry's `root=` (`PARTUUID=...`), if it has one.",
@@ -278,6 +400,24 @@
         }
       ],
       "description": "The slot the next boot starts: the trial slot, else the default."
+    },
+    "preparation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Preparation"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "recovery_reason": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "rollback_slot": {
       "anyOf": [
