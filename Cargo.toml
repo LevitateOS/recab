@@ -8,6 +8,7 @@ authors.workspace = true
 description = "A/B slot + boot-selection manager for LevitateOS-style immutable systems"
 
 [dependencies]
+url = "2"
 distro-contract = { path = "../../distro/contract" }
 tempfile = "3"
 levitate-recipe = { path = "../recipe" }

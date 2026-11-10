@@ -347,7 +347,7 @@ fn validate_root(path: &Path, verified: &VerifiedRelease, produced: bool) -> Res
     crate::candidate::release(path, &verified.kernel(), &verified.initramfs(), manifest)?;
     Ok(())
 }
-fn installed(target: &Target) -> Result<(Identity, Policy)> {
+pub(crate) fn installed(target: &Target) -> Result<(Identity, Policy)> {
     let root = Root::open(&target.root)?;
     let os = root
         .optional_text(Path::new("etc/os-release"))?
@@ -409,6 +409,13 @@ fn import_inner(
         None => Target::running()?,
     };
     let _lock = crate::system::lock(&target, "release import")?;
+    import_locked(&target, manifest, trusted_local)
+}
+pub(crate) fn import_locked(
+    target: &Target,
+    manifest: &Path,
+    trusted_local: bool,
+) -> Result<ImportedRelease> {
     let parent = target.state_dir.join("releases");
     fs::create_dir_all(&parent)?;
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;

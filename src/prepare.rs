@@ -191,6 +191,7 @@ pub fn discard(id: &str, revision: u64) -> Result<()> {
     }
     sys.apply(&transition)?;
     crate::change::discard(&sys,id)?;
+    crate::update::discard(&sys,id)?;
     cleanup_plan(&sys, id);
     Ok(())
 }

@@ -32,6 +32,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Discover/download signed updates through Recipe; offline selection preserves prepared work.
+    Update {
+        #[command(subcommand)]
+        command: UpdateCommand,
+    },
     /// Verify/import one complete release set without changing the candidate.
     Release {
         #[command(subcommand)]
@@ -237,6 +242,34 @@ enum ReleaseCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum UpdateCommand {
+    Status,
+    Check,
+    Download {
+        release: Option<String>,
+    },
+    /// Reverify cached/media inputs and select them for the preparation; merge is P09.
+    Apply {
+        release: Option<String>,
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        #[arg(long)]
+        trusted_local: bool,
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+    },
+    /// Detach a selected release without discarding prepared changes.
+    Cancel {
+        #[arg(long)]
+        preparation: String,
+        #[arg(long)]
+        revision: u64,
+    },
+}
+
 fn main() -> ExitCode {
     let mut cli = Cli::parse();
     let json = cli.json;
@@ -256,6 +289,32 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
+        Command::Update { command } => {
+            let result = match command {
+                UpdateCommand::Status => recab::update::status(),
+                UpdateCommand::Check => recab::update::check(),
+                UpdateCommand::Download { release } => recab::update::download(release.as_deref()),
+                UpdateCommand::Apply {
+                    release,
+                    manifest,
+                    trusted_local,
+                    preparation,
+                    revision,
+                } => recab::update::apply(
+                    release.as_deref(),
+                    manifest.as_deref(),
+                    trusted_local,
+                    preparation.as_deref(),
+                    revision,
+                ),
+                UpdateCommand::Cancel {
+                    preparation,
+                    revision,
+                } => recab::update::cancel(&preparation, revision),
+            }
+            .map_err(|e| recab::update_error(e))?;
+            println!("{}", serde_json::to_string(&result)?);
+        }
         Command::Release {
             command:
                 ReleaseCommand::Import {
@@ -588,6 +647,7 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
         preparation,
         recovery_reason,
         lifecycle,
+        updates: _,
     } = st;
     println!(
         "State: {:?}; the other system: {:?}; a command is running: {}",

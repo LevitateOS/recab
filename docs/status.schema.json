@@ -201,6 +201,104 @@
       ],
       "type": "object"
     },
+    "ChangeRecord": {
+      "description": "One finished change of a preparation: what a person reads as \"the next\nsystem holds these changes\". The reports of a change stay in\n[`Preparation::last_change`]; this is the list.",
+      "properties": {
+        "action": {
+          "description": "`install`, `update`, `remove` or `edit`.",
+          "type": "string"
+        },
+        "actor": {
+          "default": null,
+          "description": "Who asked for it, as the caller named itself (`--actor`): a label for\nthe person reading, not an authenticated identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "package": {
+          "description": "The recipe's package, or the edited path.",
+          "type": "string"
+        },
+        "unix_time": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "action",
+        "package",
+        "unix_time"
+      ],
+      "type": "object"
+    },
+    "DownloadProgress": {
+      "properties": {
+        "accounting_complete": {
+          "description": "False when a previous failed producer may have written unreported bytes.",
+          "type": "boolean"
+        },
+        "downloaded": {
+          "type": "boolean"
+        },
+        "producer_cancelled_write_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "producer_write_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "release": {
+          "type": "string"
+        },
+        "reused_files": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_files": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verified_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verified_files": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "release",
+        "verified_files",
+        "total_files",
+        "verified_bytes",
+        "total_bytes",
+        "reused_files",
+        "producer_write_bytes",
+        "producer_cancelled_write_bytes",
+        "downloaded",
+        "accounting_complete"
+      ],
+      "type": "object"
+    },
     "Finalization": {
       "properties": {
         "accounting_complete": {
@@ -271,6 +369,103 @@
       ],
       "type": "object"
     },
+    "Lifecycle": {
+      "properties": {
+        "other": {
+          "$ref": "#/$defs/OtherSystem"
+        },
+        "state": {
+          "$ref": "#/$defs/LifecycleState"
+        },
+        "working": {
+          "description": "A recab command holds the run lock right now. `None` when this reader\nmay not open the lock file.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "state",
+        "other"
+      ],
+      "type": "object"
+    },
+    "LifecycleState": {
+      "description": "Where the two systems stand, in the terms a person is told. recab works\nit out here, once, from its own state, so that no front end rebuilds it\nfrom slots and phases and gets it wrong.",
+      "oneOf": [
+        {
+          "const": "stable",
+          "description": "The running system is kept; nothing is prepared and no restart is set.",
+          "type": "string"
+        },
+        {
+          "const": "open",
+          "description": "A preparation is open and takes changes. It cannot be started yet.",
+          "type": "string"
+        },
+        {
+          "const": "working",
+          "description": "A recab command is working on the preparation right now.",
+          "type": "string"
+        },
+        {
+          "const": "interrupted",
+          "description": "The preparation was left in the middle of an operation and no command\nis running: it must be continued or discarded.",
+          "type": "string"
+        },
+        {
+          "const": "ready",
+          "description": "The candidate is finalized; no restart into it is set.",
+          "type": "string"
+        },
+        {
+          "const": "restart_set",
+          "description": "A restart into the other system is set: the next start takes it.",
+          "type": "string"
+        },
+        {
+          "const": "on_trial",
+          "description": "The running system is a trial that is not kept yet; a restart goes\nback to the one before.",
+          "type": "string"
+        },
+        {
+          "const": "trial_failed",
+          "description": "The candidate was tried, did not start properly, and the computer\ncame back. The candidate is still there. Told from the last judged\ntrial, which names a slot and not a generation: a candidate finalized\nagain since then is still reported this way until it is tried.",
+          "type": "string"
+        },
+        {
+          "const": "unusable",
+          "description": "The installation is incomplete or the state needs recovery; see\n`recovery_reason`.",
+          "type": "string"
+        }
+      ]
+    },
+    "OtherSystem": {
+      "description": "What the other system is to the running one.",
+      "oneOf": [
+        {
+          "const": "copy",
+          "description": "It holds the same generation: a second copy of the running system.",
+          "type": "string"
+        },
+        {
+          "const": "previous",
+          "description": "It is the known-good system from before, which rollback returns to.",
+          "type": "string"
+        },
+        {
+          "const": "next",
+          "description": "It is being prepared, is finalized, or is set for the next start.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "None of these can be said.",
+          "type": "string"
+        }
+      ]
+    },
     "Preparation": {
       "properties": {
         "change": {
@@ -283,6 +478,14 @@
             }
           ],
           "default": null
+        },
+        "changes": {
+          "default": [],
+          "description": "Every change finished in this preparation, oldest first.",
+          "items": {
+            "$ref": "#/$defs/ChangeRecord"
+          },
+          "type": "array"
         },
         "completed_steps": {
           "format": "uint64",
@@ -389,6 +592,37 @@
         "committed"
       ],
       "type": "string"
+    },
+    "ReleaseSummary": {
+      "properties": {
+        "channel": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "sequence",
+        "version",
+        "channel",
+        "total_bytes"
+      ],
+      "type": "object"
     },
     "Slot": {
       "description": "System slot identifier (A/B). Its one spelling (`A`, `B`) is used by the\nCLI, the JSON and the state file.",
@@ -625,6 +859,66 @@
       ],
       "type": "object"
     },
+    "UpdateStatus": {
+      "properties": {
+        "available": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReleaseSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "download": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DownloadProgress"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "highest_index": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "merge_complete": {
+          "description": "P08 selects/validates the release; filesystem merging is owned by P09.",
+          "type": "boolean"
+        },
+        "pending_preparation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending_release": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "phase",
+        "highest_index",
+        "merge_complete"
+      ],
+      "type": "object"
+    },
     "Verdict": {
       "description": "What recab would make of an action now.",
       "oneOf": [
@@ -697,6 +991,15 @@
       ],
       "description": "How the last judged trial boot ended."
     },
+    "lifecycle": {
+      "$ref": "#/$defs/Lifecycle",
+      "default": {
+        "other": "unknown",
+        "state": "stable",
+        "working": null
+      },
+      "description": "The same facts as one state a person can be told; see [`Lifecycle`]."
+    },
     "next_boot": {
       "anyOf": [
         {
@@ -763,6 +1066,17 @@
     "trial_pending": {
       "description": "A one-shot trial boot is set in the firmware and not yet taken.",
       "type": "boolean"
+    },
+    "updates": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/UpdateStatus"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

@@ -235,7 +235,7 @@ read-only verified inputs. Running A, prepared B with pending X, state and boot
 entries remain unchanged. The host lacks EROFS zstd, so mounted consumer checks
 use a genuine small LZ4 fixture; producer provenance avoids that host limitation.
 No full distro/ISO/kernel builds or VM boots were run. P08 acquisition/index
-publishing and P09 release merging remain outstanding.
+publishing is implemented below; P09 release merging remains outstanding.
 
 The starting-point description below records the pre-implementation audit.
 
@@ -719,6 +719,36 @@ acquisition recipes; distro release configuration. Depends on P06 and P07.
 
 Evidence: download an update while B already contains X; disconnect/retry,
 restart the process and apply offline, with X and current boot selection intact.
+
+P08 implementation:
+
+- `update check` verifies the producer's signed index and manifest through the
+  installed Recipe acquisition producer, pins exact release identity/URLs and
+  persists index/release high-water marks. `update download [id]` retains and
+  rehashes completed artifacts across interrupted invocations, restarts the
+  incomplete artifact and uses P07 complete EROFS/boot validation before caching.
+- Networking is bounded by the installed producer's configured endpoint and
+  Ginux budget. The worker sees only a small request file. Check/download hold
+  recab's lock and leave both roots, preparation revision, slot ledger and boot
+  eligibility unchanged. Successful private work is cleaned; failure diagnostics
+  remain. Progress distinguishes verified/reused bytes and incomplete accounting.
+- `release index` publishes already signed bundles locally, serializes writers,
+  verifies immutable objects and publishes hash-addressed index signatures before
+  replacing the index. The builder packages the endpoint-specific recipe/policy.
+  No production endpoint or key has been invented or configured.
+- Offline `update apply` reverifies cached/media inputs, prepares/reuses the
+  inactive system without reseeding X, and pins a durable selection. It reports
+  `awaiting_merge` and `merge_complete: false`; P09 owns actual release merging.
+  Edits/finalization remain blocked until merge or CAS-checked cancellation;
+  cancellation restores the preparation and retains X. This is an explicit
+  handoff, never destructive `stage` or a false completed-update claim.
+- Focused real integration: `tests/finalization.py --release-builder <builder>
+  --updates <recipe>`, with existing kernel/module artifacts and a matching Ginux
+  launcher. Signed local HTTP, a truncated transfer, process retry, reused
+  artifacts, index rollback rejection, offline cache reuse/selection and stale
+  cancellation refusal passed with either A or B running, X, ledger and boot
+  eligibility unchanged. Native fixture ELF/initramfs checks remain structural; no full
+  distro/ISO/kernel build or VM boot was run.
 
 ### P09 Merge a release into an existing preparation
 

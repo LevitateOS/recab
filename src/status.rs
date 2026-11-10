@@ -47,7 +47,7 @@ pub struct SlotView {
 }
 
 /// The schema of [`Status`].
-pub const STATUS_SCHEMA_VERSION: u32 = 7;
+pub const STATUS_SCHEMA_VERSION: u32 = 8;
 
 /// Where the two systems stand, in the terms a person is told. recab works
 /// it out here, once, from its own state, so that no front end rebuilds it
@@ -220,6 +220,8 @@ pub struct ActionView {
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
+    #[serde(default)]
+    pub updates: Option<crate::update::UpdateStatus>,
     pub schema_version: u32,
     pub active_slot: Slot,
     pub inactive_slot: Slot,
@@ -447,6 +449,7 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
     let lifecycle = lifecycle(sel, state, sys.store.busy(), recovery_reason.is_some(), same_generation);
     Ok(Status {
         lifecycle,
+        updates: crate::update::view(&sys).ok(),
         schema_version: STATUS_SCHEMA_VERSION,
         preparation: state.preparation.clone(),
         recovery_reason,

@@ -44,6 +44,7 @@ mod systemd_boot;
 mod target;
 mod trial;
 mod trial_options;
+pub mod update;
 
 use anyhow::Result;
 use std::path::Path;
@@ -252,4 +253,9 @@ pub fn install_unit(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
 /// Inspect system contents without writing or scheduling a boot.
 pub fn inventory(root: &Path) -> Result<Inventory> {
     Inventory::capture(root)
+}
+
+/// Preserve classified failures; classify acquisition/selection refusals.
+pub fn update_error(error: anyhow::Error) -> anyhow::Error {
+    error::or_class(error, ErrorClass::StateOrDetection)
 }

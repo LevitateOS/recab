@@ -126,7 +126,7 @@ fn unhex(text: &str) -> Result<Vec<u8>> {
 fn journal_path(sys: &System, id: &str) -> PathBuf {
     sys.target.state_dir.join(format!("change-{id}.json"))
 }
-fn verify_source(sys: &System) -> Result<()> {
+pub(crate) fn verify_source(sys: &System) -> Result<()> {
     crate::immutable::require_readonly(&sys.target)?;
     let s = sys.boot.selection.active;
     let g = sys.state.require_ready(s)?;

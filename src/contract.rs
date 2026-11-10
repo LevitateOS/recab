@@ -11,7 +11,8 @@ use crate::{ErrorClass, ErrorPayload, Finalization, Health, Inventory, Preparati
 pub fn export() -> Result<Contract> {
     let docs = concat!(env!("CARGO_MANIFEST_DIR"), "/docs");
     let mut c = Contract::new("recab", &["recab"]);
-    c.schema::<crate::ChangeProgress>(docs, "change")?
+    c.schema::<crate::update::UpdateStatus>(docs, "updates")?
+        .schema::<crate::ChangeProgress>(docs, "change")?
         .schema::<Finalization>(docs, "finalization")?
         .schema::<Preparation>(docs, "preparation")?
         .schema::<Inventory>(docs, "inventory")?

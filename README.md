@@ -59,8 +59,10 @@ rollback. It does **not yet implement the full lifecycle above**:
   boot. `finalize` now validates and seals it, installs reusable boot artifacts,
   then publishes its entry. Recipe now applies software/configuration changes
   to that preparation. Downloaded release merging remains incomplete.
-- Update discovery/download and release conflict handling remain missing. `stage` refuses an existing preparation so it
-  cannot silently discard X.
+- Signed update discovery/download now run through Recipe, with pinned releases,
+  bounded networking, verified caching and interruption recovery. Offline apply
+  selects inputs while preserving X; P09 filesystem merging and conflicts remain
+  incomplete. `stage` refuses an existing preparation to protect X.
 - Root's Recipe install/update/remove commands on immutable A/B installs delegate
   to recab. Package selection and `/usr/lib/recipe/profile` belong to each slot;
   independent per-user profiles and output-only builders retain their own routes.
@@ -84,6 +86,11 @@ from its purpose. The commands below describe the existing implementation.
 - `recab discard --preparation <id> --revision <n>`
 - `recab inventory --root <dir> [--json]`
 - `recab compare [--json] [--machine-events | --roots <running> <other>]`
+- `recab update status|check`
+- `recab update download [<manifest-sha256>]`
+- `recab update apply <manifest-sha256> [--preparation <id> --revision <n>]`
+- `recab update apply --manifest <release.json> [--trusted-local] [--preparation <id> --revision <n>]`
+- `recab update cancel --preparation <id> --revision <n>`
 - `recab release import <release.json> [--trusted-local] [--root <dir>]`
 - `recab stage --manifest <release.json> [--trusted-local]`
 - `recab stage --from-media <device|dir> [--trusted-local]`, or `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> --initrd <img> [--change-flavour]`
@@ -170,7 +177,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   boot record, manifest and artifacts before changing selection. The initramfs
   checks `recab.slot`, root PARTUUID and `recab.generation` against the sealed
   root before starting init, and protects both root devices.
-- `status --json` (schema 7) also says where the two systems stand in one
+- `status --json` (schema 8) also says where the two systems stand in one
   word, so front ends need not work it out from slots and phases:
   `lifecycle.state` is `stable`, `open`, `working`, `interrupted`, `ready`,
   `restart_set`, `on_trial`, `trial_failed` or `unusable`; `lifecycle.other`
@@ -486,8 +493,8 @@ recab release import /mnt/release/release.json --trusted-local
 installed distribution key is configured. With a key, a detached Ed25519
 signature of the exact manifest bytes is mandatory. Trust comes from
 `/usr/lib/recab/update-source.json`, never the incoming release. The current
-variant defaults have no production endpoint/key. Online discovery/acquisition
-and preserving X while merging a release remain P08/P09.
+variant defaults have no production endpoint/key. Online discovery/acquisition is
+implemented; preserving X while merging release files remains P09.
 
 Import verifies identity/compatibility, copies and hashes the exact inputs into
 a private read-only set, mounts its actual EROFS image and checks the complete
@@ -665,3 +672,57 @@ this does not establish a kernel/PID 1 or distro-service boot.
 Release policy is a regular slot-owned root file. Recab refuses symlinked or
 group/world-writable policy so shared mutable state cannot replace the
 distribution trust authority.
+
+
+## Signed update discovery and download (P08)
+
+The producer must configure the installed source, acquisition recipe and public
+release key. `check` gives a useful error when they are missing; it never infers
+an endpoint from `HOME_URL` or a package-signing key. Every HTTP request is made
+by Recipe inside Ginux, with only a small request input and configured endpoint
+access. The worker never receives a running/prepared system tree.
+
+```sh
+recab update check                # verifies signed index and manifest
+recab update download            # pins the checked release; copy its returned id
+recab update download <id>       # retry that exact release, even after restart
+recab update status
+recab update apply <id>          # offline verification/selection, awaiting P09 merge
+# Or select mounted media: recab update apply --manifest /mnt/release/release.json
+recab update cancel --preparation <id> --revision <n>
+```
+
+Check/download hold recab's lock, leave both roots protected and do not change
+preparation revisions, slot ledger or boot eligibility. They can run while the
+inactive preparation contains X. Signed index/release high-water marks reject
+rollback or same-sequence substitution. The exact signed manifest, URLs and
+hashes are retained under the manifest's SHA256; retry does not switch to a new
+release behind the caller's back.
+
+Interrupted download retains completed artifacts. Retry rehashes them and
+restarts only the incomplete artifact; byte-range resume within that artifact
+is not implemented. A successful download verifies the complete actual
+EROFS/kernel/initramfs/inventory set through the P07 importer. A cached release
+can be reverified and selected with the network disconnected. These commands
+work for either active slot.
+
+Status schema 8 adds `updates`. Download progress reports verified files/bytes,
+reused objects and Recipe process I/O for the current attempt. Failed producers
+can have unreported writes, so `accounting_complete` is false after interruption.
+Counts exclude other verification/cache copies, filesystem journals and device
+writes; no SMART or zero-write claim is made. Failed Recipe diagnostics remain
+in the private update work directory; successful invocation work is removed.
+
+P08's `apply` is a durable offline handoff to P09, not a completed release merge.
+It reuses an existing preparation without reseeding X, verifies/cache-pins the
+selected inputs and reports `awaiting_merge`, `merge_complete: false`. It blocks
+edits/finalization of that preparation until merging is implemented or the
+selection is cancelled. `cancel` requires the current preparation ID/revision
+and restores it without discarding X. Explicit `discard` abandons the selection
+and preparation. Cached/pinned release inputs remain retained for reuse.
+
+Focused integration uses `tests/finalization.py --release-builder <builder>
+--updates <recipe>` with existing native kernel/module artifacts and a matching
+Ginux launcher; `--updates-running B` exercises B to A. It runs a genuine signed local HTTP feed, disconnect/retry,
+index rollback refusal, offline reuse/selection and cancellation while X is
+prepared. It does not build a distribution or boot a VM.

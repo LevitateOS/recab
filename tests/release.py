@@ -63,6 +63,7 @@ def exercise(h,active):
         try:return cli(active,'inventory','--root',str(roots['B']))
         finally:run('umount',str(roots['B']));h['mounts'].remove('B')
     before_b=b_inventory();entries={p.name:p.read_bytes() for p in (roots['esp']/'loader/entries').iterdir()}
+    cli(active,'update','check',code=21,contains='no update source configured')
     imported=cli(active,'release','import',str(release),'--trusted-local')
     check(imported['id']==hashlib.sha256(original).hexdigest(),'import did not bind exact manifest bytes')
     cache=Path(imported['cache']);check((cache/'release.json').read_bytes()==original,'cache manifest differs')

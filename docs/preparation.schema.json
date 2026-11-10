@@ -85,6 +85,42 @@
       ],
       "type": "object"
     },
+    "ChangeRecord": {
+      "description": "One finished change of a preparation: what a person reads as \"the next\nsystem holds these changes\". The reports of a change stay in\n[`Preparation::last_change`]; this is the list.",
+      "properties": {
+        "action": {
+          "description": "`install`, `update`, `remove` or `edit`.",
+          "type": "string"
+        },
+        "actor": {
+          "default": null,
+          "description": "Who asked for it, as the caller named itself (`--actor`): a label for\nthe person reading, not an authenticated identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "package": {
+          "description": "The recipe's package, or the edited path.",
+          "type": "string"
+        },
+        "unix_time": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "action",
+        "package",
+        "unix_time"
+      ],
+      "type": "object"
+    },
     "Finalization": {
       "properties": {
         "accounting_complete": {
@@ -290,6 +326,14 @@
         }
       ],
       "default": null
+    },
+    "changes": {
+      "default": [],
+      "description": "Every change finished in this preparation, oldest first.",
+      "items": {
+        "$ref": "#/$defs/ChangeRecord"
+      },
+      "type": "array"
     },
     "completed_steps": {
       "format": "uint64",
