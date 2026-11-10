@@ -1,9 +1,9 @@
 //! Read-only checks of the actual root, kernel and installed initramfs.
+use crate::Slot;
 use crate::error::refuse;
 use crate::filesystem::Root;
-use crate::Slot;
 use anyhow::{Context, Result};
-use distro_profile::{os_release_fact, os_release_value, InitSystem};
+use distro_profile::{InitSystem, os_release_fact, os_release_value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -268,8 +268,8 @@ fn runtime(root: &Root, machine: u16, libc: &str) -> Result<()> {
         serde_json::from_str(&text(root, "usr/lib/recab/runtime.json")?)?;
     if runtime["version"] != 1
         || runtime["state_major"] != 2
-        || runtime["state_minor_min"].as_u64().is_none_or(|n| n > 2)
-        || runtime["state_minor_max"].as_u64().is_none_or(|n| n < 2)
+        || runtime["state_minor_min"].as_u64().is_none_or(|n| n > 3)
+        || runtime["state_minor_max"].as_u64().is_none_or(|n| n < 3)
         || runtime["boot_protocol"] != 3
     {
         return Err(refuse(
@@ -354,7 +354,7 @@ fn mounts(root: &Root, slot: Slot, uuid: &str, state: &str, esp: &str) -> Result
                 .iter()
                 .any(|prefix| p == *prefix || p.starts_with(&format!("{prefix}/"))) =>
             {
-                return Err(refuse("unexpected runtime mount in fstab"))
+                return Err(refuse("unexpected runtime mount in fstab"));
             }
             _ => {}
         }
@@ -483,6 +483,19 @@ fn ssh(root: &Root, init: InitSystem) -> Result<()> {
     Ok(())
 }
 fn receipts(root: &Root) -> Result<()> {
+    if let Some(text) = root.optional_text(Path::new(levitate_recipe::system::RECEIPT))? {
+        let receipt = levitate_recipe::system::Receipt::parse(Some(&text))?;
+        for package in receipt.packages.values() {
+            for path in package.files.keys() {
+                if root.metadata(Path::new(path))?.is_none() {
+                    return Err(refuse(format!(
+                        "selected system package file is missing: {path}"
+                    )));
+                }
+            }
+        }
+        return Ok(());
+    }
     let profile = Path::new("usr/lib/recipe/profile");
     if root.metadata(profile)?.is_none() {
         return Ok(());

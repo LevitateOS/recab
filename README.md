@@ -57,13 +57,13 @@ rollback. It does **not yet implement the full lifecycle above**:
   identity/revisions and recovery. Reopening preserves pending changes.
 - Synchronization finishes in `prepared`, while the slot remains incomplete for
   boot. `finalize` now validates and seals it, installs reusable boot artifacts,
-  then publishes its entry. Supported Recipe editing still requires P06;
-  this is not yet the complete X+update→Y lifecycle.
-- Update discovery/download, conflict handling and Recipe integration with an
-  inactive system remain missing. `stage` refuses an existing preparation so it
+  then publishes its entry. Recipe now applies software/configuration changes
+  to that preparation. Downloaded release merging remains incomplete.
+- Update discovery/download and release conflict handling remain missing. `stage` refuses an existing preparation so it
   cannot silently discard X.
-- Root's current Recipe profile is shared on `/var`; this is not a substitute
-  for package selection tied to a prepared system.
+- Root's Recipe install/update/remove commands on immutable A/B installs delegate
+  to recab. Package selection and `/usr/lib/recipe/profile` belong to each slot;
+  independent per-user profiles and output-only builders retain their own routes.
 - Installed immutable boot protects the active root device and keeps ordinary
   `/etc` on that read-only system. Legacy writable configuration overlays require
   explicit adoption; they are never silently hidden. The package/finalizer now
@@ -149,7 +149,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   updated kernel/initramfs; a changed kernel/module set requires the release
   producer's `usr/lib/recab/kernel.json` binding. The candidate must include a
   recab binary matching its producer's `usr/lib/recab/runtime.json`, supporting
-  state 2.2 and immutable boot protocol v3. The retained fallback must have a
+  state 2.3 and immutable boot protocol v3. The retained fallback must have a
   compatible reader and installed boot protocol too; legacy adoption remains
   explicit work, rather than stranding rollback on an older writer.
 
@@ -203,7 +203,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   trial is pending, the next boot, and how the last trial ended. It only reads,
   so it also works off UEFI. `slots` lists each slot's entry, kernel
   directory, `root=`, device, whether it can boot and whether it carries the
-  trial options. Status schema 5 also reports generation identities, readiness,
+  trial options. Status schema 6 also reports generation identities, readiness,
   preparation progress and a recovery reason. `bootable` checks ESP-file presence;
   `generation_ready` additionally requires a complete recorded generation and
   matching boot-artifact digests. Boot scheduling requires that stronger check. With `--root <dir>` it reads the system installed there (its
@@ -340,9 +340,9 @@ The A/B layout mounts its state partition at `/var`, so both slots share recab's
 - Audit log (JSON lines): `/var/lib/recab/audit.log`
 - Lock: `/run/lock/recab.lock`, held by every run that changes anything
 
-Mutations now write state format `{"major":2,"minor":2}`. The new reader also
-accepts 2.0/2.1 and promotes them on mutation. Earlier writers refuse 2.2, so they
-cannot drop finalization records or publish an unsealed candidate. Both slot runtimes need a compatible version before deployment. The structured major
+Mutations now write state format `{"major":2,"minor":3}`. The new reader also
+accepts 2.0/2.1/2.2 and promotes them on mutation. Earlier writers refuse 2.3, so they
+cannot drop in-progress Recipe publications or publish an incomplete candidate. Both slot runtimes need a compatible version before deployment. The structured major
 version intentionally cannot be read by the old numeric-schema writer, which
 would otherwise ignore new safety restrictions. Numeric schema 1 is inspectable
 but read-only; adoption with compatible runtimes is still required. Unsupported
@@ -436,6 +436,64 @@ shared-data isolation, mount/special-file refusal, and space refusal before boot
 invalidation. It supplies scratch firmware/boot records and does not validate
 finalization or a kernel boot. Its verified temporary loop image is cleaned
 up on success; failure artifacts are retained unmounted for inspection.
+
+## Prepared system changes
+
+On an immutable A/B installation, root's `recipe install`, `update`, and
+`remove` route through recab. `--system` selects this route explicitly.
+Recipe builds isolated payloads inside Ginux; it never receives a writable slot,
+the running system as a whole input, the ESP or shared `/var`.
+
+```sh
+recipe --system install service
+recipe --system installed                 # active and prepared receipts
+recipe --system isinstalled service --prepared
+recab edit /etc/example.conf               # editor works on a private bounded copy
+recab edit /etc/example.conf --file ./new.conf
+recipe --system update service
+recipe --system remove service
+recab finalize
+recab set-next B                           # use A when running B
+```
+
+`recab change install|update|remove RECIPE` exposes the same application owner.
+Producer options follow `--`; `--producer-recipe PATH` selects the current source
+for an update. Recipe's frontend resolves the current catalog first and falls
+back to the selected source when no catalog entry exists. Optional
+`--preparation ID --revision N` guards stale requests. Changes are pending reboot;
+they do not activate a shared root profile. `--package-root DIR` selects an
+independent profile; `--no-activate` retains output-only production.
+
+Explicit `system` directory outputs require `target_finalize` metadata and use
+root-relative paths. Ordinary `package` outputs install in the candidate's
+`/usr/lib/recipe/profile`. The slot-owned `/usr/lib/recipe/system.json` records
+producer digest, architecture, scoped target, runtime dependencies and owned
+metadata/content. Unowned base/admin file replacement, incompatible coownership,
+and overwrite/removal of administrator edits refuse before publication.
+Directories already present retain their metadata; removal retains directories
+and files owned by remaining selections. Shared/runtime and recab identity paths
+are excluded. An edit preserves original ownership, permissions and xattrs and does not silently
+change its package fingerprint, so later overwrite/removal detects that edit.
+Edits are limited to existing regular files of at most 1 MiB.
+
+A durable publication intent invalidates the candidate and advances its revision.
+After interruption, `recab change recover` reconciles the same frozen selected
+payload and receipt; other edits/finalization refuse until recovery or explicit
+discard. Failed producers publish no candidate changes. The prepared system is
+unmounted between commands; finalization validates and seals it for trial boot.
+
+`last_change` and a pending `change` appear in status schema 6 / state 2.3.
+Reports separate logical candidate payload writes from package projection bytes
+and `/proc/self/io` deltas for Recipe and the recab invocation (including reaped children and streams). Returned invocation counters cover cleanup; the persisted record predates that observation and leaves it unmeasured.
+The latter includes runtime input staging, checkpoints, exports and diagnostics;
+it is not physical SSD traffic or a SMART count. Interrupted attempts explicitly
+report incomplete accounting. Compiler runtime extraction is still included in
+producer I/O; no claim of zero total invocation writes is made.
+
+For focused real Recipe/Ginux checks, pass `--changes /absolute/path/to/recipe`
+to `tests/finalization.py` with a compatible `GINUX_BIN`, plus its existing `--binary`, `--kernel`
+and `--module` arguments. It uses disposable ext4/vfat loop partitions and actual
+Ginux producers using a tiny native worker/loader runtime; boot/firmware observations remain structural fixtures.
 
 ## End-to-End Validation
 

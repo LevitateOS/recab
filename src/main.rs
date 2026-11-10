@@ -1,11 +1,12 @@
+use anyhow::Context;
 use clap::{CommandFactory, Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use recab::{
-    stable_exit_code, Health, InitLayout, InitRequest, Slot, SlotView, StageRequest, StageSource,
-    Status, TrialOutcome,
+    Health, InitLayout, InitRequest, Slot, SlotView, StageRequest, StageSource, Status,
+    TrialOutcome, stable_exit_code,
 };
 use recpart::types::InstallMode;
 
@@ -27,6 +28,33 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Apply Recipe software to the prepared inactive system; activation needs reboot.
+    Change {
+        #[arg(value_parser=["install","update","remove","recover","list","check"])]
+        action: String,
+        recipe: Option<PathBuf>,
+        /// Current resolved producer; update otherwise uses the selected source path.
+        #[arg(long)]
+        producer_recipe: Option<PathBuf>,
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+        #[arg(long)]
+        prepared: bool,
+        #[arg(last = true)]
+        recipe_args: Vec<String>,
+    },
+    /// Edit configuration through a bounded temporary file, then apply to the inactive system.
+    Edit {
+        path: PathBuf,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+    },
     /// Validate, flush and seal the candidate, then publish its immutable boot entry.
     Finalize {
         #[arg(long, requires = "revision")]
@@ -189,6 +217,60 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
+        Command::Change {
+            action,
+            recipe,
+            producer_recipe,
+            preparation,
+            revision,
+            prepared,
+            recipe_args,
+        } => {
+            if action == "list" || action == "check" {
+                let view = recab::changes()?;
+                let result = if action == "check" {
+                    let name = recipe.context("check requires a package name")?;
+                    let selected = &view[if prepared { "prepared" } else { "active" }]["packages"];
+                    selected
+                        .get(name.to_str().context("invalid package name")?)
+                        .context("package is not selected in that system")?
+                        .clone()
+                } else {
+                    view
+                };
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                let result = recab::change(&recab::ChangeRequest {
+                    action,
+                    recipe: recipe.unwrap_or_default(),
+                    producer_recipe,
+                    preparation,
+                    revision,
+                    recipe_args,
+                })?;
+                if cli.json {
+                    println!("{}", serde_json::to_string(&result)?);
+                } else {
+                    println!(
+                        "Prepared {}: system changes are pending reboot. Finalize before selecting the candidate.",
+                        result.package
+                    );
+                }
+            }
+        }
+        Command::Edit {
+            path,
+            file,
+            preparation,
+            revision,
+        } => {
+            let result = recab::edit(&path, file.as_deref(), preparation.as_deref(), revision)?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&result)?);
+            } else {
+                println!("Configuration prepared; finalize and reboot to activate it.");
+            }
+        }
         Command::Finalize {
             preparation,
             revision,
@@ -206,8 +288,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string(&result)?);
             } else {
-                println!("Finalized generation {}: {} boot payload bytes written, {} files reused. Ready for a trial boot.",result.generation.id,result.boot_bytes_written,result.reused_boot_files);
-                if !result.accounting_complete { println!("Earlier interrupted writes are unknown; counters cover the completed attempt."); }
+                println!(
+                    "Finalized generation {}: {} boot payload bytes written, {} files reused. Ready for a trial boot.",
+                    result.generation.id, result.boot_bytes_written, result.reused_boot_files
+                );
+                if !result.accounting_complete {
+                    println!(
+                        "Earlier interrupted writes are unknown; counters cover the completed attempt."
+                    );
+                }
             }
         }
         Command::Prepare {
@@ -223,9 +312,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     preparation.id, preparation.slot, preparation.revision, preparation.phase
                 );
                 if let Some(report) = preparation.synchronization {
-                    println!("Last synchronization: {} payload bytes written in {} ranges; {} metadata updates. Finalize before trial boot.", report.payload_bytes_written, report.range_writes, report.metadata_updates);
+                    println!(
+                        "Last synchronization: {} payload bytes written in {} ranges; {} metadata updates. Finalize before trial boot.",
+                        report.payload_bytes_written, report.range_writes, report.metadata_updates
+                    );
                     if !report.accounting_complete {
-                        println!("Earlier interrupted writes are unknown; counters cover the completed attempt.");
+                        println!(
+                            "Earlier interrupted writes are unknown; counters cover the completed attempt."
+                        );
                     }
                 }
             }
@@ -236,7 +330,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => {
             recab::discard(&preparation, revision)?;
             if !cli.json {
-                println!("Preparation discarded. The inactive slot remains unavailable until a new system is completed.");
+                println!(
+                    "Preparation discarded. The inactive slot remains unavailable until a new system is completed."
+                );
             }
         }
         Command::Inventory { root } => {
@@ -264,7 +360,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             };
             recab::stage(&source, change_flavour)?;
             if !cli.json {
-                println!("Update staged in the inactive slot. Run 'recab status' to review it before scheduling a trial boot.");
+                println!(
+                    "Update staged in the inactive slot. Run 'recab status' to review it before scheduling a trial boot."
+                );
             }
         }
         Command::Init {
@@ -347,11 +445,7 @@ fn slot_text(slot: Option<Slot>) -> String {
 }
 
 fn yes_no(value: bool) -> &'static str {
-    if value {
-        "yes"
-    } else {
-        "no"
-    }
+    if value { "yes" } else { "no" }
 }
 
 /// `Status` as text: every field (no `..`, so a new field cannot be left out).

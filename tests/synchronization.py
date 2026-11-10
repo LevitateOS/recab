@@ -51,8 +51,9 @@ try:
     check(loop.startswith('/dev/loop'),'unexpected loop path')
     backing=run('losetup','--noheadings','--output','BACK-FILE',loop).stdout.decode().strip()
     check(Path(backing).resolve()==disk.resolve(),'loop backing file does not match scratch image')
+    run('udevadm','settle')
     devices={s:loop+'p'+str(i) for i,s in enumerate(['A','B'],1)}
-    uuids={s:run('blkid','-s','PARTUUID','-o','value',d).stdout.decode().strip() for s,d in devices.items()}
+    uuids={s:run('blkid','-c','/dev/null','-s','PARTUUID','-o','value',d).stdout.decode().strip() for s,d in devices.items()}
     roots={s:base/s for s in ['A','B']}
     for s in roots:
         roots[s].mkdir();run('mkfs.ext4','-q','-F',devices[s]);run('mount','-t','ext4',devices[s],str(roots[s]));mounts.add(s)
@@ -158,7 +159,7 @@ try:
     first=cli(active,'prepare','--preparation',interrupted['id'],'--revision',str(interrupted['revision']))
     check(first['phase']=='prepared' and first['synchronized'],'resume did not complete')
     check(first['synchronization']['resumed'] and not first['synchronization']['accounting_complete'],'interrupted counters claimed completeness')
-    check(json.loads((state/'state.json').read_text())['schema']=={'major':2,'minor':2},'minor safety format was not upgraded')
+    check(json.loads((state/'state.json').read_text())['schema']=={'major':2,'minor':3},'minor safety format was not upgraded')
     cli(active,'set-next','B',code=21,contains='incomplete')
     run('mount','-t','ext4',devices['B'],str(b));mounts.add('B')
     check((b/'var/cache/alias').read_bytes()==b'cached publication must survive','excluded hardlink alias was patched')

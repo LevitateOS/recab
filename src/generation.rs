@@ -112,6 +112,81 @@ impl Inventory {
             entries,
         })
     }
+    /// Observe only explicitly selected paths; never export/copy a system tree
+    /// merely to install a small package. Parents are resolved by directory FDs.
+    pub(crate) fn capture_paths(path: &Path, paths: &[std::path::PathBuf]) -> Result<Self> {
+        let root = Root::open(path)?;
+        let device = root.device()?;
+        let mut entries = Vec::new();
+        let mut links = BTreeMap::<(u64, u64), Vec<u8>>::new();
+        let mut paths = paths.to_vec();
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            let metadata = match root.metadata(&path) {
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                        matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
+                    }) =>
+                {
+                    None
+                }
+                v => v?,
+            };
+            let Some(m) = metadata else {
+                continue;
+            };
+            if m.dev() != device {
+                return Err(refuse("selected system path crosses a mount"));
+            }
+            let e = root.entry(&path, false)?;
+            let mut n = Node {
+                path: path.as_os_str().as_bytes().to_vec(),
+                kind: if m.is_dir() {
+                    "dir"
+                } else if m.is_file() {
+                    "file"
+                } else if m.file_type().is_symlink() {
+                    "link"
+                } else {
+                    return Err(refuse("unsupported selected system inode"));
+                }
+                .into(),
+                mode: m.mode() & 0o7777,
+                uid: m.uid(),
+                gid: m.gid(),
+                size: if m.is_dir() { 0 } else { m.len() },
+                modified: m.mtime(),
+                modified_ns: m.mtime_nsec(),
+                xattrs: filesystem::xattrs(&e.path())?,
+                content: None,
+                normalized: None,
+                link: None,
+                hardlink: None,
+                extents: None,
+            };
+            if m.is_file() {
+                let mut file = e.open()?;
+                n.content = Some(hash_reader(&mut file)?);
+                n.extents = extents(&file, m.len())?;
+            }
+            if m.file_type().is_symlink() {
+                n.link = Some(fs::read_link(e.path())?.as_os_str().as_bytes().to_vec());
+            }
+            if !m.is_dir() && m.nlink() > 1 {
+                if let Some(first) = links.get(&(m.dev(), m.ino())) {
+                    n.hardlink = Some(first.clone());
+                } else {
+                    links.insert((m.dev(), m.ino()), n.path.clone());
+                }
+            }
+            entries.push(n);
+        }
+        Ok(Self {
+            version: 1,
+            entries,
+        })
+    }
     pub fn digest(&self) -> Result<String> {
         let mut canonical = self.clone();
         for node in &mut canonical.entries {

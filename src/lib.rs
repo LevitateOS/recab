@@ -14,6 +14,7 @@
 
 mod candidate;
 mod carry;
+mod change;
 #[cfg(feature = "contracts")]
 pub mod contract;
 mod efivars;
@@ -61,6 +62,7 @@ pub use status::{
 pub use target::state_file;
 pub use trial::{trial, TrialOutcome};
 
+pub use change::{change, changes, edit, ChangeProgress, ChangeRequest};
 pub use finalize::{finalize, BootSeal, Finalization, FinalizeRequest};
 pub use generation::{Generation, Inventory};
 pub use prepare::{discard, prepare};

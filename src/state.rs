@@ -72,7 +72,7 @@ pub(crate) enum StateSchema {
 }
 impl Default for StateSchema {
     fn default() -> Self {
-        Self::Current { major: 2, minor: 2 }
+        Self::Current { major: 2, minor: 3 }
     }
 }
 
@@ -127,6 +127,10 @@ pub struct Preparation {
     pub synchronization: Option<crate::SyncReport>,
     #[serde(default)]
     pub finalization: Option<crate::Finalization>,
+    #[serde(default)]
+    pub change: Option<crate::ChangeProgress>,
+    #[serde(default)]
+    pub last_change: Option<crate::ChangeProgress>,
 }
 
 /// What recab keeps in its state file.
@@ -166,7 +170,7 @@ impl PersistentState {
             StateSchema::Legacy(1)
             | StateSchema::Current {
                 major: 2,
-                minor: 0 | 1 | 2,
+                minor: 0 | 1 | 2 | 3,
             } => Ok(()),
             _ => Err("unsupported recab state format; use a compatible recovery tool".into()),
         }
@@ -249,10 +253,20 @@ impl PersistentState {
             _ => {
                 return Err(refuse(
                     "pending trial does not identify a complete generation",
-                ))
+                ));
             }
         }
         if let Some(preparation) = &self.preparation {
+            if preparation.change.as_ref().is_some_and(|change| {
+                preparation.operation != "change"
+                    || preparation.phase != PreparationPhase::Interrupted
+                    || !preparation.synchronized
+                    || change.id.len() != 64
+                    || !change.id.bytes().all(|b| b.is_ascii_hexdigit())
+            }) || (preparation.operation == "change" && preparation.change.is_none())
+            {
+                return Err(refuse("inconsistent pending system change"));
+            }
             let source = self
                 .slot(preparation.source_slot)
                 .and_then(|slot| slot.generation.as_ref());
@@ -628,6 +642,8 @@ pub(crate) fn plan(
                 synchronized: false,
                 synchronization: None,
                 finalization: None,
+                change: None,
+                last_change: None,
             });
             Transition {
                 operation: Operation::Prepare(inactive),
@@ -731,6 +747,8 @@ Run 'recab commit' to keep slot {active}, or reboot into slot {inactive}."
                 synchronized: false,
                 synchronization: None,
                 finalization: None,
+                change: None,
+                last_change: None,
             });
             next.slot_mut(inactive)?.readiness = Readiness::Incomplete;
             next.slot_mut(inactive)?.generation = None;

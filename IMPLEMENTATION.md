@@ -160,6 +160,45 @@ with zero system payload writes. Boot observations are structural fixtures;
 actual kernel/PID 1/distro boots remain unverified. No full builds or VM scenarios
 were run. Recipe system targeting and downloaded-update merging remain later work.
 
+P06 now connects Recipe software changes to the inactive preparation. Root's
+package commands on immutable A/B systems delegate to recab; `--system` selects
+that route explicitly. Independent profiles and output-only builders keep their
+existing routes. Package directories install into the slot-owned system profile;
+explicit system outputs carry root-relative intended metadata. Recipe's existing
+graph produces runtime dependencies and coordinator-owned producer provenance.
+The versioned target manifest includes owned paths and explicit removals.
+
+Recab checks observed fingerprints, dependency constraints and compatible
+coownership before publication, refusing unowned base/admin file replacement and
+overwrite/removal of administrator edits. It projects only selected package data,
+then uses P03's range writer against those paths. No whole candidate is passed as
+a Recipe input, checkpoint or export. Producer caches include preparation/source
+and revision scope in addition to Recipe's existing source/dependency/architecture
+identity. Normal package inspection leaves published caches unchanged.
+Unspecified SELinux labels retain installed kernel policy; authored labels and
+other xattrs remain exact constraints.
+
+A durable selected-payload journal precedes writable access. Interrupted changes
+block other edits/finalization and recover the same frozen bytes and receipt, or
+can be explicitly discarded. `recab edit` uses a private existing regular-file
+copy limited to 1 MiB, preserving ownership, permissions and xattrs, and retaining package fingerprints for
+later edit detection. Active/prepared selection is explicit and activation stays
+pending reboot. Login paths use the booted slot's system profile for all users,
+with independent ordinary-user profiles. State 2.3 / status schema 6 expose
+pending/completed changes and counters; older writers cannot drop them.
+
+Focused compilation and the real Recipe/Ginux/ext4/vfat integration passed
+service/library install, update and removal, dependency refusal, administrator
+conflicts/edits, failed producer isolation, reopening X, both slot directions,
+and finalization/boot-artifact reuse without changing the running root. The
+extended native-runtime fixture passed with OpenRC too, including ordinary
+package output, killed publication recovery and altered-payload refusal.
+The existing P03 synchronization regression and docs/TUI typechecks passed. Process I/O counters include runtime staging/checkpoints/
+exports/diagnostics; projection and candidate logical writes are separate. They
+are not SSD or SMART totals. Compiler-runtime extraction remains producer I/O;
+this does not claim zero total writes or optimal binary deltas. Actual distro
+boots, full builds, and downloaded-release merging remain deferred.
+
 The starting-point description below records the pre-implementation audit.
 
 ## Starting point

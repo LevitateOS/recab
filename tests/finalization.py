@@ -4,9 +4,10 @@ Uses an existing UEFI kernel/module, native ELF programs and temporary GPT disks
 The initramfs and observed firmware/boot records are structural fixtures; only
 an actual VM boot can establish PID 1, hardware-driver and service behavior.
 """
-import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time
+import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
+sys.dont_write_bytecode=True
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--stage-recstrap',type=Path,help='also exercise destructive staging through the shared finalizer');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--stage-recstrap',type=Path,help='also exercise destructive staging through the shared finalizer');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');args=p.parse_args()
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
 BIN=str(args.binary.resolve(strict=True));KERNEL=args.kernel.resolve(strict=True);MODULE=args.module.resolve(strict=True)
 GUID='4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
@@ -245,7 +246,11 @@ try:
         check(run('blockdev','--getro',dev['B']).stdout.strip()==b'1','staging left candidate unprotected')
         staged=stage_status['preparation'];cli(active,'discard','--preparation',staged['id'],'--revision',str(staged['revision']))
     prepared=cli(active,'prepare');check(prepared['phase']=='prepared','preparation did not complete')
-    # Simulate an explicitly prepared system edit until P06 owns editing.
+    changes=None
+    if args.changes:
+        from changes import Changes
+        changes=Changes(globals());changes.first(active)
+    # Older finalization checks also exercise an external prepared edit.
     run('blockdev','--setrw',dev['B']);run('mount','-o','rw',dev['B'],str(roots['B']));mounts.add('B')
     (roots['B']/'etc/config').write_text('local X\n');run('umount',str(roots['B']));mounts.remove('B');run('blockdev','--setro',dev['B'])
     # Bad archive refuses before any finalization state/root mutation.
@@ -301,6 +306,7 @@ try:
     run('mount','-o','ro',dev['B'],str(roots['B']));mounts.add('B');run('mount','--bind',str(roots['state']),str(roots['B']/'var'));mounts.add('B/var')
     variable('OneShot',None);variable('Selected','lev-b.conf');bgen=complete['generation'];on_b=running('B',bgen);check((roots['B']/'etc/config').read_text()=='local X\n','finalization lost local X');cli(on_b,'commit')
     reverse=cli(on_b,'prepare');check(reverse['slot']=='A','reverse preparation picked wrong slot')
+    if changes:changes.reverse(on_b)
     back=cli(on_b,'finalize');check(back['boot_bytes_written']==0 and back['reused_boot_files']==2,'reverse copied unchanged boot payloads')
     check(run('blockdev','--getro',dev['A']).stdout.strip()==b'1' and run('blockdev','--getro',dev['B']).stdout.strip()==b'1','both roots are not protected')
     cli(on_b,'set-next','A');cli(on_b,'rollback');check(not (efi/f'efivars/LoaderEntryOneShot-{GUID}').exists(),'rollback did not cancel trial')

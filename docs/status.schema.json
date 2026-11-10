@@ -142,6 +142,65 @@
       ],
       "type": "object"
     },
+    "ChangeProgress": {
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "invocation_io": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Entire recab invocation through cleanup, including the Recipe subprocess.\nAvailable in the returned result; the persisted receipt predates cleanup.\nFinal result serialization follows this observation.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "package": {
+          "type": "string"
+        },
+        "producer_io": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Recipe /proc/self/io deltas, including reaped children and streams.\nNot physical SSD traffic; null means unmeasured.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "projection_bytes_written": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "report": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SyncReport"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "action",
+        "package",
+        "projection_bytes_written"
+      ],
+      "type": "object"
+    },
     "Finalization": {
       "properties": {
         "accounting_complete": {
@@ -214,6 +273,17 @@
     },
     "Preparation": {
       "properties": {
+        "change": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeProgress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "completed_steps": {
           "format": "uint64",
           "minimum": 0,
@@ -238,6 +308,17 @@
         },
         "id": {
           "type": "string"
+        },
+        "last_change": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeProgress"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "operation": {
           "type": "string"

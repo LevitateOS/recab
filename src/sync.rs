@@ -10,10 +10,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::Slot;
 use crate::error::refuse;
 use crate::filesystem::{self, Entry, Root};
-use crate::generation::{digest, extents, Extent, Inventory, Node, EXCLUDED, MARKER};
-use crate::Slot;
+use crate::generation::{EXCLUDED, Extent, Inventory, MARKER, Node, digest, extents};
 
 const RANGE: u64 = 1024 * 1024;
 
@@ -71,6 +71,7 @@ pub(crate) struct Synchronization {
     slot: Slot,
     partuuid: String,
     temporary: String,
+    selected: bool,
 }
 
 fn path(bytes: &[u8]) -> &Path {
@@ -158,7 +159,27 @@ fn metadata_matches(node: &Node, entry: &Entry) -> Result<bool> {
         && m.mtime_nsec() == node.modified_ns
         && filesystem::xattrs(&entry.path())? == node.xattrs)
 }
-fn metadata(node: &Node, entry: &Entry, report: &mut SyncReport) -> Result<()> {
+fn assigned_metadata(node: &Node, entry: &Entry, selected: bool) -> Result<Node> {
+    let mut intended = node.clone();
+    if selected
+        && !intended
+            .xattrs
+            .iter()
+            .any(|(n, _)| n == b"security.selinux")
+        && entry.metadata()?.is_some()
+    {
+        for (name, value) in filesystem::xattrs(&entry.path())? {
+            if name == b"security.selinux" {
+                intended.xattrs.push((name, value));
+            }
+        }
+        intended.xattrs.sort();
+    }
+    Ok(intended)
+}
+fn metadata(node: &Node, entry: &Entry, report: &mut SyncReport, selected: bool) -> Result<()> {
+    let intended = assigned_metadata(node, entry, selected)?;
+    let node = &intended;
     if metadata_matches(node, entry)? {
         return Ok(());
     }
@@ -424,11 +445,140 @@ impl Synchronization {
             slot,
             partuuid: uuid.into(),
             temporary,
+            selected: false,
         };
         result.capacity()?;
         Ok(result)
     }
 
+    /// A Recipe publication reuses the same range/metadata writer, with an
+    /// explicit bounded selection instead of whole-system deletion semantics.
+    pub(crate) fn selected(
+        source: &Path,
+        destination: &Path,
+        mut desired: Inventory,
+        removals: &[String],
+        slot: Slot,
+        uuid: &str,
+        id: &str,
+    ) -> Result<Self> {
+        let source = Root::open(source)?;
+        let destination_root = Root::open(destination)?;
+        desired.entries.retain(|n| !n.path.is_empty());
+        let paths = desired
+            .entries
+            .iter()
+            .map(|n| path(&n.path).to_path_buf())
+            .chain(removals.iter().map(PathBuf::from))
+            .collect::<Vec<_>>();
+        let observed = Inventory::capture_paths(destination, &paths)?;
+        let actual = observed
+            .entries
+            .iter()
+            .map(|n| (n.path.clone(), n))
+            .collect::<BTreeMap<_, _>>();
+        let mut operations = Vec::new();
+        let mut deleting = removals
+            .iter()
+            .map(|p| p.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        for node in &desired.entries {
+            if actual
+                .get(&node.path)
+                .is_some_and(|old| old.kind != node.kind)
+            {
+                if actual[&node.path].kind == "dir"
+                    && !destination_root.names(path(&node.path))?.is_empty()
+                {
+                    return Err(refuse(
+                        "selected update cannot replace a populated directory",
+                    ));
+                }
+                deleting.push(node.path.clone());
+            }
+        }
+        deleting.sort_by_key(|p| std::cmp::Reverse(p.len()));
+        deleting.dedup();
+        for p in deleting {
+            if let Some(old) = actual.get(&p) {
+                if old.kind == "dir" && !destination_root.names(path(&p))?.is_empty() {
+                    continue;
+                }
+                operations.push(Operation::Remove(p));
+            }
+        }
+        for node in desired.entries.iter().filter(|n| n.kind == "dir") {
+            operations.push(Operation::Directory(node.path.clone()));
+        }
+        for node in desired
+            .entries
+            .iter()
+            .filter(|n| n.kind != "dir" && n.hardlink.is_none())
+        {
+            operations.push(if node.kind == "file" {
+                Operation::File(node.path.clone())
+            } else {
+                Operation::Symlink(node.path.clone())
+            });
+        }
+        for node in desired.entries.iter().filter(|n| n.hardlink.is_some()) {
+            operations.push(Operation::Link(node.path.clone()));
+        }
+        for node in desired.entries.iter().rev() {
+            operations.push(Operation::Metadata(node.path.clone()));
+        }
+        let result = Self {
+            source,
+            destination: destination_root,
+            desired,
+            observed,
+            operations,
+            slot,
+            partuuid: uuid.into(),
+            temporary: format!(".recab-sync-{id}"),
+            selected: true,
+        };
+        result.capacity()?;
+        Ok(result)
+    }
+    pub(crate) fn verify_selected(&self, destination: &Path) -> Result<()> {
+        let paths = self
+            .desired
+            .entries
+            .iter()
+            .map(|n| path(&n.path).to_path_buf())
+            .collect::<Vec<_>>();
+        let actual = Inventory::capture_paths(destination, &paths)?;
+        if actual.entries.len() != self.desired.entries.len() {
+            return Err(refuse("selected publication is incomplete"));
+        }
+        for wanted in &self.desired.entries {
+            let n = actual
+                .entries
+                .iter()
+                .find(|n| n.path == wanted.path)
+                .unwrap();
+            let mut n = n.clone();
+            if !wanted
+                .xattrs
+                .iter()
+                .any(|(name, _)| name == b"security.selinux")
+            {
+                n.xattrs.retain(|(name, _)| name != b"security.selinux");
+            }
+            if !same_metadata(&n, wanted)
+                || n.content != wanted.content
+                || n.link != wanted.link
+                || n.hardlink != wanted.hardlink
+            {
+                return Err(refuse(format!(
+                    "selected publication mismatch at {}",
+                    path(&wanted.path).display()
+                )));
+            }
+        }
+        Ok(())
+    }
     fn capacity(&self) -> Result<()> {
         let actual: BTreeMap<_, _> = self
             .observed
@@ -550,7 +700,11 @@ impl Synchronization {
                 .saturating_add(freed_bytes)
             || inodes > stat.f_favail.saturating_add(freed_inodes)
         {
-            return Err(refuse(format!("synchronization needs up to {bytes} free bytes and {inodes} inodes; destination has {} bytes and {} inodes", stat.f_bavail.saturating_mul(block), stat.f_favail)));
+            return Err(refuse(format!(
+                "synchronization needs up to {bytes} free bytes and {inodes} inodes; destination has {} bytes and {} inodes",
+                stat.f_bavail.saturating_mul(block),
+                stat.f_favail
+            )));
         }
         Ok(())
     }
@@ -615,7 +769,8 @@ impl Synchronization {
                 .iter()
                 .any(|h| ranges(old).iter().any(|data| overlap(h, data).is_some()))
         });
-        let meta_differs = !metadata_matches(node, &target)?;
+        let meta_differs =
+            !metadata_matches(&assigned_metadata(node, &target, self.selected)?, &target)?;
         let detach = match &m {
             Some(m) if !self.safe_aliases(node, m)? => {
                 data_differs
@@ -824,6 +979,7 @@ impl Synchronization {
                         wanted[p.as_slice()],
                         &entry(&self.destination, p)?,
                         &mut report,
+                        self.selected,
                     )?,
                 }
                 Ok(())

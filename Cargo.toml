@@ -8,6 +8,7 @@ authors.workspace = true
 description = "A/B slot + boot-selection manager for LevitateOS-style immutable systems"
 
 [dependencies]
+levitate-recipe = { path = "../recipe" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 distro-profile = { path = "../../distro/profile" }
