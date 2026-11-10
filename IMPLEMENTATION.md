@@ -33,10 +33,12 @@ against read-only bind-mounted scratch roots in a user/mount namespace; xattrs,
 raw path bytes, hardlinks, sparse extents and shared tmpfs exclusion; generation
 artifact mismatch and incomplete candidate refusals; stale ID/revision refusal;
 process termination after durable intent followed by reopening that same ID;
-discard; and uncommitted-source, legacy and future-format refusal. P01 baseline
+discard; uncommitted-source, legacy and future-format refusal; the same
+preparation contract in both slot directions; and refusal to commit altered system
+content. P01 baseline
 CLI checks also exercised xattr recording, symlink confinement and FIFO refusal.
 Public schemas and the TUI contract are generated through recab's existing
-contract exporter. No unit suites, full system builds or VM scenarios were run.
+contract exporter; the TUI and documentation TypeScript checks pass. No unit suites, full system builds or VM scenarios were run.
 
 These checks do not establish installed boot behavior, destructive staging on
 real slot devices, or the complete X+update→Y lifecycle. P03 synchronization,

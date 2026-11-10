@@ -78,6 +78,7 @@ impl System {
     /// Plan `request` and apply it; nothing to do when the system already is
     /// where it leads.
     pub fn run(&self, request: Request) -> Result<()> {
+        let committing = matches!(request, Request::Commit);
         let slot = match &request {
             Request::SetNext(slot) => Some(*slot),
             Request::Commit => Some(self.boot.selection.active),
@@ -90,7 +91,12 @@ impl System {
         }
         match plan(request, &self.boot.selection, &self.state)? {
             Some(transition) => self.apply(&transition).map(|_| ()),
-            None => Ok(()),
+            None => {
+                if committing {
+                    self.verify_active_generation()?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -99,6 +105,9 @@ impl System {
     pub fn apply(&self, transition: &Transition) -> Result<PersistentState> {
         self.state.check_mutable()?;
         transition.next.check_mutable()?;
+        if matches!(transition.operation, crate::state::Operation::Commit(_)) {
+            self.verify_active_generation()?;
+        }
         let name = transition.operation.name();
         if let Some(change) = transition.boot {
             let slot = match change {
@@ -134,6 +143,15 @@ impl System {
             &next,
         );
         Ok(next)
+    }
+
+    fn verify_active_generation(&self) -> Result<()> {
+        let active = self.boot.selection.active;
+        self.state.require_ready(active)?.verify_root(
+            &self.target.root,
+            active,
+            &self.backend.slot_partuuid(&self.boot, active)?,
+        )
     }
 }
 
