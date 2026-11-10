@@ -695,7 +695,8 @@ take N, including deletions. When N equals O, keep C, including local deletions.
 When C equals N, keep that result. Otherwise report a conflict. Content, ownership,
 modes, xattrs, symlinks and hardlink groups participate; directory replacement
 conflicts select complete subtrees. Release timestamps are image-writer policy,
-not evidence of a separate content edit. Kernel-assigned SELinux labels are
+not evidence of a separate content edit. Only recab-owned root references are materialized in fstab; independent release
+changes and conflicts still participate in the merge. Kernel-assigned SELinux labels are
 retained when incoming metadata declares none, as in Recipe publication.
 
 The installer calls `baseline` before personalization. The protected slot file

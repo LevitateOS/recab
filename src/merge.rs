@@ -829,7 +829,9 @@ fn materialize_accounts(
     let ng = ids(&next, "etc/group")?;
     for node in &desired.entries {
         let key = hex(&node.path);
-        let release = sources.get(&key).is_some_and(|s| s == "release");
+        let release = sources
+            .get(&key)
+            .is_some_and(|s| s == "release" || s.starts_with("packages/"));
         let (expected_users, expected_groups) = if release { (&nu, &ng) } else { (&cu, &cg) };
         if !users.contains_key(&node.uid)
             || !groups.contains_key(&node.gid)
@@ -1153,7 +1155,10 @@ pub(crate) fn start(
         "release baseline differs from installed release identity"
     );
     ensure!(
-        v.manifest().identity.sequence > old.identity.sequence,
+        v.manifest().identity.sequence > old.identity.sequence
+            || (allow_flavour
+                && v.manifest().identity.sequence == old.identity.sequence
+                && v.manifest().identity.flavour != old.identity.flavour),
         "incoming release is not newer than the prepared release baseline"
     );
     let mut j = Journal {

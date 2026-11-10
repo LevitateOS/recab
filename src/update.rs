@@ -812,7 +812,8 @@ pub(crate) fn apply_options(
     }
     let (installed, _) = crate::release::installed(&sys.target)?;
     ensure!(
-        input.manifest().identity.sequence > installed.sequence,
+        input.manifest().identity.sequence > installed.sequence
+            || (allow_flavour && input.manifest().identity.sequence == installed.sequence),
         "update must be newer than the installed baseline"
     );
     drop(input);
