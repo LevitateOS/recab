@@ -136,7 +136,7 @@ class Updates:
         variant=self.repo/'distro/variants/levitate'
         for item in variant.iterdir():
             if item.name!='distro.toml':(fixture/'distro/variants/levitate'/item.name).symlink_to(item,target_is_directory=item.is_dir())
-        text=(variant/'distro.toml').read_text().replace('sequence = 1','sequence = 2')
+        text=(variant/'distro.toml').read_text().replace('sequence = 1','sequence = 2').replace('init = "systemd"','init = "'+h['args'].init+'"')
         text+='\n[release.trust]\ned25519 = "'+self.public+'"\n[release.source]\nindex = "'+self.policy['source']['index']+'"\nrecipe = "distro/builder/os-recipes/update-acquire.rhai"\n'
         (fixture/'distro/variants/levitate/distro.toml').write_text(text)
         def builder(*args):
@@ -165,6 +165,7 @@ class Updates:
         for path in self.publish.rglob('*'):
             if path.name=='.index.lock':continue
             check(stat.S_IMODE(path.stat().st_mode)==(0o755 if path.is_dir() else 0o644),'published files are not readable by the HTTP service: '+str(path))
+        run('python3',str(self.repo/'tools/recab/tests/production_metadata.py'),'--builder',self.builder,'--repo',str(self.repo),'--manifest',str(bundle/'release.json'))
         old_index=(self.publish/'index.json').read_bytes()
         # Publisher refuses index rollback and ignores a stale convenience sig.
         (self.publish/'index.sig').write_bytes(b'x'*64)
@@ -208,7 +209,7 @@ class Updates:
         check(sum(p.endswith('/filesystem.erofs') for p in self.requests)==root_requests,'retry downloaded the rootfs again');unchanged()
         # New index is accepted; old signed index is then rejected persistently.
         builder('release','index','levitate',str(bundle),str(self.publish),'2','--signing-key',str(self.key))
-        cli(active,'update','check');(self.publish/'index.json').write_bytes(old_index)
+        cli(active,'update','check');new_index=(self.publish/'index.json').read_bytes();(self.publish/'index.json').write_bytes(old_index)
         cli(active,'update','check',code=21,contains='stale/equivocating');unchanged()
         self.server.shutdown();self.server.server_close()
         # Offline cache reuse does not attempt any acquisition.
@@ -335,4 +336,29 @@ class Updates:
         if h['args'].trials:
             from trials import exercise
             return exercise(h,active,inactive,last['generation'])
-        return {'result':'PASS','p09':'preserving merge/conflicts/recovery','running':running,'prepared':inactive,'checks':['C plus N retained','local/release deletions','metadata and directory/type conflicts','edited/C/subtree resolutions and stale CAS','structured account fields/member removals','no account bodies in shared state','actual partial-write kill and frozen-input tamper refusal','captured-C and post-cleanup checkpoint recovery','hardlinks','Recipe reproduction bound to new release and selected receipt retained','new baseline only after complete validation','bound finalization/trial inputs (including an existing newer kernel when supplied)','idempotent apply, manifest stage without mkfs, and later Y'],'adopted_original':bool(original_bundle),'numeric_id_collision_checked':h['args'].merge_id_collision,'full_build':False,'vm_boot':False}
+        # Observe a real finalized/committed reverse slot without claiming a VM
+        # boot. Its release sequence changes the cache fingerprint, not trust.
+        def observed_boot(slot,generation,prior):
+            for which in [running,inactive]:
+                if which+'/var' in h['mounts']:run('umount',str(roots[which]/'var'));h['mounts'].remove(which+'/var')
+                if which in h['mounts']:run('umount',str(roots[which]));h['mounts'].remove(which)
+            run('mount','-o','ro',h['dev'][slot],str(roots[slot]));h['mounts'].add(slot)
+            run('mount','--bind',str(roots['state']),str(roots[slot]/'var'));h['mounts'].add(slot+'/var')
+            h['variable']('OneShot',None);h['variable']('Selected',f'{h["fixture_prefix"]}-{slot.lower()}.conf')
+            target=h['running'](slot,generation);target.update({k:v for k,v in prior.items() if k!='RECAB_ROOT'});return target
+        cli(active,'set-next',inactive)
+        promoted=observed_boot(inactive,last['generation'],active);cli(promoted,'commit')
+        check(cli(promoted,'update','status')['highest_index']==2,'status hid the shared floor after activation')
+        self.server=http.server.ThreadingHTTPServer(('127.0.0.1',self.server.server_port),self.server.RequestHandlerClass)
+        threading.Thread(target=self.server.serve_forever,daemon=True).start()
+        try:
+            cli(promoted,'update','check',code=21,contains='stale/equivocating')
+            (self.publish/'index.json').write_bytes(new_index)
+            current=cli(promoted,'update','check');check(current['highest_index']==2 and current['phase']=='up_to_date','new release lost its shared discovery floor')
+            cli(promoted,'rollback')
+            previous=observed_boot(running,h['ga'] if running=='A' else h['gb'],promoted)
+            (self.publish/'index.json').write_bytes(old_index)
+            cli(previous,'update','check',code=21,contains='stale/equivocating')
+            check(len(list((state/'updates/floors').glob('*.json')))==1,'a slot/release change created another trust floor')
+        finally:self.server.shutdown();self.server.server_close();(self.publish/'index.json').write_bytes(new_index)
+        return {'result':'PASS','p09':'preserving merge/conflicts/recovery','running':running,'prepared':inactive,'checks':['C plus N retained','local/release deletions','metadata and directory/type conflicts','edited/C/subtree resolutions and stale CAS','structured account fields/member removals','no account bodies in shared state','actual partial-write kill and frozen-input tamper refusal','captured-C and post-cleanup checkpoint recovery','hardlinks','Recipe reproduction bound to new release and selected receipt retained','new baseline only after complete validation','bound finalization/trial inputs (including an existing newer kernel when supplied)','idempotent apply, manifest stage without mkfs, and later Y','shared anti-rollback floor after real candidate commit and observed rollback','production metadata CLI role/expiry/revocation/root-succession checks'],'adopted_original':bool(original_bundle),'numeric_id_collision_checked':h['args'].merge_id_collision,'full_build':False,'vm_boot':False}

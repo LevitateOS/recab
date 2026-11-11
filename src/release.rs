@@ -107,6 +107,7 @@ fn read_policy(root: &Root) -> Result<Policy> {
     ensure!(bytes.len() <= 65536, "release policy exceeds bound");
     let policy: Policy = serde_json::from_slice(&bytes)?;
     policy.validate()?;
+    ensure!(policy.production.is_none(), "delegated production policy needs the production acquisition/verification reader; legacy unsigned/local trust is not permitted");
     Ok(policy)
 }
 fn copy(root: &Root, artifact: &Artifact, destination: &Path) -> Result<()> {

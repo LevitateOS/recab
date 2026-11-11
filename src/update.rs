@@ -57,6 +57,8 @@ pub struct UpdateStatus {
 struct Record {
     schema_version: u32,
     source: String,
+    #[serde(default)]
+    feed: String,
     highest_index: u64,
     index_hash: String,
     highest_release: Option<(u64, String)>,
@@ -116,36 +118,70 @@ fn root_dir(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-fn record(target: &Target, source: &str) -> Result<Record> {
-    let path = record_path(target);
-    if !path.exists() {
-        return Ok(Record {
-            schema_version: 1,
-            source: source.into(),
-            view: UpdateStatus {
-                phase: "idle".into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+fn floor_path(target: &Target, feed: &str) -> Result<PathBuf> {
+    valid_id(feed)?;
+    Ok(directory(target).join("floors").join(format!("{feed}.json")))
+}
+fn floor(target: &Target, feed: &str) -> Result<format::production::RollbackFloor> {
+    let path = floor_path(target, feed)?;
+    if path.try_exists()? { load(&path, 65536) } else { Ok(Default::default()) }
+}
+fn record(target: &Target, source: &str, identity: &Identity, policy: &Policy) -> Result<Record> {
+    // Delivery/Recipe revisions and the installed release sequence are not a
+    // new authority. A shared floor outlives both slot and cache identities.
+    let feed = if let Some(production) = &policy.production {
+        production.feed_id(identity)?
+    } else {
+        format::digest(&serde_json::to_vec(&(
+            &policy.trust, &identity.distro, &identity.channel,
+            &identity.architecture, identity.init, identity.libc, identity.flavour,
+        ))?)
+    };
+    let mut value = if record_path(target).try_exists()? {
+        let old: Record = load(&record_path(target), 4 * 1024 * 1024)?;
+        ensure!(old.schema_version == 1, "unsupported update record");
+        if old.source == source { old } else { Record::default() }
+    } else { Record::default() };
+    value.schema_version = 1;
+    value.source = source.into();
+    value.feed = feed;
+    if value.view.phase.is_empty() { value.view.phase = "idle".into(); }
+    let floor = floor(target, &value.feed)?;
+    if floor.index_sequence > value.highest_index {
+        value.highest_index = floor.index_sequence;
+        value.index_hash = floor.index_digest;
+    } else if floor.index_sequence == value.highest_index && floor.index_sequence > 0 {
+        ensure!(floor.index_digest == value.index_hash, "stored index floor equivocation");
     }
-    let value: Record = load(&path, 4 * 1024 * 1024)?;
-    ensure!(value.schema_version == 1, "unsupported update record");
-    if value.source != source {
-        return Ok(Record {
-            schema_version: 1,
-            source: source.into(),
-            view: UpdateStatus {
-                phase: "idle".into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+    if let Some((sequence, id)) = floor.release {
+        match &value.highest_release {
+            Some((s, old)) if *s == sequence => ensure!(old == &id, "stored release floor equivocation"),
+            Some((s, _)) if *s > sequence => {},
+            _ => value.highest_release = Some((sequence, id)),
+        }
     }
+    value.view.highest_index = value.highest_index;
     Ok(value)
 }
 fn persist(target: &Target, record: &mut Record) -> Result<()> {
     root_dir(&directory(target))?;
+    let previous = floor(target, &record.feed)?;
+    let mut next = previous.clone();
+    ensure!(record.highest_index >= next.index_sequence && (record.highest_index == 0
+        || record.highest_index != next.index_sequence || record.index_hash == next.index_digest),
+        "index rollback/equivocation refused by shared authority floor");
+    if record.highest_index > 0 {
+        valid_id(&record.index_hash)?;
+        next.index_sequence = record.highest_index;
+        next.index_digest = record.index_hash.clone();
+    }
+    if let Some((sequence, id)) = &record.highest_release { next.release(*sequence, id)?; }
+    if next != previous {
+        let path = floor_path(target, &record.feed)?;
+        root_dir(path.parent().unwrap())?;
+        // Floors precede convenience status: a crash cannot forget acceptance.
+        save(&path, &next)?;
+    }
     record.view.highest_index = record.highest_index;
     save(&record_path(target), record)
 }
@@ -377,7 +413,7 @@ pub(crate) fn cached_summary(target:&Target,id:&str)->Result<ReleaseSummary> {
 pub fn check() -> Result<UpdateStatus> {
     let sys = System::locked("update-check")?;
     let (identity, policy, source, recipe) = configuration(&sys)?;
-    let mut state = record(&sys.target, &source)?;
+    let mut state = record(&sys.target, &source, &identity, &policy)?;
     state.view.phase = "checking".into();
     state.view.last_error = None;
     persist(&sys.target, &mut state)?;
@@ -555,7 +591,7 @@ fn publish_file(
 pub fn download(requested: Option<&str>) -> Result<UpdateStatus> {
     let sys = System::locked("update-download")?;
     let (identity, policy, source, recipe) = configuration(&sys)?;
-    let mut state = record(&sys.target, &source)?;
+    let mut state = record(&sys.target, &source, &identity, &policy)?;
     let id = requested
         .map(str::to_owned)
         .or_else(|| state.view.available.as_ref().map(|a| a.id.clone()))
@@ -680,11 +716,10 @@ fn pending(sys: &System) -> Result<Option<Pending>> {
 }
 pub(crate) fn view(sys: &System) -> Result<UpdateStatus> {
     let mut view = if record_path(&sys.target).exists() {
-        let record: Record = load(&record_path(&sys.target), 4 * 1024 * 1024)?;
-        ensure!(record.schema_version == 1, "unsupported update record");
-        if source_configuration(&sys.target).is_ok_and(|(_, _, source, _)| source == record.source)
-        {
-            record.view
+        let stored: Record = load(&record_path(&sys.target), 4 * 1024 * 1024)?;
+        ensure!(stored.schema_version == 1, "unsupported update record");
+        if let Ok((identity, policy, source, _)) = source_configuration(&sys.target) {
+            record(&sys.target, &source, &identity, &policy)?.view
         } else {
             UpdateStatus {
                 phase: "idle".into(),

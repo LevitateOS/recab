@@ -1071,10 +1071,11 @@ artifacts. Keep key material out of the repository and logs. Local fixture
 success must not be reported as a working production update service.
 
 Current delivery: production remains disabled. The
-[release engineering proposal](RELEASE-ENGINEERING.md) designs a service using
+[approved release engineering design](RELEASE-ENGINEERING.md) specifies a service using
 GitHub Pages metadata and immutable GitHub Release payloads, with signing roles,
-transport, publication, freshness and recovery specified. It awaits Vince's
-explicit design approval before implementation or production provisioning.
+transport, publication, freshness and recovery specified. Vince approved it on
+2026-11-11. Implementation is in progress; production enablement remains pending
+the required validation.
 The service is to be designed and provisioned here, not supplied as unexplained
 external configuration. Neither variant currently supplies an update source or
 distribution trust key; both still declare development sequence 1. The Pages
@@ -1084,6 +1085,32 @@ unapproved production authority, redirect installed systems to a fixture or
 publish unchecked development artifacts.
 Applicable P13 VM runtime evidence is also outstanding. Installed acquisition
 and apply against a real published service have not been verified.
+
+The first implementation introduces explicit delegated production policy and
+version-2 index contracts, signing-role separation, root succession, index
+epochs, bounded transport maps and metadata validity windows. The builder's
+`release authorize` and `release verify-feed` commands consume actual key files
+and staged metadata without builds or network access. Private signing files
+must remain external and inaccessible to group/other users. The current
+installed reader refuses delegated production policy until the new acquisition
+and verification path is integrated; it cannot interpret a root anchor as an
+unsigned/local fallback.
+
+The existing online reader now persists anti-rollback floors in shared state
+under authority/profile identity rather than release sequence, Recipe bytes or
+delivery URL. Native update integration exercises actual candidate commit plus
+observed slot activation/rollback, retaining stale-index refusal across the
+changed source fingerprint. These are real filesystem/producer checks, not VM
+boots or evidence of a deployed production service.
+
+Focused checks passed using existing native release artifacts and disposable
+external keys: root authorization, role separation, revocation, metadata expiry
+and clock errors, audience/transport confinement, dual-signed succession,
+expired authorization renewal, private-file permissions and index epoch binding
+and downgrade refusal. The signed Recipe/Ginux update regression passed with
+systemd A-to-B and OpenRC B-to-A native fixtures, including shared-floor retention
+after commit and observed rollback. Tool compilation and xtask/install-tests
+typechecking passed. No full builds, VM tests or production provisioning ran.
 
 The existing builder publisher now checks signing-key location/authority before
 writing public release objects, refusing keys in the checkout or supplied

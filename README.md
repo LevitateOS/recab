@@ -501,9 +501,12 @@ signature of the exact manifest bytes is mandatory. Trust comes from
 `/usr/lib/recab/update-source.json`, never the incoming release. The current
 variant defaults have no production endpoint/key. Online discovery/acquisition is
 implemented, including baseline-aware merging of the prepared continuation.
-The proposed production hosting, signing and publication design is in
-[RELEASE-ENGINEERING.md](RELEASE-ENGINEERING.md); it awaits approval before
-implementation and service provisioning.
+The approved production hosting, signing and publication design is in
+[RELEASE-ENGINEERING.md](RELEASE-ENGINEERING.md). Its policy, authority/index
+contracts and metadata tools are being implemented; production acquisition and
+enablement remain pending. The existing reader explicitly refuses delegated
+production policy while that path is incomplete. Shared anti-rollback floors
+now survive release/Recipe changes and slot rollback.
 
 Import verifies identity/compatibility, copies and hashes the exact inputs into
 a private read-only set, mounts its actual EROFS image and checks the complete

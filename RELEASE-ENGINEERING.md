@@ -1,8 +1,9 @@
 # P14 release engineering proposal
 
-Status: proposed, awaiting Vince's approval. This document authorizes no
-production configuration, key generation, account changes, publication or builds.
-It replaces the assumption that somebody else must first supply an update service.
+Status: approved by Vince on 2026-11-11; implementation started. Production
+enablement remains pending applicable validation. Full builds and VM tests are
+not authorized. This replaces the assumption that somebody else must first
+supply an update service.
 Scope: native Linux x86_64, LevitateOS and AcornOS, base and desktop systems.
 
 ```mermaid
@@ -212,6 +213,14 @@ longer than 14 days. Reject future issue times beyond a small documented clock
 tolerance. Root-signed operational key authorization lasts at most one year;
 renew it before expiry, with alerts 30 days beforehand.
 
+The root authorization also binds an index epoch. A root-authorized epoch
+increase can recover from a compromised index signer's poisoned sequence
+counter. It resets only index counters; accepted system-release floors and
+signed time remain intact. Routine releases, Recipe changes and root rotations
+do not implicitly change that epoch. Release floors advance only after the
+release-role signature and manifest binding are verified, never from an index
+signer's claim alone.
+
 Store accepted authority/index/release floors under shared recab state, keyed
 by root anchor, distro, channel, audience and full execution profile. They must
 survive A/B boots, system rollback and changes to release sequence or acquisition
@@ -389,12 +398,25 @@ artifacts has been provisioned. Current variant defaults remain development
 sequence 1 without a source/trust key. No full builds or VM runs are authorized
 by this document. Additional CPU architectures remain deferred indefinitely.
 
-## Decision requested
+## Approved scope and current implementation
 
-Approve or amend this architecture: GitHub Pages metadata plus immutable GitHub
+The approved architecture is GitHub Pages metadata plus immutable GitHub
 Release payloads in the existing public repository, `stable` release identity
 with separate candidate/stable discovery audiences, bounded transport parts,
 offline root/release custody with an online index signer, and promotion only
-after actual installed x86_64 validation. Approval would permit implementation
-and service/key provisioning; the existing restriction on full builds and VM
-runs remains until explicitly changed.
+after actual installed x86_64 validation. Implementation and preparatory
+provisioning are authorized; production enablement is pending validation. The
+restriction on full builds and VM tests remains until explicitly changed.
+
+The first implementation includes production policy/delegation/index contracts,
+bounded transport descriptions, signing-role and dual-root verification,
+root-authorized index epochs, and stable shared anti-rollback floors for the
+existing update reader. The builder can authorize public roles and authenticate
+a staged production feed through explicit CLI commands. These commands do not
+fetch/validate payloads or enable the service.
+
+The installed production acquisition/assembly reader, delegation-aware media
+publication, GitHub publishing/refresh workflows, public-origin scenario mode
+and profile selection are still to be implemented. Until they are integrated,
+the legacy reader explicitly refuses a delegated production policy instead of
+falling back to unsigned/local trust. Existing development defaults are retained.
