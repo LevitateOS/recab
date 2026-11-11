@@ -1079,10 +1079,14 @@ the required validation.
 The service is to be designed and provisioned here, not supplied as unexplained
 external configuration. Neither variant currently supplies an update source or
 distribution trust key; both still declare development sequence 1. The Pages
-origin, actual generated keys/delegations, external private-key custody and
-GitHub publication configuration are not yet provisioned. Do not generate an
-unapproved production authority, redirect installed systems to a fixture or
-publish unchecked development artifacts.
+origin, independent role keys/delegations, private working-key files and
+master-restricted GitHub signing/deployment environments are now provisioned.
+Public production policy is staged separately under `release/updates/production/`;
+normal variant defaults remain unchanged. Only public authority/provisioning
+metadata is deployed, without a release index. The release runner and validated
+production artifacts remain pending. Extra offline backup setup is deferred as
+requested; private root/release keys have not been uploaded to GitHub. Do not
+redirect installed systems to a fixture or publish unchecked development artifacts.
 Applicable P13 VM runtime evidence is also outstanding. Installed acquisition
 and apply against a real published service have not been verified.
 

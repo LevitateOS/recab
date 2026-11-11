@@ -30,12 +30,12 @@ Use the existing public `LevitateOS/LevitateOS` GitHub repository:
 - Existing x86_64 build/validation machines produce artifacts through Recipe
   and the distro builder. Publication consumes those explicit artifacts.
 
-Proposed metadata base:
+Provisioned metadata base:
 `https://levitateos.github.io/LevitateOS/updates/`.
-The actual canonical HTTPS Pages URL must be confirmed during provisioning;
-an inherited custom-domain redirect must be resolved before an origin is sealed
-into installations. No custom domain purchase is required. This URL is a proposal,
-not an existing service.
+GitHub Pages reports the canonical HTTPS project URL with no custom domain,
+workflow deployment and HTTPS enforcement. No custom domain purchase is required.
+Only public authority/provisioning metadata is deployed initially; no release
+index or installed production default is enabled by provisioning.
 
 Use `/levitate/stable/x86_64/index.json` and
 `/acorn/stable/x86_64/index.json` below that base. Each index selects one current
@@ -188,9 +188,11 @@ Keep old transition documents reachable for machines that skipped releases.
 Generate production keys only after design approval. Working private files live
 outside the checkout and build/publication trees, for example under
 `~/.local/share/levitateos/release-keys/<distro>/`, owned by the release operator
-with directory mode 0700 and file mode 0600. Keep encrypted offline backups of
-root/release keys in two independent locations. Backup verification is an actual
-restore/signature-verification exercise, not an assumption.
+with directory mode 0700 and file mode 0600. The provisioning scope keeps these
+working files private and sends only index-role keys to GitHub. Additional offline
+backup setup was deferred by Vince during provisioning; it is an operational
+follow-up, not an extra approval or provisioning gate. Do not claim an offline
+backup exists until one is actually made and checked.
 
 Transfer the index key into the protected GitHub environment through stdin/API
 secret handling. On a runner, materialize it only in a private temporary memory
@@ -397,6 +399,16 @@ GitHub secret/environment configuration or matching validated production
 artifacts has been provisioned. Current variant defaults remain development
 sequence 1 without a source/trust key. No full builds or VM runs are authorized
 by this document. Additional CPU architectures remain deferred indefinitely.
+
+Provisioning now configures Pages, immutable releases, master-only signing and
+deployment environments, independent per-distro role keys and public delegations.
+Only index-role keys enter the protected GitHub environment; private working keys
+stay outside the repository. Staged production policy lives under
+`release/updates/production/`, while ordinary variant defaults stay development-only.
+Metadata-only deployment has its own provisioning switch and cannot enable
+publication, refresh, monitoring or stable promotion. Release-runner registration
+and installed public-origin evidence remain pending. Extra backup machinery is
+deferred as requested.
 
 ## Approved scope and current implementation
 
