@@ -40,7 +40,7 @@ def exercise(h,active):
     (bundle/'boot').mkdir();shutil.copyfile(h['KERNEL'],bundle/'boot/vmlinuz');shutil.copyfile(h['initrd'],bundle/'boot/initramfs-installed.img')
     driver=base/'release-input-check'
     compiler=os.environ.get('RECAB_TEST_RUSTC','rustc')
-    try:run(compiler,'--edition','2024',str(repo/'tools/recab/tests/release_input.rs'),'--extern','recab='+str(repo/'target/debug/librecab.rlib'),'--extern','distro_builder='+str(repo/'target/debug/libdistro_builder.rlib'),'--extern','levitate_recipe='+str(repo/'target/debug/liblevitate_recipe.rlib'),'-L','dependency='+str(repo/'target/debug/deps'),'-o',str(driver))
+    try:run(compiler,'--edition','2024',str(repo/'tools/recab/tests/fixtures/release_input.rs'),'--extern','recab='+str(repo/'target/debug/librecab.rlib'),'--extern','distro_builder='+str(repo/'target/debug/libdistro_builder.rlib'),'--extern','levitate_recipe='+str(repo/'target/debug/liblevitate_recipe.rlib'),'-L','dependency='+str(repo/'target/debug/deps'),'-o',str(driver))
     except subprocess.CalledProcessError as error:raise RuntimeError(error.stderr.decode()) from error
     def build(repo_root=repo,key=None):
         run(str(driver),'--pack',str(source),str(bundle/'filesystem.erofs'))
