@@ -284,8 +284,10 @@ pub(crate) fn produce(
     recipe: &Path,
 ) -> Result<serde_json::Value> {
     let dir = sys.target.state_dir.join("recipe").join(scope);
-    fs::create_dir_all(&dir)?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    fs::create_dir_all(&dir)
+        .and_then(|()| fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)))
+        .with_context(|| format!("preparing Recipe work directory '{}'", dir.display()))
+        .map_err(|error| crate::error::or_class(error, ErrorClass::StateOrDetection))?;
     for arg in &request.recipe_args {
         if [
             "--state-dir",

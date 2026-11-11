@@ -607,6 +607,10 @@ references are in `.artifacts/out/<distro>/scenarios/<scenario>/<run>/run-manife
 The current `ab-update` scenario exercises matching initial A/B systems, X plus
 a signed downloaded release, conflict resolution, failed and healthy trials in
 both directions, Y, repeated incremental continuation, discard and rollback.
+It also checks independent Recipe profiles, active/prepared package visibility,
+metadata-only owner/mode/ACL/capability updates and removals, shared data, and
+unchanged boot selection during acquisition. Each actual boot keeps its serial
+log beside `ab-update.json`.
 It requires `--update-fixture /absolute/path/fixture.iso` and an existing install
 whose matching public update policy was personalized before sealing. See
 [`install-tests`](../../testing/install-tests/README.md) for explicit fixture
@@ -633,10 +637,16 @@ sudo env GINUX_BIN=/absolute/path/ginux python3 tools/recab/tests/finalization.p
 
 Use `--init openrc` for both recipe export and the native check to exercise its
 service publication. This mode uses disposable GPT/ext4/vfat partitions and real
-Recipe/Ginux producers. It checks metadata/path fidelity, actual copy
-interruption and recovery, space refusal, lock serialization, stale revisions,
-independent Recipe profiles, and repeated synchronization. Boot identities are
-supplied observations in this native check, not VM boots.
+Recipe/Ginux producers. It requires `strace` for a SIGSTOP at the actual `syncfs`
+boundary, followed by a process kill and recovery. Real read-only mounts fail
+new initramfs payload installation, and artifact metadata/entry publication after
+preflight. Metadata and entry faults run in both directions. It also checks metadata-only updates/removals without replacing the data inode,
+root byte/inode, producer cache and ESP exhaustion, durable invalidation and
+copy interruption/recovery, lock serialization, stale revisions, independent
+Recipe profiles, and repeated synchronization. A full Recipe work directory
+returns a contextual state refusal; no candidate becomes selectable.
+Boot identities are supplied observations in this native check, not VM boots or
+physical power-loss experiments.
 
 On x86_64, both init variants passed: Y wrote about 1.05 MB of candidate payload
 and 1.10 MB on the isolated root block device for a one-byte edit to a 32 MiB

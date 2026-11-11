@@ -991,26 +991,43 @@ architectures are deferred indefinitely and are not P13 requirements or
 completion blockers. REQ-DESIGN-030 follows this scope.
 
 Implementation status: the named scenario and focused install/runtime checks
-now exercise the new lifecycle. `--update-fixture` selects an existing signed
-release fixture and participates in run records/cache fingerprints. The packer
-uses the release owner's manifest/index/signature contract and an explicitly
+now implement the x86_64 lifecycle checks. `--update-fixture` selects an
+existing signed release fixture and participates in run records/cache
+fingerprints. The packer uses the release owner's manifest/index/signature
+contract and an explicitly
 built static guest HTTP helper. Install personalizes public policy and local
 fidelity probes before sealing. The scenario checks first-use B, preserves X
 through interrupted download and conflict resolution, exercises failed and
 healthy trials in both directions, then Y, repeated continuation, discard and
 rollback. It records actual generations, boots, application counters and root
-block sectors. Runtime now executes a real output-only Recipe/Ginux worker.
+block sectors. Every boot, including an unattended failed trial, has its own
+retained serial transcript in the run directory. An independent Recipe profile
+and shared user data are checked across first-use, trials, continuation and
+rollback. Actual Recipe metadata-only changes update numeric owners/modes,
+ACLs, capabilities and user xattrs without changing file content; a later
+revision removes those attributes. Package reproduction explicitly covers both
+probe selections. Acquisition checks boot selection as well as the preparation,
+and prepared package visibility is separate from the active selection.
+Runtime executes a real output-only Recipe/Ginux worker.
 
 Focused x86_64 native evidence passed with both systemd and OpenRC using real
 GPT/ext4/vfat and Recipe/Ginux. The checks cover 32 MiB publication, one-range
 Y edits, repeated synchronization, zero unchanged payload, root protection,
 owner/mode/ACL/xattr/capability fidelity, hardlinked files and symlinks, sparse
-and non-UTF-8 paths, deletions, unchanged filesystem UUIDs, actual insufficient
-space, kill after an observed payload write and captured-plan recovery, actual
+and non-UTF-8 paths, deletions, unchanged filesystem UUIDs, actual root-byte/inode,
+producer-cache and ESP capacity exhaustion, durable invalidation interruption,
+kill after an observed payload write and captured-plan recovery, actual syncfs
+interruption, a new initramfs object write failure, and real read-only artifact
+metadata/entry publication failures in both directions. They also cover actual
 lock serialization, stale revision refusal, prepared failure service removal,
-shared data and an independent Recipe profile. Native boot identities remain
-observations, not exercised firmware/init boots. The origin helper also passed
-an actual TCP truncated-transfer/retry and unsafe path/symlink refusal check.
+shared data, independent profiles and active/prepared Recipe selections.
+Metadata-only changes preserve the existing data inode; their later removal
+survives reverse synchronization.
+A full Recipe work filesystem now returns the contextual state refusal (21),
+with the candidate unselectable and active root unchanged. Native boot identities
+remain observations, not exercised firmware/init boots. The origin helper also
+passed an actual TCP truncated-transfer/retry and unsafe path/symlink refusal
+check.
 Fixture packing passed against a current signed scratch release, including ISO
 extraction, exact manifest/rootfs bytes, index signature verification and
 private-key exclusion. An older state-2.4 release was correctly refused.
@@ -1022,19 +1039,24 @@ unconfined fallback. Eight real re-stages passed under the reproducing rename
 race, and the signed discovery/download/merge regression passed with re-staging
 under concurrent renames. The original cause is resolved.
 
-Measured Y payload was 1,049,847 bytes (systemd) / 1,049,854 bytes (OpenRC),
-with root block writes about 1.10 MB, rather than rewriting the 32 MiB file.
+The expanded native lifecycle passed for both inits on x86_64.
+Measured Y payload was 1,051,060 bytes (systemd) / 1,051,058 bytes (OpenRC),
+with root block writes 1,105,920 / 1,104,896 bytes, rather than rewriting the
+32 MiB file. The reports identify actual input binaries, kernel, runtime and
+probe hashes and retain conservative accounting after interrupted finalization.
 Unchanged continuation wrote zero payload. Full native invocation process
 writes were about 204 MB, including about 170 MB of producer writes and 33.6 MB
 of projected content. Those counters overlap; do not add them. Scratch TMPDIR
 was disk-backed. Total SSD write reduction remains unproven: staging/export
 traffic still needs attention and filesystem/controller effects are separate.
 
-P13 is **not complete**. No new VM scenario or full system build was run.
-The existing pre-fixture install artifacts cannot prove this flow. The fault
-matrix below still requires applicable boot and boundary observations.
-No additional CPU architecture port is required. Production-update validation
-remains separate from local fixture checks.
+P13's x86_64 implementation is complete; end-to-end runtime acceptance is
+pending. No new VM scenario or full system build was run. Existing pre-fixture
+install artifacts cannot prove this flow. The named scenarios consume explicit
+current artifacts when a build/run is requested; native process/filesystem
+faults do not establish recovery from a physical power cut or hardware hang.
+Additional CPU architectures remain deferred indefinitely. Production-update
+validation remains separate from local fixture checks.
 
 ### P14 Enable production online updates
 
