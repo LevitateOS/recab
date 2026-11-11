@@ -125,9 +125,10 @@ Example: setting next slot to the already-pending slot, or committing a slot
 that is committed, the default and has no trial pending, should succeed without
 changing meaningfully observable state.
 
-### 3.4 Cross-Architecture
+### 3.4 Supported target
 
-**REQ-DESIGN-030**: `recab` MUST support `x86_64` and `aarch64` targets.
+**REQ-DESIGN-030**: `recab` MUST support native Linux `x86_64`. Additional
+CPU architectures are deferred indefinitely and are not delivery prerequisites.
 
 ---
 

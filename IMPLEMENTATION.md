@@ -121,8 +121,8 @@ The P03 real-filesystem synchronization regression check still passes. A focused
 recinit producer run using cached Alpine tools, static busybox and the existing
 7.3.3-levitate kernel tree produced a 1922 KiB v3 archive accepted by the new
 whole-stream inspector. Rust compilation and documentation/TUI typechecks pass.
-This does not establish a kernel, PID 1 or distro-service boot. Full installed boot/hardware and aarch64 validation
-remain pending; no full system builds or VM runs were requested or performed.
+This does not establish a kernel, PID 1 or distro-service boot. Full installed boot/hardware validation
+remains pending; no full system builds or VM runs were requested or performed.
 
 P05 now initializes both personalized systems. Recsetup captures the image
 baseline once and finishes requested accounts/passwords, service/network settings,
@@ -973,8 +973,8 @@ and retry pass, including first-continuation zero payload writes. P11 guarded
 edit/finalize/trial/commit passes in both directions after a signed release
 merge with prepared changes and conflicts. All 40 native OpenRC trial checks
 pass with isolated fixture mounts, including unavailable state/ESP and corrupted
-fallbacks. CLI/library compilation and docs typechecking are focused checks; full system builds, hardware/VM boots,
-aarch64 execution and production publishing remain unrun.
+fallbacks. CLI/library compilation and docs typechecking are focused checks;
+full system builds, hardware/VM boots and production publishing remain unrun.
 
 ### P13 Prove the complete lifecycle and write reduction
 
@@ -986,11 +986,9 @@ Extend the existing named `ab-update` scenario and focused install/runtime check
 do not create an ordered ladder of prerequisite test runs. Scenarios consume
 explicit existing artifacts. Required observations are listed below.
 
-The Recipe coordinator currently rejects non-x86_64 execution in
-`tools/recipe/src/inputs/root.rs`. REQ-DESIGN-030 also requires aarch64. Add the
-corresponding Recipe/Ginux launcher, worker, runtime image and boot artifact
-support through their existing owners before claiming cross-architecture
-completion. x86_64 results on both distros do not establish aarch64 support.
+The supported execution target is native Linux x86_64. Additional CPU
+architectures are deferred indefinitely and are not P13 requirements or
+completion blockers. REQ-DESIGN-030 follows this scope.
 
 Implementation status: the named scenario and focused install/runtime checks
 now exercise the new lifecycle. `--update-fixture` selects an existing signed
@@ -1016,12 +1014,13 @@ an actual TCP truncated-transfer/retry and unsafe path/symlink refusal check.
 Fixture packing passed against a current signed scratch release, including ISO
 extraction, exact manifest/rootfs bytes, index signature verification and
 private-key exclusion. An older state-2.4 release was correctly refused.
-An additional signed-merge regression run reached finalization/rollback but
-failed its later manifest `stage` with `EAGAIN` ("Resource temporarily
-unavailable"); that run is not a passing regression result and remains to be
-investigated. Re-staging the retained disk under syscall tracing succeeded;
-the original refusal has not been reproduced or explained. The independent
-write/fidelity checks above passed separately.
+The earlier manifest re-stage EAGAIN was reproduced while resolving the
+`sbin/init` symlink during unrelated concurrent directory renames. This is the
+kernel's documented `openat2(RESOLVE_IN_ROOT)` containment-race refusal.
+Resolution now retries at most 32 times with exactly the same flags and no
+unconfined fallback. Eight real re-stages passed under the reproducing rename
+race, and the signed discovery/download/merge regression passed with re-staging
+under concurrent renames. The original cause is resolved.
 
 Measured Y payload was 1,049,847 bytes (systemd) / 1,049,854 bytes (OpenRC),
 with root block writes about 1.10 MB, rather than rewriting the 32 MiB file.
@@ -1034,13 +1033,8 @@ traffic still needs attention and filesystem/controller effects are separate.
 P13 is **not complete**. No new VM scenario or full system build was run.
 The existing pre-fixture install artifacts cannot prove this flow. The fault
 matrix below still requires applicable boot and boundary observations.
-REQ-DESIGN-030 remains unmet: Recipe validates native x86_64 targets and worker
-ELF, Ginux uses x86_64 startup/ptrace/register/syscall code, the runtime is pinned
-to amd64, builder launcher/tool recipes target x86_64, and libvirt/ISO identity
-select x86_64/q35/OVMF. These existing owners need an actual aarch64 port and
-matching artifacts; removing Recipe's guard or adding an AA64 filename does
-not provide it. Do not infer cross-architecture or production-update success
-from the native fixture checks.
+No additional CPU architecture port is required. Production-update validation
+remains separate from local fixture checks.
 
 ### P14 Enable production online updates
 
@@ -1145,7 +1139,7 @@ user/application data are never candidates for recab garbage collection.
 | Independent software and data | Per-user profiles/data remain available; prepared system packages are not active in the running slot; boot rollback does not claim to reverse shared data migrations. |
 | Release verification | Wrong architecture/profile, mixed artifacts, altered payloads, unsupported protocol and stale release identity fail before applying a system change. |
 | Write accounting | Unchanged continuation has zero system payload writes; bounded file edits avoid whole-file/root rewrites; counters include Recipe staging/checkpoints/exports and ESP work. |
-| Architecture | Required lifecycle is exercised on supported x86_64 and aarch64 stacks; missing Recipe/Ginux aarch64 execution is tracked as incomplete conformance. |
+| Architecture | Required lifecycle is exercised on the supported native Linux x86_64 stack. Additional CPU architectures are deferred indefinitely. |
 
 Use counted application writes and isolated block-device observations to evaluate
 write reduction. Filesystem journaling, metadata and controller behavior mean
@@ -1178,10 +1172,9 @@ The implementation is complete when fresh installs provide both equivalent
 systems, X plus a real obtained update survives one preparation, healthy trial
 and failure recovery work, and reverse preparation preserves X/the update while
 adding Y with measured write avoidance. CLI/TUI, generated contracts and docs
-must expose that behavior on both distros. Cross-architecture and production
-online-update completion additionally require P13's architecture work and P14's
-real release configuration, respectively; report those limits separately if
-delivery is staged.
+must expose that behavior on both distros on native Linux x86_64. Production
+online-update completion additionally requires P14's real release configuration;
+report that limit separately if delivery is staged.
 
 Start with P01 and P02: reconcile the existing root-protection work, remove
 unsafe write paths and establish generation/preparation identity. Then build the

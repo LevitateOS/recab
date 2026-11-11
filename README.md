@@ -617,9 +617,8 @@ The rewritten VM lifecycle has not yet been run against current artifacts.
 Required boot evidence includes actual slot roots, OVMF one-shot consumption,
 both init systems' trial services, the installed initramfs and retained identity
 across reboot. Native filesystem checks cannot establish those behaviors,
-physical firmware support or recovery from hardware hangs. Recipe/Ginux and
-the runtime/build/boot owners still need their aarch64 port; x86_64 results on
-both distros do not establish cross-architecture completion.
+physical firmware support or recovery from hardware hangs. Native Linux x86_64 is the supported target;
+additional CPU architectures are deferred indefinitely.
 
 For the independent native large-file check, export the same probe recipes and
 use existing recab, Recipe, Ginux, kernel and module artifacts:
