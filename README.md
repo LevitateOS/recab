@@ -919,3 +919,13 @@ The fixture covers deletions, metadata/type conflicts, edited resolution, accoun
 fields/member removal, Recipe reproduction, actual partial-write kill, frozen-input
 tampering, recovery, later Y and bound finalization. No full distro/kernel/ISO
 build or VM boot is implied.
+
+
+Installed-target release verification now places its temporary frozen copy in
+shared recab release storage, alongside the import verifier's scratch copies.
+Immutable systems mount `/tmp` as tmpfs, so desktop releases must not depend on
+the entire compressed image fitting in RAM. These temporary files retain the
+same full validation, read-only lifetime and cleanup; they do not create a
+second permanent release cache. Production public-origin scenario support and
+base/desktop artifact selectors are implemented in install-tests, with actual
+VM/public-service validation and production enablement still pending.

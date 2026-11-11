@@ -431,7 +431,9 @@ legacy trust fallback can admit production content. The old v1 publisher refuses
 production policies. Transport publication and GitHub publishing/refresh/monitoring
 workflows are now implemented; their operator guide is
 [release/updates/README.md](../../release/updates/README.md). Public-origin
-scenario mode and profile selection remain pending. Existing
+scenario mode and explicit base/desktop artifact selection are implemented in
+the existing install/runtime and ab-update owners, but VM/public-service
+validation remains unrun. Existing
 development defaults remain without a production origin or trust root. No
 public production service, installed boot trial or production readiness is
 claimed by native fixtures.

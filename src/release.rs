@@ -453,6 +453,13 @@ pub(crate) fn for_target(
     allow_flavour: bool,
 ) -> Result<VerifiedRelease> {
     let (identity, policy) = installed(target)?;
+    crate::system::require_root("verify release")?;
+    // Immutable installations mount /tmp as tmpfs. Freeze large base/desktop
+    // releases in the shared release area, using the same lifetime and verifier
+    // as import, rather than requiring the image to fit in guest RAM.
+    let parent = target.state_dir.join("releases");
+    fs::create_dir_all(&parent)?;
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
     verify_in(
         manifest,
         Verification {
@@ -460,7 +467,7 @@ pub(crate) fn for_target(
             trusted_local,
             expected: Some(&identity),
             allow_flavour,
-            cache_parent: None,
+            cache_parent: Some(&parent),
             produced: None,
             delegated: policy.production.as_ref().map(|_| (Some(target), &policy)),
         },
