@@ -407,9 +407,14 @@ Only index-role keys enter the protected GitHub environment; private working key
 stay outside the repository. Staged production policy lives under
 `release/updates/production/`, while ordinary variant defaults stay development-only.
 Metadata-only deployment has its own provisioning switch and cannot enable
-publication, refresh, monitoring or stable promotion. Release-runner registration
-and installed public-origin evidence remain pending. Extra backup machinery is
-deferred as requested.
+publication, refresh, monitoring or stable promotion. The x86_64 release runner
+is registered and uses a private, non-identity UID/GID range with no host signing
+homes mounted. Recipe owns its pinned agent acquisition; Ginux still owns Recipe
+execution. The agent runs through its vendor service wrapper with graceful
+shutdown. The registered-runner metadata check passed through actual Recipe/Ginux,
+and normal service restart was checked without a stale session or timeout.
+Installed public-origin lifecycle evidence remains pending. Extra backup
+machinery is deferred as requested.
 
 ## Approved scope and current implementation
 

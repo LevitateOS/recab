@@ -1085,8 +1085,11 @@ Public production policy is staged separately under `release/updates/production/
 normal variant defaults remain unchanged. Only public authority/provisioning
 metadata has been deployed, without a release index. Recipe/Ginux verified the
 exact bytes of all nine public files over the canonical HTTPS origin. The
-release runner and validated
-production artifacts remain pending. Extra offline backup setup is deferred as
+release runner is now registered in a separate filesystem/PID/user namespace,
+with namespace root mapped to an unprivileged host UID and signing homes absent.
+Recipe/Ginux public acquisition passed inside that boundary, including the actual
+registered GitHub runner-check job. Validated production artifacts and installed
+lifecycle evidence remain pending. Extra offline backup setup is deferred as
 requested; private root/release keys have not been uploaded to GitHub. Do not
 redirect installed systems to a fixture or publish unchecked development artifacts.
 Applicable P13 VM runtime evidence is also outstanding. Installed acquisition
@@ -1136,10 +1139,11 @@ no production endpoint, installed production apply, full build or VM run was
 performed.
 
 The production acquisition, publishing/refresh/monitoring workflows and
-public-origin install/ab-update mode are implemented. The remaining rollout work
-is provisioning the canonical service/public authority and protected signing
-environment, producing compatible baseline/new release artifacts, and running
-the applicable actual public-origin lifecycle validation before enablement.
+public-origin install/ab-update mode are implemented. The canonical public trust
+service, protected signing environment and isolated x86_64 release runner are
+provisioned. Remaining rollout work is producing compatible baseline/new release
+artifacts with the staged production policy and running the applicable actual
+public-origin lifecycle validation before enablement.
 No local/native result substitutes for that evidence. Installed defaults remain
 development-only.
 
