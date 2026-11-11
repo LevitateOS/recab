@@ -227,7 +227,7 @@ fn materialized(source: &Root, bytes: &[u8], slot: Slot, uuid: &str) -> Result<V
         return Err(refuse("slot identity file exceeds 1 MiB"));
     }
     Ok(if bytes == b"etc/fstab" {
-        crate::carry::fstab_for_slot(&text, uuid, "ext4")?.into_bytes()
+        crate::fstab::for_slot(&text, uuid, "ext4")?.into_bytes()
     } else {
         let fields = text.split_whitespace().collect::<Vec<_>>();
         if fields.len() != 2 {

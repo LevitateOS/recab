@@ -362,15 +362,6 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
             None => None,
         };
         let generation_ready = match sys.state.require_ready(slot).and_then(|generation| {
-            if sys
-                .state
-                .slot(slot)
-                .is_some_and(|r| r.readiness == Readiness::Ready && r.seal.is_none())
-            {
-                return Err(crate::error::refuse(
-                    "candidate must be finalized before boot selection",
-                ));
-            }
             if let Some(seal) = sys.state.slot(slot).and_then(|r| r.seal.as_ref()) {
                 crate::finalize::verify_entry(&sys, slot, generation, seal)?;
             }
@@ -426,7 +417,11 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
         action_view(Action::Rollback, Request::Rollback, rollback_to, sel, state),
         action_view(
             Action::Stage,
-            Request::Stage { id: "0".repeat(64) },
+            Request::Prepare {
+                id: "0".repeat(64),
+                expected_id: None,
+                expected_revision: None,
+            },
             inactive,
             sel,
             state,

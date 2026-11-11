@@ -48,11 +48,7 @@ pub fn finalize(request: &FinalizeRequest) -> Result<Finalization> {
     crate::immutable::require_readonly(&sys.target)?;
     let active = sys.boot.selection.active;
     let source = sys.state.require_ready(active)?;
-    source.verify_root(
-        &sys.target.root,
-        active,
-        &sys.backend.slot_partuuid(&sys.boot, active)?,
-    )?;
+    crate::finalize::verify_slot(&sys, active)?;
     sys.backend.verify_generation(&sys.boot, active, source)?;
     let transition = plan(
         Request::Finalize {
@@ -269,9 +265,6 @@ pub(crate) fn check_record(root: &Path, slot: Slot, uuid: &str, peer: &str, g: &
 pub(crate) fn verify_slot(sys: &System, slot: Slot) -> Result<()> {
     let g = sys.state.require_ready(slot)?;
     let record = sys.state.slot(slot).unwrap();
-    if record.seal.is_none() && record.readiness != Readiness::Committed {
-        return Err(refuse("candidate must be finalized before boot selection"));
-    }
     let uuid = sys.backend.slot_partuuid(&sys.boot, slot)?;
     let peer = sys.backend.slot_partuuid(&sys.boot, slot.other())?;
     if slot == sys.boot.selection.active {

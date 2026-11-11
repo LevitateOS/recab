@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "A/B slot + boot-selection manager for LevitateOS-style immutable systems"
+description = "Immutable A/B system updates and incremental continuation through Recipe"
 
 [dependencies]
 url = "2"
@@ -31,6 +31,3 @@ tool-contract = { path = "../recstrap/tool-contract", optional = true }
 # Derive the JSON Schemas and TypeScript declarations of the JSON output
 # (`cargo xtask gen`); the shipped tool does not need them.
 contracts = ["dep:schemars", "dep:ts-rs", "dep:tool-contract", "distro-profile/contracts"]
-
-[dev-dependencies]
-tempfile = "3"

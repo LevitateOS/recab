@@ -1,19 +1,12 @@
-//! recab - A/B slot management for systemd-boot systems.
+//! recab owns symmetric immutable A/B continuation and system updates.
 //!
-//! - set up the boot layout at install time, A/B or one root (`init`)
-//! - which slot booted, which boots next (`status`)
-//! - write a prebuilt system into the inactive slot (`stage`), from files or
-//!   from a release medium
-//! - boot the other slot once (`set_next`)
-//! - keep the running slot (`commit`), or go back (`rollback`)
-//! - on each boot, commit a healthy trial or reboot out of a failed one (`trial`)
-//!
-//! `state` holds the slot state machine without I/O; `systemd_boot` owns the
-//! installed ESP (writes and reads entries, loader.conf and the boot
-//! selection); `store` keeps recab's state and audit log.
+//! Installation publishes two equivalent personalized systems. Preparation
+//! synchronizes the inactive filesystem incrementally; Recipe changes and
+//! verified releases share that preparation. Finalization seals the candidate,
+//! then a generation-bound trial commits it or returns to the protected system.
+//! Boot selection, startup health and recovery remain part of this lifecycle.
 
 mod candidate;
-mod carry;
 mod change;
 mod compare;
 #[cfg(feature = "contracts")]
@@ -24,6 +17,7 @@ mod entry;
 mod error;
 mod filesystem;
 mod finalize;
+mod fstab;
 mod generation;
 mod immutable;
 mod init;
@@ -144,20 +138,15 @@ pub fn health(timeout: Duration) -> Result<Health> {
     init_system::health(&Target::running()?, timeout)
 }
 
-/// Record the baseline of the image tree `root`: what it ships at the paths
-/// its carried list names.
+/// Record the complete release inventory and account baseline before the
+/// extracted image is personalized. Existing baselines survive setup retries.
 pub fn baseline(root: &Path) -> Result<()> {
-    merge::capture_baseline(root)?;
-    if carry::Baseline::read(root)?.is_some() {
-        return Ok(());
-    }
-    let list = carry::read_list(root)?;
-    carry::Baseline::write(root, &list)
+    merge::capture_baseline(root)
 }
 
 /// Write recab's package contents for `init` into the tree `root` (what
-/// Recipe packages): the trial service running `bin`, enabled, and the
-/// carried-state list.
+/// Recipe packages): the enabled trial service, immutable runtime policy and
+/// compatibility record bound to the executable.
 pub fn install_unit(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
     package::write(root, init, bin)
 }

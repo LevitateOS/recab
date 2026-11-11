@@ -43,8 +43,10 @@ trial. Requirements: [REQUIREMENTS.md](REQUIREMENTS.md).
 
 ## Implementation status
 
-The current implementation has release-image staging, trial boot, commit and
-rollback. It does **not yet implement the full lifecycle above**:
+The CLI, TUI and existing desktop interfaces implement the lifecycle above,
+including symmetric preparation, Recipe changes, release merging and trial
+recovery. Focused native filesystem checks establish the behavior described
+below; full installed boots and production deployment remain unverified:
 
 - `init` now populates B from the personalized A, verifies normalized equivalence,
   seals both roots and publishes both generation-bound entries. A starts
@@ -67,14 +69,15 @@ rollback. It does **not yet implement the full lifecycle above**:
   to recab. Package selection and `/usr/lib/recipe/profile` belong to each slot;
   independent per-user profiles and output-only builders retain their own routes.
 - Installed immutable boot protects the active root device and keeps ordinary
-  `/etc` on that read-only system. Legacy writable configuration overlays require
-  explicit adoption; they are never silently hidden. The package/finalizer now
+  `/etc` on that read-only system. Nonempty legacy writable configuration overlays are refused; this release
+  provides no adoption command. The package/finalizer now
   installs explicit runtime policy for mount tables, DNS, systemd first-boot
   writers and OpenRC clock updates. Actual installed boots on both distributions
   remain unverified with these changes.
 
-These are implementation gaps in recab's update responsibility, not exclusions
-from its purpose. The commands below describe the existing implementation.
+Remaining work is full lifecycle boot validation on the supported architectures
+and distribution stacks, plus configuring and publishing a production update
+origin. These limits do not change recab's responsibility for system updates.
 
 ## Current commands
 
@@ -94,7 +97,7 @@ from its purpose. The commands below describe the existing implementation.
 - `recab update cancel --preparation <id> --revision <n>`
 - `recab release import <release.json> [--trusted-local] [--root <dir>]`
 - `recab stage --manifest <release.json> [--trusted-local]`
-- `recab stage --from-media <device|dir> [--trusted-local]`, or `recab stage --rootfs <image.erofs|partition> --kernel <vmlinuz> --initrd <img> [--change-flavour]`
+- `recab stage --from-media <device|dir> [--trusted-local]`, or `recab stage --rootfs <image.erofs> --kernel <vmlinuz> --initrd <img> [--change-flavour]`
 - `recab set-next <A|B>`
 - `recab commit`
 - `recab rollback`
@@ -160,9 +163,10 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   updated kernel/initramfs; a changed kernel/module set requires the release
   producer's `usr/lib/recab/kernel.json` binding. The candidate must include a
   recab binary matching its producer's `usr/lib/recab/runtime.json`, supporting
-  state 2.4 and immutable boot protocol v3. The retained fallback must have a
-  compatible reader and installed boot protocol too; legacy adoption remains
-  explicit work, rather than stranding rollback on an older writer.
+  state 2.5 and immutable boot protocol v3. The retained fallback must have a
+  compatible reader and installed boot protocol too. This release targets fresh
+  paired installations; legacy adoption and a two-cycle runtime bootstrap are
+  not implemented. Use compatible recovery media or a fresh installation.
 
   Durable intent and absent entry precede writable access. Runtime policy,
   inventory and root records are flushed; boot objects and manifest are made
@@ -328,13 +332,17 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   `prepare` is not audited, so its entry says only that it began or stopped.
   `records`, `unreadable`, `truncated` and `log_found` say how complete the
   reading was. Point it at another state folder with `RECAB_STATE_DIR`.
-- `baseline --root <dir>` records the extracted image's carried paths before
-  personalization. It is a configuration baseline, not a whole-system delta.
+- `baseline --root <dir>` records the complete original release inventory and
+  account fields before personalization, in `usr/lib/recab/release-baseline.json`.
+  Setup retries retain it; generation-marked systems cannot invent an original
+  baseline. Missing release policy leaves no baseline; a later release merge
+  reports that constraint and requires the verified original release.
 - `install-unit --init <init>` writes recab's package contents into a tree:
   the trial service, enabled (`recab-trial.service` in `sysinit.target`, or
   `/etc/init.d/recab-trial` in the boot runlevel, which runs `recab trial` in
-  the background, logging to the kernel log, and stops it at shutdown), and the
-  carried-state list. The install-tools recipe packages it so, so every image
+  the background, logging to the kernel log, and stops it at shutdown), immutable
+  runtime policy and an executable-bound compatibility record. No carried-path
+  list or legacy configuration baseline is produced. Every image with recab
   runs the trial service. The service waits for startup health before deciding
   whether this boot is a trial.
 
@@ -376,14 +384,17 @@ The A/B layout mounts its state partition at `/var`, so both slots share recab's
 - Audit log (JSON lines): `/var/lib/recab/audit.log`
 - Lock: `/run/lock/recab.lock`, held by every run that changes anything
 
-Mutations now write state format `{"major":2,"minor":4}`. The reader also
-accepts 2.0/2.1/2.2/2.3 and promotes them on mutation. Earlier writers refuse 2.4, so they
-cannot discard generation-bound trial recovery restrictions. Both slot runtimes need a compatible version before deployment. The structured major
-version intentionally cannot be read by the old numeric-schema writer, which
-would otherwise ignore new safety restrictions. Numeric schema 1 is inspectable
-but read-only; adoption with compatible runtimes is still required. Unsupported
-versions and inconsistent generation records refuse mutation with a recovery
-reason. Status stays bounded and carries IDs and summaries, not system file bodies.
+Fresh installs write state format `{"major":2,"minor":5}` and immutable boot
+protocol 3 in both personalized systems. Mutations require a completed paired
+installation record and matching boot seals for every ready/committed generation.
+Numeric schema 1 and structured 2.0–2.4 remain inspectable but read-only; they
+are never promoted by a command. Unsupported versions and inconsistent records
+refuse mutation with a recovery reason. There is no legacy adoption/bootstrap
+command: use compatible recovery media or a fresh installation. Do not edit the
+state version, patch the running immutable root, or replace the only known-good
+fallback to force an upgrade. Older structured writers refuse minor 5. The
+structured major cannot be parsed by the old numeric reader. Both bootable runtimes must enforce the state and boot protocol.
+Status stays bounded and carries IDs and summaries, not system file bodies.
 
 Partition mappings survive boot-entry removal. Each complete slot records its
 generation and kernel/initramfs digests; the boot command line identifies the
@@ -444,35 +455,30 @@ Every operation that writes (`init`, `stage`, `set-next`, `commit`, `rollback`,
 | `src/sync.rs` | Delta operation planning, capacity, range writes, sparse files, links and metadata |
 | `src/slot_mount.rs` | Checked inactive ext4 mounts and device protection restoration |
 | `src/init_system.rs` | The init adapter: startup and failures (`health`), reboot, the crash option |
-| `src/package.rs`, `src/services/` | The trial service files and the carried-state list recab's package carries |
-| `src/carry.rs` | Legacy baseline compatibility and owned root-reference materialization |
+| `src/package.rs`, `src/services/` | Enabled trial service, immutable runtime policy and reader compatibility |
+| `src/fstab.rs` | Slot-specific root-reference materialization |
 | `src/error.rs` | Error classes and exit codes |
 
 ## Tests
 
-`tests/lifecycle.rs` runs recab against a scratch boot tree: slot entries naming
-fake devices, a stand-in `/proc/cmdline`, an efivars directory recab writes
-systemd-boot's variables into, a fake `systemctl` whose startup state the test
-sets, and a fake OpenRC state directory. No disk is touched. Runs that need root get it in a user namespace
-(`unshare --user --map-root-user`). Some fixtures still encode the old empty-B
-installation, use legacy state and lack the initramfs now required by this checkout. These checks
-do not establish the required continuation lifecycle.
+The native CLI checks use disposable GPT/ext4/vfat disks and existing kernel
+artifacts. `tests/finalization.py` covers sealing/publication and both directions;
+`--lifecycle`, `--trials`, `--installation` and `--deployment` select the relevant
+focused integration. The old mock-only lifecycle suite and pre-protocol P03
+fixture were retired; they cannot represent a current paired installation.
 
-The explicit P03 CLI check uses temporary GPT/ext4 loop partitions and requires
-root plus `sfdisk`, `losetup`, `blkid`, `mkfs.ext4`, `mount`, `umount`, `fallocate`
-and Python 3. From the superproject root, using the existing focused CLI binary:
+For the deployment refusals, from the superproject root:
 
 ```sh
-sudo python3 tools/recab/tests/synchronization.py --binary target/debug/recab
+sudo python3 tools/recab/tests/finalization.py --binary target/debug/recab \
+  --kernel <existing-UEFI-kernel> --module <its-module.ko> --deployment
 ```
 
-It checks both synchronization directions, a kill after a real payload write,
-resume, preservation of pending changes, bounded range writes, equal-root zero
-payload writes, metadata/ACL/capability/xattr and link fidelity, sparse files,
-shared-data isolation, mount/special-file refusal, and space refusal before boot
-invalidation. It supplies scratch firmware/boot records and does not validate
-finalization or a kernel boot. Its verified temporary loop image is cleaned
-up on success; failure artifacts are retained unmounted for inspection.
+This checks old state formats, missing installation records/seals, old protocols,
+legacy entries and corrupted committed boot objects. Refusals leave the ledger,
+ESP, firmware selection and running root unchanged in both directions. Current
+sealed pairs still schedule and cancel trials. The fixture supplies observed
+boot records; only actual boot scenarios establish PID 1 and service behavior.
 
 ## Release manifest and verified inputs
 

@@ -3,8 +3,8 @@
 use anyhow::Result;
 use std::io::Read;
 
-use crate::error::{classified, refuse, ErrorClass};
-use crate::state::{plan, Operation, PersistentState, Preparation, PreparationPhase, Request};
+use crate::error::{ErrorClass, classified, refuse};
+use crate::state::{Operation, PersistentState, Preparation, PreparationPhase, Request, plan};
 use crate::system::System;
 
 pub(crate) fn new_id() -> Result<String> {
@@ -19,11 +19,7 @@ pub fn prepare(expected_id: Option<&str>, expected_revision: Option<u64>) -> Res
     crate::immutable::require_readonly(&sys.target)?;
     let active = sys.boot.selection.active;
     let source = sys.state.require_ready(active)?;
-    source.verify_root(
-        &sys.target.root,
-        active,
-        &sys.backend.slot_partuuid(&sys.boot, active)?,
-    )?;
+    crate::finalize::verify_slot(&sys, active)?;
     sys.backend.verify_generation(&sys.boot, active, source)?;
     let transition = plan(
         Request::Prepare {
@@ -190,9 +186,9 @@ pub fn discard(id: &str, revision: u64) -> Result<()> {
         ));
     }
     sys.apply(&transition)?;
-    crate::change::discard(&sys,id)?;
-    crate::update::discard(&sys,id)?;
-    crate::merge::discard(&sys,id)?;
+    crate::change::discard(&sys, id)?;
+    crate::update::discard(&sys, id)?;
+    crate::merge::discard(&sys, id)?;
     cleanup_plan(&sys, id);
     Ok(())
 }

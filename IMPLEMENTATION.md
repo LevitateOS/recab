@@ -58,7 +58,8 @@ operations, identity bytes and plan bytes. Filesystem metadata/journal and other
 state byte totals remain unmeasured; interrupted prior writes are explicitly
 unknown. These are not physical SSD/SMART write totals.
 
-The reusable real CLI check is `tests/synchronization.py --binary <recab>`.
+The P03 evidence used `tests/synchronization.py --binary <recab>` (a historical
+pre-protocol fixture, retired by P12; current checks use `tests/finalization.py`).
 It passed with two temporary GPT/ext4 roots: A→B, kill after a payload write,
 resume, preserve pending X, B→A, and another equal-root continuation. Recovery
 skipped the already written 1 MiB range and wrote the remaining 15 MiB of the
@@ -224,7 +225,8 @@ same files into a content-addressed cache without another full payload copy;
 cache reuse is rehashed. `stage --manifest` and `stage --from-media` use the same
 verifier before invalidation, while retaining the frozen inputs through use.
 Unsigned local use requires explicit `--trusted-local`; it cannot bypass a
-configured key. Explicit legacy raw-file staging remains pending P12.
+configured key. P12 retains raw-file staging only as a manifest-checked adapter to the same
+preserving merge and finalization engine.
 
 Focused CLI/library compilation and a real native EROFS builder/consumer
 integration passed. The fixture uses existing kernel/module artifacts and actual
@@ -943,6 +945,37 @@ their callers; installer and release tools. Depends on P05 through P11.
 Evidence: the old refusal/selection paths cannot bypass new readiness checks;
 documentation, help, consumers and actual state agree on update ownership.
 
+P12 implementation:
+
+- Package/source/CLI descriptions now name system updates and incremental
+  continuation. Architecture, comparison, troubleshooting and install docs no
+  longer describe empty-B installation, destructive staging or shared system
+  package activation.
+- The carried-path parser, fingerprints, packaged list and configuration-only
+  baseline are retired. `baseline` and recsetup retain one owner: the complete
+  release inventory/account baseline used by the preserving O/C/N merge.
+  `fstab.rs` only materializes slot root references. Stage is a compatibility
+  entry point to update apply/finalize; its redundant state request is removed.
+- Mutation accepts fresh state 2.5 only (older writers refuse minor 5), with a
+  completed paired installation record. Numeric 1 and structured 2.0–2.4 are read-only. Every ready/committed
+  generation needs its protocol-3 seal, including the protected source. Prepare,
+  finalization and raw boot selection recheck the sealed boot set; idempotent
+  commit has no legacy exception. There is no adoption or bootstrap command.
+- The old mock-only lifecycle suite and pre-protocol synchronization fixture
+  were retired. Native finalization fixtures now use sealed generation-bound
+  entries and installation records; they cannot silently bootstrap old state.
+  `--deployment` checks explicit refusal without changing the ledger, ESP,
+  firmware selection or running root, in either direction.
+
+Focused evidence: native GPT/ext4/vfat deployment refusals and current-pair trial
+selection pass in both directions. Paired recsetup installation, interruption
+and retry pass, including first-continuation zero payload writes. P11 guarded
+edit/finalize/trial/commit passes in both directions after a signed release
+merge with prepared changes and conflicts. All 40 native OpenRC trial checks
+pass with isolated fixture mounts, including unavailable state/ESP and corrupted
+fallbacks. CLI/library compilation and docs typechecking are focused checks; full system builds, hardware/VM boots,
+aarch64 execution and production publishing remain unrun.
+
 ### P13 Prove the complete lifecycle and write reduction
 
 Owners: `testing/install-tests/src/scenarios/ab_update.rs`, install/runtime
@@ -975,6 +1008,11 @@ success must not be reported as a working production update service.
 The first delivery targets fresh installs, whose two initial systems contain
 the same compatible recab and recinit. Do not silently infer the missing B,
 release baseline or package ownership of an older install.
+
+This release targets fresh paired installations only. Old development state,
+missing paired-install records and unsealed generations refuse mutation. No
+legacy adoption/bootstrap command is shipped. The rules below constrain any
+future adoption work; changing a version field does not establish compatibility.
 
 For existing installs, implement explicit adoption only if they must be retained:
 capture their actual root/configuration, including the merged view of any old

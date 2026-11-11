@@ -15,7 +15,7 @@ use recpart::types::InstallMode;
 #[command(about = "Manage system updates and rollback with two root slots (A/B)")]
 #[command(version)]
 #[command(
-    after_help = "Common tasks:\n  recab status                    Show the running slot and next boot\n  recab status --root /mnt         Inspect an installed target\n  recab prepare                   Continue the running system in the inactive slot\n  recab finalize                  Validate, seal and publish that candidate\n  recab stage --from-media /media  Merge release media into the preparation\n  recab set-next B                 Schedule one trial boot of slot B\n  recab rollback                  Select the known-good slot for next boot\n\nA/B keeps two system copies. prepare synchronizes differences; finalize seals\nthe candidate; set-next selects a trial boot. stage merges a release and finalizes it when conflict-free. The trial service commits a healthy boot automatically.\nRead 'recab status' before choosing a slot. Add --json for structured status."
+    after_help = "Common tasks:\n  recab status                    Show the running slot and next boot\n  recab status --root /mnt         Inspect an installed target\n  recab prepare                   Continue the running system in the inactive slot\n  recab change install ./pkg.rhai  Apply Recipe software to that preparation\n  recab edit etc/example --file X  Apply configuration to that preparation\n  recab update check              Discover signed updates through Recipe\n  recab update download           Cache the available release without changing X\n  recab finalize                  Validate, seal and publish that candidate\n  recab stage --from-media /media  Merge release media into the preparation\n  recab set-next B                 Schedule one trial boot of slot B\n  recab rollback                  Select the known-good slot for next boot\n\nA/B keeps two system copies. prepare synchronizes differences; finalize seals\nthe candidate; set-next selects a trial boot. stage merges a release and finalizes it when conflict-free. The trial service commits a healthy boot automatically.\nA and B support the same operations. Old development installs are read-only;\nuse compatible recovery media or a fresh installation. No automatic state upgrade.\nRead 'recab status' before choosing a slot. Add --json for structured status."
 )]
 struct Cli {
     /// Print structured status, health, inventory, preparation and finalization;
@@ -229,10 +229,9 @@ enum Command {
         timeout: u64,
     },
 
-    /// Record what the image extracted under ROOT ships at the paths its
-    /// carried list names (usr/lib/recab/baseline), so the first update of
-    /// the slot carries only the machine's changes. Run right after the
-    /// image is extracted, before anything personalizes it (recsetup does).
+    /// Capture the complete release inventory and account baseline before
+    /// personalizing an extracted image (recsetup does this). Existing baselines
+    /// are retained; a personalized generation cannot invent its original release.
     Baseline {
         /// The image tree.
         #[arg(long)]
@@ -240,8 +239,8 @@ enum Command {
     },
 
     /// Write recab's package contents into a tree: the trial service
-    /// (systemd unit or OpenRC service), enabled, and the list of machine
-    /// state `stage` carries.
+    /// (systemd unit or OpenRC service), enabled, immutable runtime policy
+    /// and executable-bound state/boot compatibility record.
     InstallUnit {
         /// Root of the tree (a package tree, or a system).
         #[arg(long, default_value = "/")]

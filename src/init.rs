@@ -63,10 +63,10 @@ pub(crate) fn run(target: Target, request: &InitRequest) -> Result<()> {
         request.initrd.as_deref(),
         &request.options,
     )?;
-    point_firmware(&entry, false)
+    point_firmware(&entry)
 }
 
-pub(crate) fn point_firmware(default_entry: &str, ab: bool) -> Result<()> {
+pub(crate) fn point_firmware(default_entry: &str) -> Result<()> {
     // The boot selection before recab's state. A previous install may have
     // left systemd-boot variables naming another entry; they win over
     // loader.conf. This machine's firmware boots the target only when this
@@ -83,15 +83,10 @@ the installed system boots '{default_entry}' from its own loader.conf"
             format!("pointing systemd-boot's firmware variables at '{default_entry}'")
         })?;
     } else {
-        let later = if ab {
-            " 'recab stage' resets them before it writes slot B."
-        } else {
-            ""
-        };
         eprintln!(
             "recab: warning: EFI variables are not available here (no efivarfs), so systemd-boot's \
 LoaderEntryDefault and LoaderEntryOneShot left by an earlier install could not be reset to '{default_entry}'; \
-until they are, they may select another entry.{later}"
+reset them from compatible recovery media before booting this installation"
         );
     }
     Ok(())

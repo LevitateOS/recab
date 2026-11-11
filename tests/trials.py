@@ -71,6 +71,9 @@ if mode=='assessment-error':print('list failed',file=sys.stderr);sys.exit(7)
         if init=='systemd':cases+=['pipe-owner','offline']
         # Healthy must run last, to leave a committed generation for reverse.
         cases.remove('healthy');cases.append('healthy')
+        selected=os.environ.get('RECAB_TRIAL_CASES')
+        if selected:
+            names=selected.split(',');check(all(name in cases for name in names),'unknown focused trial case');cases=[c for c in cases if c in names]
         for case in cases:
             print(f'trial check: {init} {source}->{destination} {case}',flush=True)
             active=switch(source,source_generation)

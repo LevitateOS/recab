@@ -201,7 +201,7 @@ impl PersistentState {
             StateSchema::Legacy(1)
             | StateSchema::Current {
                 major: 2,
-                minor: 0 | 1 | 2 | 3 | 4,
+                minor: 0 | 1 | 2 | 3 | 4 | 5,
             } => Ok(()),
             _ => Err("unsupported recab state format; use a compatible recovery tool".into()),
         }
@@ -217,9 +217,9 @@ impl PersistentState {
     }
     pub fn check_mutable(&self) -> Result<()> {
         self.check_schema().map_err(refuse)?;
-        if matches!(self.schema, StateSchema::Legacy(_)) {
+        if self.schema != StateSchema::default() {
             return Err(refuse(
-                "legacy slot-only state is read-only; explicit adoption with compatible runtimes is required",
+                "legacy development state is read-only; use compatible recovery media or a fresh installation; automatic state upgrade and legacy adoption are not supported",
             ));
         }
         if self.slots.len() != 2 {
@@ -251,10 +251,8 @@ impl PersistentState {
             {
                 return Err(refuse("invalid system generation digest"));
             }
-            if matches!(record.readiness, Readiness::Ready | Readiness::Committed)
-                && record.generation.is_none()
-            {
-                return Err(refuse("a complete slot has no generation identity"));
+            if matches!(record.readiness, Readiness::Ready | Readiness::Committed) {
+                self.require_ready(record.slot)?;
             }
         }
         for record in &self.slots {
@@ -331,10 +329,19 @@ impl PersistentState {
                 "slot {slot} is incomplete; kernel files do not establish a finalized candidate"
             )));
         }
-        record
+        let generation = record
             .generation
             .as_ref()
-            .ok_or_else(|| refuse("slot has no generation identity"))
+            .ok_or_else(|| refuse("slot has no generation identity"))?;
+        if record.seal.as_ref().is_none_or(|seal| {
+            seal.generation != generation.id
+                || seal.protocol != distro_contract::release::BOOT_PROTOCOL
+        }) {
+            return Err(refuse(
+                "slot lacks a matching immutable boot seal; use compatible recovery media or a fresh installation",
+            ));
+        }
+        Ok(generation)
     }
 }
 
@@ -422,10 +429,6 @@ pub(crate) enum Request {
     Commit,
     /// Go back to the known-good slot, or the one good before it.
     Rollback,
-    /// Write a new system into the inactive slot.
-    Stage {
-        id: String,
-    },
     Prepare {
         id: String,
         expected_id: Option<String>,
@@ -737,19 +740,6 @@ pub(crate) fn plan(
                 next,
                 boot: None,
             }
-        }
-        Request::Stage { id } => {
-            // Media staging uses the same preserving continuation. Input and
-            // merge verdicts are supplied by the release engine, not mkfs.
-            return plan(
-                Request::Prepare {
-                    id,
-                    expected_id: None,
-                    expected_revision: None,
-                },
-                sel,
-                state,
-            );
         }
     };
     Ok(Some(transition))

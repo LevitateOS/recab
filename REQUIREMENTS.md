@@ -270,14 +270,23 @@ ended, failed units), shown by `recab status`, and audited.
 - `recab init` (installation entry point; matching initial population is required)
 - `recab trial` (decides a trial boot; run by `recab-trial.service`)
 - `recab install-unit [--root DIR] --init <systemd|openrc> [--bin PATH]`
-- `recab baseline --root DIR` (the current carried-configuration baseline)
+- `recab baseline --root DIR` (complete original release inventory/account baseline before personalization)
 
-The CLI/library MUST additionally expose preparation, reopening, finalization,
-safe recovery/discard and update acquisition/application. Exact command names
-are not specified here; this list MUST NOT imply nonexistent commands work.
-`stage` now routes verified media/manifests through the preserving release merge;
-raw files require their corresponding manifest. Conflicts and recovery are
-exposed through `update conflicts`, `resolve`, `reproduce` and `recover`.
+The CLI/library also exposes the lifecycle through:
+
+- `recab prepare`, `finalize` and guarded `discard`
+- `recab change install|update|remove|recover|list|check` and `recab edit`
+- `recab update status|check|download|apply|cancel`
+- `recab update conflicts|resolve|reproduce|recover|adopt-baseline`
+- `recab release import` and `recab verify-installation`
+
+`stage` routes verified media/manifests through the same preserving release merge
+and finalization; raw files require their corresponding manifest. Baseline
+adoption supplies a verified original release to an existing safe preparation;
+it is not adoption or state migration of a legacy installation. Fresh installs
+use the current structured state and immutable boot protocol in both roots.
+Older development formats are inspectable but read-only; there is no in-place
+version promotion or legacy bootstrap command.
 
 **REQ-CLI-002**: `recab status` MUST report, at minimum:
 

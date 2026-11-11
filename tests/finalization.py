@@ -4,16 +4,25 @@ Uses an existing UEFI kernel/module, native ELF programs and temporary GPT disks
 The initramfs and observed firmware/boot records are structural fixtures; only
 an actual VM boot can establish PID 1, hardware-driver and service behavior.
 """
-import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
+import argparse,copy,ctypes,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
 sys.dont_write_bytecode=True
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");p.add_argument('--trials',action='store_true',help='exercise generation-bound trial recovery on these real filesystems');p.add_argument('--lifecycle',action='store_true');args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");p.add_argument('--trials',action='store_true',help='exercise generation-bound trial recovery on these real filesystems');p.add_argument('--lifecycle',action='store_true');p.add_argument('--deployment',action='store_true');args=p.parse_args()
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
+# Keep scratch mounts out of concurrent host sessions and their namespaces.
+libc=ctypes.CDLL(None,use_errno=True)
+if libc.unshare(0x20000)!=0:raise OSError(ctypes.get_errno(),'creating fixture mount namespace')
+subprocess.run(['mount','--make-rprivate','/'],check=True)
 BIN=str(args.binary.resolve(strict=True));KERNEL=args.kernel.resolve(strict=True);MODULE=args.module.resolve(strict=True)
 GUID='4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
 def check(ok,message):
     if not ok:raise RuntimeError(message)
-def run(*argv,**kw):return subprocess.run(argv,check=True,capture_output=True,**kw)
+def run(*argv,**kw):
+    q=subprocess.run(argv,capture_output=True,**kw)
+    try:q.check_returncode()
+    except subprocess.CalledProcessError as error:
+        error.add_note(f'command stderr: {q.stderr!r}');raise
+    return q
 def cli(env,*argv,code=0,contains=None):
     q=subprocess.run([BIN,'--json',*argv],env=env,text=True,capture_output=True,timeout=120)
     check(q.returncode==code,f'{argv}: exit {q.returncode}, expected {code}: {q.stderr}')
@@ -213,6 +222,7 @@ try:
         modules=root/f'usr/lib/modules/{release}';(modules/'kernel').mkdir(parents=True);(modules/'kernel/test.ko').write_bytes(module);(modules/'modules.dep').write_bytes(dep);(modules/'modules.builtin').write_bytes(builtin)
         cli(dict(env,RECAB_ROOT=str(root)),'install-unit','--root',str(root),'--init',args.init)
         check((root/'usr/lib/recab/runtime.json').exists(),'producer runtime compatibility record missing')
+        check(not (root/'usr/lib/recab/carried').exists() and not (root/'usr/lib/recab/baseline').exists(),'obsolete carry metadata was packaged')
         if updates:
             updates.seed(root,globals())
             cli(dict(env,RECAB_ROOT=str(root)),'baseline','--root',str(root))
@@ -234,12 +244,21 @@ try:
         result=installation();success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     ga=generation('A');gb=generation('B')
     fixture_prefix="levitateos" if args.release_builder else "lev"
-    def legacy_entry(slot,g):
-        (esp/f'loader/entries/{fixture_prefix}-{slot.lower()}.conf').write_text(f'title {slot}\nlinux /legacy/vmlinuz\ninitrd /legacy/initrd.img\noptions root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n')
-    for slot,g in [('A',ga),('B',gb)]:legacy_entry(slot,g)
+    # A post-install fixture uses the same sealed protocol as fresh installs;
+    # it must never bootstrap new state from an unsealed development slot.
+    def sealed_entry(slot,g):
+        objects=esp/'recab/objects';objects.mkdir(parents=True,exist_ok=True)
+        shutil.copyfile(KERNEL,objects/(kernel_hash+'.linux'));shutil.copyfile(initrd,objects/(initrd_hash+'.initrd'))
+        seal={'generation':g['id'],'kernel_release':release,'architecture':'x86_64','protocol':3}
+        manifests=esp/'recab/generations';manifests.mkdir(parents=True,exist_ok=True)
+        (manifests/(g['id']+'.json')).write_bytes(packed({'version':1,'generation':g['id'],'kernel':kernel_hash,'initrd':initrd_hash,'kernel_release':release,'architecture':'x86_64','protocol':3}))
+        (esp/f'loader/entries/{fixture_prefix}-{slot.lower()}.conf').write_text(f'title {slot}\nlinux /recab/objects/{kernel_hash}.linux\ninitrd /recab/objects/{initrd_hash}.initrd\noptions root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n')
+        return seal
+    seals={slot:sealed_entry(slot,g) for slot,g in [('A',ga),('B',gb)]}
     first=args.updates_running if args.updates else 'A';other='B' if first=='A' else 'A'
-    ledger={'schema':{'major':2,'minor':1},'slots':[{'slot':s,'partuuid':uuid[s],'generation':g,'readiness':'committed' if s==first else 'ready'} for s,g in [('A',ga),('B',gb)]],'known_good_slot':first,'previous_good_slot':other}
+    ledger={'schema':{'major':2,'minor':5},'slots':[{'slot':s,'partuuid':uuid[s],'generation':g,'seal':seals[s],'readiness':'committed' if s==first else 'ready'} for s,g in [('A',ga),('B',gb)]],'known_good_slot':first,'previous_good_slot':other}
     (state/'state.json').write_bytes(packed(ledger));(esp/'loader/loader.conf').write_text(f'default {fixture_prefix}-{first.lower()}.conf\ntimeout 5\n')
+    (state/'installation.json').write_bytes(packed({'version':1,'complete':True,'roots':[uuid['A'],uuid['B']],'state':uuid['state'],'esp':uuid['esp'],'options':'','generation':ga,'seal':seals['A'],'synchronization':None}))
     def variable(name,value):
         file=efi/f'efivars/LoaderEntry{name}-{GUID}'
         if value is None:file.unlink(missing_ok=True)
@@ -250,6 +269,9 @@ try:
     def running(slot,g):
         (proc/'cmdline').write_text(f'root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n');(proc/'self/mountinfo').write_text(Path('/proc/self/mountinfo').read_text());return dict(env,RECAB_ROOT=str(roots[slot]))
     active=running(first,ga if first=='A' else gb)
+    if args.deployment:
+        from deployment import exercise
+        result=exercise(globals(),active);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     if args.lifecycle:
         from lifecycle import observe
         old_prepare=next(o for o in observe(globals(),active,'stable-initial')['operations'] if o['id']=='prepare')

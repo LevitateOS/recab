@@ -1,8 +1,8 @@
 //! What recab's package carries besides the binary, written by `recab
 //! install-unit --init <init>` into the tree Recipe packages: the trial
-//! service for the image's init system, enabled, and the list of machine
-//! state `stage` carries ([`crate::carry`]). Every image with recab runs
-//! the trial service; with no trial pending it exits at once.
+//! service for the image's init system, enabled, immutable runtime policy
+//! and executable-bound compatibility metadata. Every image with recab runs
+//! the trial service, which waits for startup health before judging a trial.
 
 use anyhow::{Context, Result};
 use distro_profile::InitSystem;
@@ -10,7 +10,6 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
 
-use crate::carry::CARRIED_LIST;
 use crate::error::refuse;
 
 /// Where the package installs recab, unless the packager says otherwise.
@@ -18,7 +17,6 @@ pub const RECAB_BIN: &str = "/usr/bin/recab";
 
 const SYSTEMD_UNIT: &str = include_str!("services/recab-trial.service");
 const OPENRC_SERVICE: &str = include_str!("services/recab-trial.openrc");
-const CARRIED: &str = include_str!("services/carried");
 
 /// What both trial services say they are.
 const DESCRIPTION: &str = "Commit a healthy A/B trial boot, or reboot into the known-good slot";
@@ -71,7 +69,7 @@ fn render(template: &str, values: &[(&str, &str)]) -> Result<String> {
 }
 
 /// Write the trial service for `init` (running the binary at `bin`), its
-/// enabling link and the carried-state list into the package tree `root`.
+/// enabling link, runtime policy and compatibility record into the package tree `root`.
 pub(crate) fn write(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
     let (template, mode) = match init {
         InitSystem::Systemd => (SYSTEMD_UNIT, 0o644),
@@ -104,9 +102,6 @@ pub(crate) fn write(root: &Path, init: InitSystem, bin: &str) -> Result<()> {
     symlink(Path::new("/").join(trial_service_path(init)), &link)
         .with_context(|| format!("enabling '{}'", link.display()))?;
 
-    let list = root.join(CARRIED_LIST);
-    target_root::write_durable(&list, CARRIED.as_bytes(), Some(0o644))
-        .with_context(|| format!("writing '{}'", list.display()))?;
     crate::runtime::Policy::check(root, init)?.apply(root)?;
     crate::runtime::package_runtime(root, bin)
 }

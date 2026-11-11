@@ -100,7 +100,6 @@ fn path(bytes: &[u8]) -> &Path {
 }
 fn skip(bytes: &[u8]) -> bool {
     bytes == BASELINE.as_bytes()
-        || bytes == crate::carry::BASELINE.as_bytes()
         || bytes == WORK.as_bytes()
         || bytes.starts_with(format!("{WORK}/").as_bytes())
         || bytes == levitate_recipe::target::MANIFEST.as_bytes()
@@ -945,7 +944,7 @@ fn controls(
         let uuid = sys
             .backend
             .slot_partuuid(&sys.boot, sys.state.preparation.as_ref().unwrap().slot)?;
-        let text = crate::carry::fstab_for_slot(std::str::from_utf8(&raw)?, &uuid, "ext4")?;
+        let text = crate::fstab::for_slot(std::str::from_utf8(&raw)?, &uuid, "ext4")?;
         crate::candidate::mounts_text(
             &Root::open(candidate)?,
             sys.state.preparation.as_ref().unwrap().slot,

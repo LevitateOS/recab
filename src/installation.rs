@@ -45,7 +45,8 @@ fn save(target: &Target, record: &Installation) -> Result<()> {
     Ok(())
 }
 pub(crate) fn require_complete(target: &Target) -> Result<()> {
-    if read(target)?.is_some_and(|r| r.version != 1 || !r.complete) {
+    let record = read(target)?.ok_or_else(|| refuse("legacy or unproven A/B installation: paired installation record is missing; use compatible recovery media or a fresh installation, not an in-place state upgrade"))?;
+    if record.version != 1 || !record.complete {
         return Err(refuse("initial A/B installation is incomplete; resume recab init on the mounted installation target"));
     }
     Ok(())
@@ -424,7 +425,7 @@ pub(crate) fn run(target: Target, request: &InitRequest, a: &Path, b: &Path) -> 
             )?;
         }
         let default = backend.installed_default()?;
-        crate::init::point_firmware(&default, true)?;
+        crate::init::point_firmware(&default)?;
         record.complete = true;
         save(&target, &record)?;
         if !was_complete {
