@@ -151,6 +151,11 @@ if mode=='assessment-error':print('list failed',file=sys.stderr);sys.exit(7)
                 record=json.loads((state/'state.json').read_text())['last_trial']
                 check(record and not record['committed'] and record['generation']==generation['id'] and record['fallback_generation']==source_generation['id'],'failure was not bound to both generations')
                 check(not ticket_path.exists(),'recovered fallback retained stale ticket')
+                status=cli(active,'status')
+                if status['schema_version']>=10:
+                    check(status['lifecycle']['state']=='trial_failed' and status['lifecycle']['trial_current'],'failed generation not exposed in lifecycle')
+                    if not status['preparation']:
+                        check(any(o['id']=='replace_failed' and o['destructive'] for o in status['operations']) and next(o for o in status['operations'] if o['id']=='prepare')['verdict']=='refused','failed changes can be silently reseeded')
                 if case=='assessment-error':
                     old_attempt=record['attempt'];cli(active,'set-next',destination);retry=switch(destination,generation);retried=subprocess.run([h['BIN'],'trial','--timeout','2'],env=retry,text=True,capture_output=True,timeout=15);check(retried.returncode==0,'explicit retry failed: '+retried.stderr);new_record=json.loads((state/'state.json').read_text())['last_trial'];check(new_record['committed'] and new_record['attempt']!=old_attempt,'explicit retry inherited an earlier failed verdict')
             if case in ['healthy','partial-default','partial-schedule']:

@@ -1673,6 +1673,9 @@ pub fn adopt_baseline(
     }
     Ok(())
 }
+pub(crate) fn can_cancel(sys: &System) -> Result<bool> {
+    Ok(!journal_path(sys)?.exists() || { let j=checked(sys)?; j.phase=="complete" || j.desired.is_none() })
+}
 pub(crate) fn cancel(sys: &System) -> Result<()> {
     let blocked = sys.target.state_dir.join(format!(
         "merge-blocked-{}.json",

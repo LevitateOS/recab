@@ -650,7 +650,9 @@ pub(crate) fn plan(
                 }
                 return Ok(None);
             }
-            if expected_id.is_some() || expected_revision.is_some() {
+            if (expected_id.is_some() || expected_revision.is_some())
+                && !(expected_id.as_deref() == Some("none") && expected_revision == Some(0))
+            {
                 return Err(refuse(
                     "no existing preparation matches the expected revision",
                 ));

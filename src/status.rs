@@ -5,13 +5,13 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::entry::{entry_name, layout_name, ENTRIES_DIR};
+use crate::System;
+use crate::entry::{ENTRIES_DIR, entry_name, layout_name};
 use crate::state::{
-    committed, known_good, plan, rollback_target, BootChange, PersistentState, Request, Selection,
-    Slot, TrialRecord,
+    BootChange, PersistentState, Request, Selection, Slot, TrialRecord, committed, known_good,
+    plan, rollback_target,
 };
 use crate::trial_options;
-use crate::System;
 use crate::{Generation, Preparation, Readiness};
 
 /// One slot's layout on the ESP, as recab wrote it.
@@ -47,7 +47,7 @@ pub struct SlotView {
 }
 
 /// The schema of [`Status`].
-pub const STATUS_SCHEMA_VERSION: u32 = 9;
+pub const STATUS_SCHEMA_VERSION: u32 = 10;
 
 /// Where the two systems stand, in the terms a person is told. recab works
 /// it out here, once, from its own state, so that no front end rebuilds it
@@ -74,10 +74,10 @@ pub enum LifecycleState {
     /// back to the one before.
     OnTrial,
     /// The candidate was tried, did not start properly, and the computer
-    /// came back. The candidate is still there. Told from the last judged
-    /// trial, which names a slot and not a generation: a candidate finalized
-    /// again since then is still reported this way until it is tried.
+    /// came back. Only a matching candidate/fallback generation pair counts.
     TrialFailed,
+    /// The selected release has unresolved conflicts or blocked reproduction.
+    Conflicted,
     /// The installation is incomplete or the state needs recovery; see
     /// `recovery_reason`.
     Unusable,
@@ -107,6 +107,26 @@ pub struct Lifecycle {
     /// A recab command holds the run lock right now. `None` when this reader
     /// may not open the lock file.
     pub working: Option<bool>,
+    pub reboot_needed: bool,
+    pub trial_current: bool,
+}
+
+pub(crate) fn failed_candidate(sel: &Selection, state: &PersistentState) -> bool {
+    state.last_trial.as_ref().is_some_and(|t| {
+        !t.committed
+            && t.slot == sel.active.other()
+            && t.generation.as_deref().is_some_and(|id| {
+                state
+                    .slot(t.slot)
+                    .and_then(|s| s.generation.as_ref())
+                    .is_some_and(|g| g.id == id)
+            })
+            && t.fallback_generation.as_deref()
+                == state
+                    .slot(sel.active)
+                    .and_then(|s| s.generation.as_ref())
+                    .map(|g| g.id.as_str())
+    })
 }
 
 /// The lifecycle of `state` under `sel`. `working` is whether a command runs
@@ -118,10 +138,32 @@ fn lifecycle(
     working: Option<bool>,
     unusable: bool,
     same_generation: bool,
+    merge: Option<&crate::merge::MergeStatus>,
 ) -> Lifecycle {
     let inactive = sel.active.other();
     let preparation = state.preparation.as_ref();
-    let other = if preparation.is_some() || sel.oneshot == Some(inactive) {
+    let trial_current = state.last_trial.as_ref().is_some_and(|t| {
+        let generation_matches = t.generation.as_deref().is_some_and(|id| {
+            state
+                .slot(t.slot)
+                .and_then(|s| s.generation.as_ref())
+                .is_some_and(|g| g.id == id)
+        });
+        generation_matches
+            && (t.committed
+                || t.fallback_generation.as_deref()
+                    == state
+                        .slot(t.slot.other())
+                        .and_then(|s| s.generation.as_ref())
+                        .map(|g| g.id.as_str()))
+    });
+    let trial_failed = failed_candidate(sel, state);
+    let other = if !committed(state, sel) && known_good(state, sel) == Some(inactive) {
+        OtherSystem::Previous
+    } else if preparation.is_some_and(|p| p.slot == inactive)
+        || sel.oneshot == Some(inactive)
+        || trial_failed
+    {
         OtherSystem::Next
     } else if rollback_target(state, sel) == Some(inactive) {
         OtherSystem::Previous
@@ -130,15 +172,16 @@ fn lifecycle(
     } else {
         OtherSystem::Unknown
     };
-    // The last judged trial was of the other slot and was not kept.
-    let trial_failed = state
-        .last_trial
-        .as_ref()
-        .is_some_and(|trial| !trial.committed && trial.slot == inactive);
     let state = if unusable {
         LifecycleState::Unusable
+    } else if working == Some(true) {
+        LifecycleState::Working
     } else if !committed(state, sel) {
         LifecycleState::OnTrial
+    } else if merge
+        .is_some_and(|m| m.phase != "complete" && (m.unresolved > 0 || m.phase == "blocked"))
+    {
+        LifecycleState::Conflicted
     } else if let Some(preparation) = preparation {
         use crate::PreparationPhase::{Prepared, Ready};
         if working == Some(true) {
@@ -154,6 +197,8 @@ fn lifecycle(
         }
     } else if sel.oneshot.is_some() {
         LifecycleState::RestartSet
+    } else if trial_failed {
+        LifecycleState::TrialFailed
     } else {
         LifecycleState::Stable
     };
@@ -161,6 +206,8 @@ fn lifecycle(
         state,
         other,
         working,
+        reboot_needed: sel.next_boot().is_some_and(|s| s != sel.active),
+        trial_current,
     }
 }
 
@@ -220,6 +267,9 @@ pub struct ActionView {
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
+    pub operations: Vec<crate::operations::Operation>,
+    pub running_release: Option<String>,
+    pub prepared_release: Option<String>,
     #[serde(default)]
     pub updates: Option<crate::update::UpdateStatus>,
     pub schema_version: u32,
@@ -442,14 +492,66 @@ pub fn status(root: Option<&Path>) -> Result<Status> {
             .err()
             .map(|error| format!("{error:#}"))
     });
-    let generation_of =
-        |slot: Slot| state.slot(slot).and_then(|record| record.generation.as_ref().map(|g| &g.id));
+    let recovery_reason = recovery_reason.or_else(|| {
+        crate::candidate::runtime_protocol(&crate::filesystem::Root::open(&sys.target.root).ok()?)
+            .err()
+            .map(|e| format!("{e:#}"))
+    });
+    let updates = Some(
+        crate::update::view(&sys).unwrap_or_else(|e| crate::update::UpdateStatus {
+            phase: "unavailable".into(),
+            last_error: Some(format!("{e:#}")),
+            ..Default::default()
+        }),
+    );
+    let ticket = crate::trial_record::Ticket::read(&sys.target);
+    let recovery_reason = recovery_reason.or_else(|| {
+        ticket
+            .as_ref()
+            .err()
+            .map(|e| format!("trial recovery record: {e:#}"))
+    });
+    let operations = crate::operations::views(
+        &sys,
+        &actions,
+        updates.as_ref(),
+        recovery_reason.as_deref(),
+        ticket.ok().flatten().is_some(),
+    );
+    let running_release = crate::release::installed(&sys.target)
+        .ok()
+        .map(|(i, _)| i.version);
+    let prepared_release = updates
+        .as_ref()
+        .and_then(|u| {
+            u.pending_release
+                .as_ref()
+                .or_else(|| u.merge.as_ref().map(|m| &m.release))
+        })
+        .and_then(|id| crate::update::cached_summary(&sys.target, id).ok())
+        .map(|r| r.version)
+        .or_else(|| state.preparation.as_ref().and(running_release.clone()));
+    let generation_of = |slot: Slot| {
+        state
+            .slot(slot)
+            .and_then(|record| record.generation.as_ref().map(|g| &g.id))
+    };
     let same_generation =
         generation_of(sel.active).is_some() && generation_of(sel.active) == generation_of(inactive);
-    let lifecycle = lifecycle(sel, state, sys.store.busy(), recovery_reason.is_some(), same_generation);
+    let lifecycle = lifecycle(
+        sel,
+        state,
+        sys.store.busy(),
+        recovery_reason.is_some(),
+        same_generation,
+        updates.as_ref().and_then(|u| u.merge.as_ref()),
+    );
     Ok(Status {
+        operations,
+        running_release,
+        prepared_release,
         lifecycle,
-        updates: crate::update::view(&sys).ok(),
+        updates,
         schema_version: STATUS_SCHEMA_VERSION,
         preparation: state.preparation.clone(),
         recovery_reason,

@@ -86,6 +86,7 @@ from its purpose. The commands below describe the existing implementation.
 - `recab discard --preparation <id> --revision <n>`
 - `recab inventory --root <dir> [--json]`
 - `recab compare [--json] [--machine-events | --roots <running> <other>]`
+- `recab history [--json]`
 - `recab update status|check`
 - `recab update download [<manifest-sha256>]`
 - `recab update apply <manifest-sha256> [--preparation <id> --revision <n>]`
@@ -177,7 +178,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   boot record, manifest and artifacts before changing selection. The initramfs
   checks `recab.slot`, root PARTUUID and `recab.generation` against the sealed
   root before starting init, and protects both root devices.
-- `status --json` (schema 9) also says where the two systems stand in one
+- `status --json` (schema 10) also says where the two systems stand in one
   word, so front ends need not work it out from slots and phases:
   `lifecycle.state` is `stable`, `open`, `working`, `interrupted`, `ready`,
   `restart_set`, `on_trial`, `trial_failed` or `unusable`; `lifecycle.other`
@@ -313,6 +314,20 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
 - `health` waits for startup like `trial` and prints the verdict (`--json`:
   `schema_version`, `init`, `startup`, `finished`, `state`, `failed`); it changes nothing and needs no A/B
   layout. It exits non-zero only when no verdict can be formed.
+- `history` lists what happened to this computer's systems, newest first, and
+  changes nothing. It reads only the audit log and the state file, and needs
+  root only if those are unreadable to the caller (`audit.log` is written with
+  the default mode, so a person normally reads it). Each entry has a `time`, a
+  `kind` (the audit log's operation names, plus `change` for a finished change
+  and `trial-kept` for a commit that ended a healthy trial), the `slot` and
+  `preparation` it concerns where the record shows them, and for a change its
+  `action`, `package` and `actor` (`--actor` is kept only with a change, so no
+  other entry has one). `outcome` is `started`, `done` or `interrupted` for
+  prepare, update, finalize and discard, and `detail` is recab's own text where
+  the record holds it (how startup ended, why an operation stopped). The end of
+  `prepare` is not audited, so its entry says only that it began or stopped.
+  `records`, `unreadable`, `truncated` and `log_found` say how complete the
+  reading was. Point it at another state folder with `RECAB_STATE_DIR`.
 - `baseline --root <dir>` records the extracted image's carried paths before
   personalization. It is a configuration baseline, not a whole-system delta.
 - `install-unit --init <init>` writes recab's package contents into a tree:
@@ -415,6 +430,7 @@ Every operation that writes (`init`, `stage`, `set-next`, `commit`, `rollback`,
 | `src/state.rs` | The state machine without I/O: what each request changes or why it is refused, and how a trial is judged |
 | `src/systemd_boot.rs` | The boot selection: entries, `loader.conf`, EFI variables, slot kernels, trial options on entries |
 | `src/store.rs` | The state file, audit log, lock and durable file replacement |
+| `src/history.rs` | `history`: the audit log and state file read as a list of what happened |
 | `src/init.rs`, `src/installation.rs` | Single-root boot setup and recoverable equivalent A/B installation |
 | `src/stage.rs` | Manifest/media adapter to the preserving release merge |
 | `src/merge.rs`, `src/merge_accounts.rs` | Frozen O/C/N plans, structured accounts, conflicts, resolution and recovery |
@@ -598,6 +614,46 @@ Combining it with `--updates` and `--release-builder` exercises the merged
 release candidate. These checks use observed boot/init records; they do not
 boot a VM or write physical firmware variables.
 
+## Lifecycle interfaces
+
+`recab status --json` schema 10 supplies `operations`: labels, verdicts, exact
+argument vectors, input fields and destructive-action markers. The CLI, TUI and
+System desktop use the same candidate/fallback decisions in either direction.
+`ready` permits requesting an operation; execution rechecks filesystem and
+firmware facts. No frontend infers readiness from the presence of kernel files.
+
+Commands bind to the preparation ID/revision and selected generation shown in
+status. `--preparation none --revision 0` explicitly requires no open session;
+it refuses if another caller has prepared work since the screen was read.
+Finalized candidates can be reopened for more changes without reseeding X.
+A failed generation without its preparation record offers an explicit destructive
+replacement, instead of silently copying over its remaining changes.
+
+`lifecycle` reports conflicts, interruption, working state, current-generation
+trial results and whether the selected next boot changes the running system.
+When the candidate is running on trial, the other system is the protected previous
+one. Status includes candidate/running release names, completed and interrupted
+changes, download counters and redacted merge conflicts. Unreadable update
+metadata is reported, never silently presented as an empty update list.
+
+`--machine-events` emits operation `started`, `finished` or `failed` JSON lines
+on stderr. Stdout remains the command's result; existing Recipe/compare event
+streams retain their own schemas. Boundary events do not invent percentages.
+The generated event and status schemas/types are the interface contract.
+
+The TUI lists all offered operations, gathers their declared inputs and refreshes
+after execution. System's existing pages retain their workflow and add an
+expandable software/update/recovery section. Conflict resolutions are submitted
+one at a time against the current revision. Neither interface discards a
+preparation to apply another change or release. A distribution update source
+must still be configured before online checking is available.
+
+Before A/B installer completion, `recab verify-installation --root TARGET`
+checks the durable initial publication, both identical personalized root
+inventories and generation records, reader compatibility and both sealed boot
+entries/payloads. The install hub records that proof and verifies again before
+unmounting; a legacy “boot done” flag alone cannot complete an A/B installation.
+
 ## Exit Codes
 
 `0` on success, `1` for an unclassified failure. Every classified failure prints
@@ -695,7 +751,7 @@ EROFS/kernel/initramfs/inventory set through the P07 importer. A cached release
 can be reverified and selected with the network disconnected. These commands
 work for either active slot.
 
-Status schema 9 reports `updates` and its structured `merge`. Download progress reports verified files/bytes,
+Status schema 10 reports `updates` and its structured `merge`. Download progress reports verified files/bytes,
 reused objects and Recipe process I/O for the current attempt. Failed producers
 can have unreported writes, so `accounting_complete` is false after interruption.
 Counts exclude other verification/cache copies, filesystem journals and device

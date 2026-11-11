@@ -398,13 +398,51 @@
       ],
       "type": "object"
     },
+    "Input": {
+      "properties": {
+        "choices": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "flag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "label",
+        "required",
+        "choices"
+      ],
+      "type": "object"
+    },
     "Lifecycle": {
       "properties": {
         "other": {
           "$ref": "#/$defs/OtherSystem"
         },
+        "reboot_needed": {
+          "type": "boolean"
+        },
         "state": {
           "$ref": "#/$defs/LifecycleState"
+        },
+        "trial_current": {
+          "type": "boolean"
         },
         "working": {
           "description": "A recab command holds the run lock right now. `None` when this reader\nmay not open the lock file.",
@@ -416,7 +454,9 @@
       },
       "required": [
         "state",
-        "other"
+        "other",
+        "reboot_needed",
+        "trial_current"
       ],
       "type": "object"
     },
@@ -460,7 +500,12 @@
         },
         {
           "const": "trial_failed",
-          "description": "The candidate was tried, did not start properly, and the computer\ncame back. The candidate is still there. Told from the last judged\ntrial, which names a slot and not a generation: a candidate finalized\nagain since then is still reported this way until it is tried.",
+          "description": "The candidate was tried, did not start properly, and the computer\ncame back. Only a matching candidate/fallback generation pair counts.",
+          "type": "string"
+        },
+        {
+          "const": "conflicted",
+          "description": "The selected release has unresolved conflicts or blocked reproduction.",
           "type": "string"
         },
         {
@@ -521,6 +566,51 @@
         "phase",
         "conflicts",
         "unresolved"
+      ],
+      "type": "object"
+    },
+    "Operation": {
+      "properties": {
+        "argv": {
+          "description": "Arguments to recab, excluding its executable. Never a shell command.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "destructive": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "inputs": {
+          "items": {
+            "$ref": "#/$defs/Input"
+          },
+          "type": "array"
+        },
+        "label": {
+          "type": "string"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verdict": {
+          "$ref": "#/$defs/Verdict",
+          "description": "Ready permits requesting the operation; execution revalidates disk facts."
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "argv",
+        "inputs",
+        "verdict",
+        "destructive"
       ],
       "type": "object"
     },
@@ -1112,7 +1202,9 @@
       "$ref": "#/$defs/Lifecycle",
       "default": {
         "other": "unknown",
+        "reboot_needed": false,
         "state": "stable",
+        "trial_current": false,
         "working": null
       },
       "description": "The same facts as one state a person can be told; see [`Lifecycle`]."
@@ -1128,6 +1220,12 @@
       ],
       "description": "The slot the next boot starts: the trial slot, else the default."
     },
+    "operations": {
+      "items": {
+        "$ref": "#/$defs/Operation"
+      },
+      "type": "array"
+    },
     "preparation": {
       "anyOf": [
         {
@@ -1138,6 +1236,12 @@
         }
       ],
       "default": null
+    },
+    "prepared_release": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "recovery_reason": {
       "default": null,
@@ -1156,6 +1260,12 @@
         }
       ],
       "description": "The slot `recab rollback` would select, if any."
+    },
+    "running_release": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "scheduled_trial": {
       "anyOf": [
@@ -1197,6 +1307,7 @@
     }
   },
   "required": [
+    "operations",
     "schema_version",
     "active_slot",
     "inactive_slot",

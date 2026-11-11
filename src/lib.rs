@@ -26,11 +26,12 @@ mod filesystem;
 mod finalize;
 mod generation;
 mod immutable;
+mod init;
+mod init_system;
+mod installation;
 pub mod merge;
 mod merge_accounts;
-mod init;
-mod installation;
-mod init_system;
+pub mod operations;
 mod package;
 mod prepare;
 pub mod release;
@@ -54,27 +55,27 @@ use std::path::Path;
 use std::time::Duration;
 
 pub use distro_profile::InitSystem;
-pub use entry::{entry_name, layout_name, ENTRIES_DIR};
-pub use error::{error_text, stable_exit_code, ErrorClass, ErrorPayload};
+pub use entry::{ENTRIES_DIR, entry_name, layout_name};
+pub use error::{ErrorClass, ErrorPayload, error_text, stable_exit_code};
 pub use init::{InitLayout, InitRequest};
 pub use init_system::{Health, TRIAL_TIMEOUT_SECS};
-pub use package::{trial_service_link, RECAB_BIN};
+pub use package::{RECAB_BIN, trial_service_link};
 pub use stage::{StageRequest, StageSource};
 pub use state::Startup;
 pub use state::{Slot, TrialRecord};
 pub use status::{
-    status, Action, ActionView, After, Lifecycle, LifecycleState, OtherSystem, SlotView, Status,
-    Verdict, STATUS_SCHEMA_VERSION,
+    Action, ActionView, After, Lifecycle, LifecycleState, OtherSystem, STATUS_SCHEMA_VERSION,
+    SlotView, Status, Verdict, status,
 };
 pub use target::state_file;
-pub use trial::{trial, TrialOutcome};
+pub use trial::{TrialOutcome, trial};
 
-pub use change::{change, changes, edit, ChangeProgress, ChangeRequest};
+pub use change::{ChangeProgress, ChangeRequest, change, changes, edit};
 pub use compare::{
-    compare, compare_roots, ComparedSystem, Comparison, Difference, DifferenceKind, FolderSize, Same,
-    COMPARISON_SCHEMA_VERSION,
+    COMPARISON_SCHEMA_VERSION, ComparedSystem, Comparison, Difference, DifferenceKind, FolderSize,
+    Same, compare, compare_roots,
 };
-pub use finalize::{finalize, BootSeal, Finalization, FinalizeRequest};
+pub use finalize::{BootSeal, Finalization, FinalizeRequest, finalize};
 pub use generation::{Generation, Inventory};
 pub use prepare::{discard, prepare};
 use state::Request;
@@ -89,7 +90,9 @@ pub fn set_actor(actor: Option<String>) {
     let plain = actor.filter(|name| {
         !name.is_empty()
             && name.len() <= 64
-            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.: ".contains(&b))
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.: ".contains(&b))
     });
     let _ = ACTOR.set(plain);
 }
@@ -99,7 +102,7 @@ pub(crate) fn actor() -> Option<String> {
 }
 use store::Store;
 pub use sync::SyncReport;
-use system::{require_root, System};
+use system::{System, require_root};
 use target::Target;
 
 /// Populate and seal equivalent personalized A/B roots, then publish both
@@ -115,8 +118,9 @@ pub fn init(request: &InitRequest) -> Result<()> {
 
 /// Merge a verified release into the prepared inactive system. Conflicts leave
 /// it unbootable; stage never formats or discards a preparation.
-pub fn stage(source:&StageSource,change_flavour:bool)->Result<()> {
-    stage::merge(source,change_flavour).map_err(|e|error::or_class(e,ErrorClass::StateOrDetection))
+pub fn stage(source: &StageSource, change_flavour: bool) -> Result<()> {
+    stage::merge(source, change_flavour)
+        .map_err(|e| error::or_class(e, ErrorClass::StateOrDetection))
 }
 
 /// Schedule one trial boot of the inactive `slot`.
@@ -144,7 +148,9 @@ pub fn health(timeout: Duration) -> Result<Health> {
 /// its carried list names.
 pub fn baseline(root: &Path) -> Result<()> {
     merge::capture_baseline(root)?;
-    if carry::Baseline::read(root)?.is_some() { return Ok(()); }
+    if carry::Baseline::read(root)?.is_some() {
+        return Ok(());
+    }
     let list = carry::read_list(root)?;
     carry::Baseline::write(root, &list)
 }
@@ -165,3 +171,46 @@ pub fn inventory(root: &Path) -> Result<Inventory> {
 pub fn update_error(error: anyhow::Error) -> anyhow::Error {
     error::or_class(error, ErrorClass::StateOrDetection)
 }
+
+/// Select a generation using the preparation snapshot shown by a frontend.
+pub fn checked_selection(
+    action: &str,
+    slot: Option<Slot>,
+    preparation: Option<&str>,
+    revision: Option<u64>,
+    generation: Option<&str>,
+) -> anyhow::Result<()> {
+    let sys = system::System::locked(action)?;
+    if preparation.is_some() || revision.is_some() {
+        match sys.state.preparation.as_ref() {
+            Some(p) if Some(p.id.as_str()) == preparation && Some(p.revision) == revision => {}
+            None if preparation == Some("none") && revision == Some(0) => {}
+            _ => return Err(error::refuse("stale preparation id/revision")),
+        }
+    }
+    let request = match action {
+        "set-next" => state::Request::SetNext(slot.ok_or_else(|| error::refuse("slot required"))?),
+        "commit" => state::Request::Commit,
+        "rollback" => state::Request::Rollback,
+        _ => return Err(error::refuse("unknown selection operation")),
+    };
+    let selected = match action {
+        "set-next" => slot,
+        "commit" => Some(sys.boot.selection.active),
+        _ => state::rollback_target(&sys.state, &sys.boot.selection),
+    };
+    if let Some(expected) = generation {
+        if !selected
+            .and_then(|s| sys.state.require_ready(s).ok())
+            .is_some_and(|g| g.id == expected)
+        {
+            return Err(error::refuse(
+                "stale generation: refresh status before selecting a system",
+            ));
+        }
+    }
+    sys.run(request)
+        .map_err(|e| error::or_class(e, error::ErrorClass::StateOrDetection))
+}
+
+pub use installation::{VerifiedInstallation, verify as verify_installation};

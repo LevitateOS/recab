@@ -22,6 +22,9 @@ struct Cli {
     /// any command that fails prints one JSON error on stderr.
     #[arg(long, global = true)]
     json: bool,
+    /// Emit operation start/completion/failure JSON lines on stderr; stdout remains the command result.
+    #[arg(long, global = true)]
+    machine_events: bool,
     /// Who asked for this, recorded with a change: a short label such as
     /// "person" or "agent:codex". Front ends set it; it grants nothing.
     #[arg(long, global = true, value_name = "LABEL")]
@@ -32,6 +35,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Verify both identical personalized initial roots and their boot payloads before finishing installation.
+    VerifyInstallation {
+        #[arg(long)]
+        root: PathBuf,
+    },
     /// Discover/download signed updates through Recipe; offline selection preserves prepared work.
     Update {
         #[command(subcommand)]
@@ -99,9 +107,6 @@ enum Command {
     /// Read the running system and the other one and say how alike they are;
     /// changes neither.
     Compare {
-        /// Report each step as a JSON line on stderr while reading.
-        #[arg(long)]
-        machine_events: bool,
         /// Compare two system trees mounted at these paths instead of this
         /// computer's two slots: the one taken as running, then the other.
         #[arg(long, num_args = 2, value_names = ["RUNNING", "OTHER"], conflicts_with = "machine_events")]
@@ -180,13 +185,33 @@ enum Command {
     SetNext {
         #[arg(value_name = "A|B", value_parser = str::parse::<Slot>)]
         slot: Slot,
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+        #[arg(long)]
+        generation: Option<String>,
     },
 
     /// Commit currently booted slot as known-good and default.
-    Commit,
+    Commit {
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+        #[arg(long)]
+        generation: Option<String>,
+    },
 
     /// Configure next boot to previously known-good slot.
-    Rollback,
+    Rollback {
+        #[arg(long, requires = "revision")]
+        preparation: Option<String>,
+        #[arg(long, requires = "preparation")]
+        revision: Option<u64>,
+        #[arg(long)]
+        generation: Option<String>,
+    },
 
     /// After startup: commit a healthy trial boot, or reboot into the
     /// known-good slot (run by the trial service on every boot).
@@ -316,9 +341,52 @@ fn main() -> ExitCode {
     let mut cli = Cli::parse();
     let json = cli.json;
     recab::set_actor(cli.actor.take());
+    let events = cli.machine_events;
+    let operation = match &cli.cmd {
+        Command::VerifyInstallation { .. } => "verify-installation",
+        Command::Update { .. } => "update",
+        Command::Release { .. } => "release",
+        Command::Change { .. } => "change",
+        Command::Edit { .. } => "edit",
+        Command::Finalize { .. } => "finalize",
+        Command::Prepare { .. } => "prepare",
+        Command::Discard { .. } => "discard",
+        Command::Compare { .. } => "compare",
+        Command::Inventory { .. } => "inventory",
+        Command::Status { .. } => "status",
+        Command::Stage { .. } => "stage",
+        Command::Init { .. } => "init",
+        Command::SetNext { .. } => "set-next",
+        Command::Commit { .. } => "commit",
+        Command::Rollback { .. } => "rollback",
+        Command::Trial { .. } => "trial",
+        Command::Health { .. } => "health",
+        Command::Baseline { .. } => "baseline",
+        Command::InstallUnit { .. } => "install-unit",
+    };
+    let event = |kind: &str, message: String, code: Option<u8>| {
+        if events {
+            eprintln!(
+                "{}",
+                serde_json::to_string(&recab::operations::Event {
+                    schema_version: 1,
+                    event: kind.into(),
+                    operation: operation.into(),
+                    message,
+                    code
+                })
+                .unwrap()
+            );
+        }
+    };
+    event("started", format!("Starting {operation}"), None);
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            event("finished", format!("Completed {operation}"), Some(0));
+            ExitCode::SUCCESS
+        }
         Err(err) => {
+            event("failed", format!("{err:#}"), Some(stable_exit_code(&err)));
             if json {
                 eprintln!("{}", recab::ErrorPayload::of(&err).to_json());
             } else {
@@ -331,6 +399,10 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
+        Command::VerifyInstallation { root } => println!(
+            "{}",
+            serde_json::to_string(&recab::verify_installation(&root)?)?
+        ),
         Command::Update { command } => {
             match &command {
                 UpdateCommand::Reproduce {
@@ -568,19 +640,22 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             revision,
         } => {
             recab::discard(&preparation, revision)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"operation":"discard","completed":true})
+                );
+            }
             if !cli.json {
                 println!(
                     "Preparation discarded. The inactive slot remains unavailable until a new system is completed."
                 );
             }
         }
-        Command::Compare {
-            machine_events,
-            roots,
-        } => {
+        Command::Compare { roots } => {
             let comparison = match roots.as_deref() {
                 Some([running, other]) => recab::compare_roots(running, other)?,
-                _ => recab::compare(machine_events)?,
+                _ => recab::compare(cli.machine_events)?,
             };
             if cli.json {
                 println!("{}", serde_json::to_string(&comparison)?);
@@ -628,6 +703,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 ),
             };
             recab::stage(&source, change_flavour)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"operation":"stage","completed":true})
+                );
+            }
             if !cli.json {
                 println!(
                     "Update staged in the inactive slot. Run 'recab status' to review it before scheduling a trial boot."
@@ -663,27 +744,81 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 options,
             })?
         }
-        Command::SetNext { slot } => {
-            recab::set_next(slot)?;
+        Command::SetNext {
+            slot,
+            preparation,
+            revision,
+            generation,
+        } => {
+            recab::checked_selection(
+                "set-next",
+                Some(slot),
+                preparation.as_deref(),
+                revision,
+                generation.as_deref(),
+            )?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"operation":"set-next","completed":true})
+                );
+            }
             if !cli.json {
                 println!("Slot {slot} selected for one trial boot. Reboot when ready.");
             }
         }
-        Command::Commit => {
-            recab::commit()?;
+        Command::Commit {
+            generation,
+            preparation,
+            revision,
+        } => {
+            recab::checked_selection(
+                "commit",
+                None,
+                preparation.as_deref(),
+                revision,
+                generation.as_deref(),
+            )?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"operation":"commit","completed":true})
+                );
+            }
             if !cli.json {
                 println!("The running slot is now known-good and the default for future boots.");
             }
         }
-        Command::Rollback => {
-            recab::rollback()?;
+        Command::Rollback {
+            generation,
+            preparation,
+            revision,
+        } => {
+            recab::checked_selection(
+                "rollback",
+                None,
+                preparation.as_deref(),
+                revision,
+                generation.as_deref(),
+            )?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"operation":"rollback","completed":true})
+                );
+            }
             if !cli.json {
                 println!("The known-good slot is selected for the next boot. Reboot when ready.");
             }
         }
         Command::Trial { timeout } => {
-            if let TrialOutcome::Committed(slot) = recab::trial(Duration::from_secs(timeout))? {
-                // The record of the decision (the journal, or the kernel log on OpenRC).
+            let result = recab::trial(Duration::from_secs(timeout))?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"operation":"trial","outcome":match result {TrialOutcome::Committed(_)=>"committed",TrialOutcome::NotATrial=>"no_verdict"}})
+                );
+            } else if let TrialOutcome::Committed(slot) = result {
                 println!("recab: committed slot {slot} after a healthy trial boot");
             }
         }
@@ -777,8 +912,62 @@ fn print_status(st: &Status, json: bool) -> anyhow::Result<()> {
         preparation,
         recovery_reason,
         lifecycle,
-        updates: _,
+        updates,
+        operations,
+        running_release,
+        prepared_release,
     } = st;
+    println!(
+        "Running release: {}; prepared release: {}",
+        running_release.as_deref().unwrap_or("unknown"),
+        prepared_release.as_deref().unwrap_or("none")
+    );
+    println!("Reboot needed: {}", yes_no(lifecycle.reboot_needed));
+    if let Some(u) = updates {
+        println!(
+            "Update: {}{}",
+            u.phase,
+            u.available
+                .as_ref()
+                .map(|r| format!(" {} ({})", r.version, r.id))
+                .unwrap_or_default()
+        );
+        if let Some(d) = &u.download {
+            println!(
+                "Downloaded: {} / {} verified bytes; complete: {}",
+                d.verified_bytes, d.total_bytes, d.downloaded
+            );
+        }
+        if let Some(e) = &u.last_error {
+            println!("Update error: {e}");
+        }
+        if let Some(m) = &u.merge {
+            println!(
+                "Merge: {} revision {}; {} unresolved conflicts",
+                m.phase, m.revision, m.unresolved
+            );
+            for c in &m.conflicts {
+                println!(
+                    "  {}: {} ({}) {}",
+                    c.id,
+                    c.path,
+                    c.kind,
+                    c.resolution.as_deref().unwrap_or("unresolved")
+                );
+            }
+        }
+    }
+    for op in operations {
+        println!(
+            "Operation {}: {:?}{}",
+            op.id,
+            op.verdict,
+            op.reason
+                .as_ref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default()
+        );
+    }
     println!(
         "State: {:?}; the other system: {:?}; a command is running: {}",
         lifecycle.state,

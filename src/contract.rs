@@ -11,7 +11,9 @@ use crate::{ErrorClass, ErrorPayload, Finalization, Health, Inventory, Preparati
 pub fn export() -> Result<Contract> {
     let docs = concat!(env!("CARGO_MANIFEST_DIR"), "/docs");
     let mut c = Contract::new("recab", &["recab"]);
-    c.schema::<crate::merge::MergeStatus>(docs,"merge")?
+    c.schema::<crate::VerifiedInstallation>(docs,"installation")?
+        .schema::<crate::operations::Event>(docs,"event")?
+        .schema::<crate::merge::MergeStatus>(docs,"merge")?
         .schema::<crate::update::UpdateStatus>(docs, "updates")?
         .schema::<crate::ChangeProgress>(docs, "change")?
         .schema::<Finalization>(docs, "finalization")?
@@ -22,6 +24,7 @@ pub fn export() -> Result<Contract> {
         .schema::<ErrorPayload>(docs, "error")?;
     c.types_from::<Status>()
         .types_from::<Health>()
+        .types_from::<crate::operations::Event>()
         .types_from::<ErrorPayload>();
     c.constant(
         "SLOTS",

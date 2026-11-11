@@ -149,7 +149,7 @@ fn persist(target: &Target, record: &mut Record) -> Result<()> {
     record.view.highest_index = record.highest_index;
     save(&record_path(target), record)
 }
-fn configuration(sys: &System) -> Result<(Identity, Policy, String, PathBuf)> {
+pub(crate) fn configuration(sys: &System) -> Result<(Identity, Policy, String, PathBuf)> {
     crate::change::verify_source(sys)?;
     source_configuration(&sys.target)
 }
@@ -365,6 +365,14 @@ fn summarize(id: &str, manifest: &ReleaseManifest) -> ReleaseSummary {
         channel: manifest.identity.channel.clone(),
         total_bytes: manifest.artifacts.all().iter().map(|a| a.size).sum(),
     }
+}
+pub(crate) fn cached_summary(target:&Target,id:&str)->Result<ReleaseSummary> {
+    valid_id(id)?;
+    let root=Root::open(&target.state_dir.join("releases").join(id))?;
+    let mut bytes=Vec::new();root.entry(Path::new(format::MANIFEST),false)?.open()?.take(format::MAX_MANIFEST as u64+1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len()<=format::MAX_MANIFEST && crate::generation::digest(&bytes)==id,"cached manifest identity mismatch");
+    let manifest:ReleaseManifest=serde_json::from_slice(&bytes)?;
+    Ok(summarize(id,&manifest))
 }
 pub fn check() -> Result<UpdateStatus> {
     let sys = System::locked("update-check")?;
@@ -689,6 +697,10 @@ pub(crate) fn view(sys: &System) -> Result<UpdateStatus> {
             ..Default::default()
         }
     };
+    if let Ok((identity,_))=crate::release::installed(&sys.target) {
+        if view.available.as_ref().is_some_and(|r|r.sequence<=identity.sequence) {view.available=None;}
+        if view.download.as_ref().is_some_and(|d|cached_summary(&sys.target,&d.release).is_ok_and(|r|r.sequence<=identity.sequence)) {view.download=None;}
+    }
     if let Some(value) = pending(sys)? {
         view.phase = "awaiting_merge".into();
         view.pending_release = Some(value.release);

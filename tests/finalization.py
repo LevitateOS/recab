@@ -7,7 +7,7 @@ an actual VM boot can establish PID 1, hardware-driver and service behavior.
 import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
 sys.dont_write_bytecode=True
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");p.add_argument('--trials',action='store_true',help='exercise generation-bound trial recovery on these real filesystems');args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");p.add_argument('--trials',action='store_true',help='exercise generation-bound trial recovery on these real filesystems');p.add_argument('--lifecycle',action='store_true');args=p.parse_args()
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
 BIN=str(args.binary.resolve(strict=True));KERNEL=args.kernel.resolve(strict=True);MODULE=args.module.resolve(strict=True)
 GUID='4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
@@ -147,6 +147,8 @@ def installation():
         generation=complete['generation'];(proc/'cmdline').write_text(f'root=PARTUUID={uuid["A"]} ro recab.immutable recab.slot=A recab.generation={generation["id"]}\n');refresh()
         status=cli(active,'status');check(all(s['generation_ready'] and s['bootable'] and s['generation']['id']==generation['id'] for s in status['slots']),'both initial systems are not ready/bootable')
         check(status['slots'][0]['readiness']=='committed' and status['slots'][1]['readiness']=='ready' and status['last_trial'] is None,'initial B was falsely trial-committed')
+        proof=cli(env,'verify-installation','--root',str(root));check(proof['complete'] and proof['slots']==['A','B'],'paired installer completion missing')
+        missing=boot/'loader/entries/lev-b.conf';saved_entry=missing.read_bytes();missing.unlink();cli(env,'verify-installation','--root',str(root),code=21,contains='entry');missing.write_bytes(saved_entry)
         cli(active,'set-next','B');cli(active,'rollback')
         prepared=cli(active,'prepare');check(prepared['synchronization']['payload_bytes_written']==0,'first continuation rewrote the installed system')
         # A completed init must never reset a preparation or resurrect its entry.
@@ -248,7 +250,13 @@ try:
     def running(slot,g):
         (proc/'cmdline').write_text(f'root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n');(proc/'self/mountinfo').write_text(Path('/proc/self/mountinfo').read_text());return dict(env,RECAB_ROOT=str(roots[slot]))
     active=running(first,ga if first=='A' else gb)
+    if args.lifecycle:
+        from lifecycle import observe
+        old_prepare=next(o for o in observe(globals(),active,'stable-initial')['operations'] if o['id']=='prepare')
     prepared=cli(active,'prepare');check(prepared['phase']=='prepared','preparation did not complete')
+    if args.lifecycle:
+        from lifecycle import execute
+        execute(globals(),active,'prepare',operation=old_prepare,code=21)
     if updates:
         result=updates.exercise(globals(),active);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     if args.release_builder:
@@ -276,6 +284,7 @@ try:
         time.sleep(.005)
     else:raise RuntimeError('finalization intent not observed')
     audit.unlink();interrupted=cli(active,'status')['preparation']
+    if args.lifecycle:observe(globals(),active,'interrupted-finalization')
     check(not (esp/'loader/entries/lev-b.conf').exists() and run('blockdev','--getro',dev['A']).stdout.strip()==b'1','interruption exposed candidate or unprotected A')
     # Force publication failure with an actual read-only bind in the child's
     # private namespace, after its root-generation checkpoint was saved.
@@ -308,6 +317,9 @@ try:
     # Idempotence and stale revision refusal.
     same=cli(active,'finalize');check(same['generation']['id']==complete['generation']['id'],'idempotent finalization changed identity')
     current=cli(active,'status')['preparation'];cli(active,'finalize','--preparation',current['id'],'--revision','0',code=21,contains='stale')
+    if args.lifecycle:
+        from lifecycle import exercise
+        result=exercise(globals(),active,'B',complete);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     if args.trials:
         from trials import exercise
         result=exercise(globals(),active,'B',complete['generation']);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)

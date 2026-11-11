@@ -449,3 +449,38 @@ pub(crate) fn run(target: Target, request: &InitRequest, a: &Path, b: &Path) -> 
         )
     })
 }
+
+/// Installer completion is evidence about both personalized roots, not just an
+/// exit code from writing one boot entry. This is read-only filesystem validation.
+#[cfg_attr(feature="contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerifiedInstallation {
+    pub schema_version: u32,
+    pub complete: bool,
+    pub slots: Vec<Slot>,
+    pub generation: String,
+}
+pub fn verify(root: &Path) -> Result<VerifiedInstallation> {
+    crate::system::require_root("verify-installation")?;
+    let target=Target::installed(root)?;
+    let _lock=Store::new(&target).lock()?;
+    let record=read(&target)?.ok_or_else(||refuse("initial A/B installation record is missing"))?;
+    if record.version!=1 || !record.complete {return Err(refuse("both initial systems must be completely published"));}
+    same_ledger(&target,&record)?;
+    Store::new(&target).require_mounted()?;
+    crate::filesystem::private_mounts()?;
+    let backend=SystemdBoot::new(&target);
+    let state=Store::new(&target).load()?.context("installation ledger missing")?;
+    let boot=backend.read(&state)?;
+    let sys=crate::system::System::read(Some(root))?;
+    anyhow::ensure!(boot.selection.active==Slot::A,"installer verification must use the personalized initial root A");
+    let generation=record.generation.as_ref().context("initial generation missing")?;
+    for slot in Slot::ALL {
+        if slot==Slot::A {record_matches(root,slot,&record)?;crate::candidate::runtime_protocol(&Root::open(root)?)?;}
+        else {let mount=crate::slot_mount::SlotMount::installed(&target,&record.roots[slot as usize],&generation.id)?;record_matches(&mount.point,slot,&record)?;crate::candidate::runtime_protocol(&Root::open(&mount.point)?)?;mount.seal()?;}
+        backend.verify_generation(&boot,slot,generation)?;
+        crate::finalize::verify_entry(&sys,slot,generation,record.seal.as_ref().context("installation seal missing")?)?;
+        backend.verify_manifest(generation,record.seal.as_ref().context("installation boot seal missing")?)?;
+    }
+    Ok(VerifiedInstallation {schema_version:1,complete:true,slots:Slot::ALL.to_vec(),generation:generation.id.clone()})
+}

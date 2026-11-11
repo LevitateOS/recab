@@ -223,7 +223,10 @@ class Updates:
         check(selected['phase']=='conflicted' and not selected['merge_complete'],'collisions did not stop the merge')
         check(candidate()==before_b,'conflicted merge modified captured X')
         check({c['kind'] for c in selected['merge']['conflicts']} >= {'directory_tree','account_fields','content_or_metadata'},'conflict classes incomplete')
-        cli(active,'finalize',code=21);cli(active,'prepare',code=21)
+        cli(active,'finalize',code=21)
+        if h['args'].lifecycle:
+            from lifecycle import observe
+            observed=observe(h,active,'release-conflicted');check(observed['lifecycle']['state']=='conflicted','merge conflicts not exposed in lifecycle');check(any(o['id'].startswith('resolve:') for o in observed['operations']),'conflict resolution commands missing');cli(active,'prepare',code=21)
         p=cli(active,'status')['preparation'];cli(active,'update','cancel','--preparation',p['id'],'--revision',str(p['revision']))
         cli(active,'prepare');check(candidate()==before_b,'cancel/reopen lost X')
         selected=cli(active,'update','apply',id);merge=selected['merge']
@@ -317,6 +320,9 @@ class Updates:
         cli(active,'stage','--manifest',str(bundle/'release.json'));check(run('blkid','-c','/dev/null','-s','UUID','-o','value',h['dev'][inactive]).stdout==filesystem_uuid,'stage reformatted the inactive system')
         ledger=(state/'state.json').read_bytes();cli(active,'update','apply',id);check((state/'state.json').read_bytes()==ledger,'reapplying completed release changed preparation')
         changed=base/'Y';changed.write_text('later Y\n');cli(active,'edit','etc/config','--file',str(changed));last=cli(active,'finalize')
+        if h['args'].lifecycle:
+            from lifecycle import exercise
+            return exercise(h,active,inactive,last)
         if h['args'].trials:
             from trials import exercise
             return exercise(h,active,inactive,last['generation'])

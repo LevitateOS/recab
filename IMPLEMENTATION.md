@@ -236,7 +236,7 @@ entries remain unchanged. The host lacks EROFS zstd, so mounted consumer checks
 use a genuine small LZ4 fixture; producer provenance avoids that host limitation.
 No full distro/ISO/kernel builds or VM boots were run. P08 acquisition/index
 publishing, P09 release merging and P10 assessment recovery are implemented
-below; P11 complete frontend work remains.
+below, including the P11 lifecycle interfaces.
 
 The starting-point description below records the pre-implementation audit.
 
@@ -806,7 +806,7 @@ P09 implementation:
   account/member changes, real Recipe reproduction, a kill after a release file
   was written, frozen-input tampering refusal, captured-C recovery, hardlinks,
   idempotent apply and later changes. Full system builds and VM boots remain
-  explicitly unrun; P10 health/fallback and P11 complete frontend flows remain.
+  explicitly unrun at that checkpoint; P10 recovery and P11 interfaces follow below.
 
 ### P10 Make trial and fallback cover assessment failures
 
@@ -891,6 +891,39 @@ Owners: recab `main.rs`, `status.rs`, `contract.rs`, schemas; `xtask` generation
 Evidence: existing frontend fixtures and real command integration cover stable,
 preparing, conflicted, interrupted, ready, pending-trial and failed-trial states
 in both directions; no frontend silently discards X.
+
+P11 implementation:
+
+- Status schema 10 exports concrete operations, declared inputs, refusal reasons,
+  generation/readiness views, release names and lifecycle facts. CLI boundary
+  events have their own schema; stdout remains the result. Generated schemas
+  and TypeScript include this interface.
+- Selection commands accept preparation and generation guards. The explicit
+  empty-session snapshot (`none`, revision 0) also rejects newly-created work.
+  Reopening a finalized candidate preserves X. Failed candidates lacking a
+  preparation require explicit replacement; ordinary change actions refuse.
+- Lifecycle conflicts, in-progress work and interrupted merge publication are
+  reported directly. A running trial's other system is its protected previous
+  generation. Failed-trial presentation requires the same generation pair.
+- The existing TUI consumes the catalog, gathers inputs without shell parsing,
+  preserves command snapshots through confirmation, and exposes software,
+  configuration, acquisition, merges, resolutions, reproduction, recovery,
+  finalization, boot selection and explicit discard. Desktop System retains
+  its existing pages and adds catalog controls; Disk understands schema 10 and
+  the actual release names. Resolution requests refresh between decisions.
+- A/B installer completion verifies both personalized inventories, generation
+  records and sealed boot sets. Shared install state records the paired proof;
+  older boot flags must be verified again. Finishing checks before unmounting.
+
+Focused evidence: native CLI/catalog integration exercises edit, reopen,
+finalize, trial selection and commit in both directions, preserves the running
+root and rejects stale revisions. A signed P09 merge candidate covers conflicts,
+interruption, captured recovery and subsequent catalog activation. Installer
+checks verify both roots and refuse a missing B entry. Existing TUI stories
+cover stable, preparing, conflicted, interrupted, ready, scheduled and failed
+states in both directions, including a disappearing resolved conflict. Changed
+Qt objects compile independently; this is not a full Qt application build or a
+physical/VM boot claim. Full system builds and VM scenarios remain unrun.
 
 ### P12 Retire the old assumptions and deploy safely
 
