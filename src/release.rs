@@ -4,7 +4,7 @@
 use crate::{error::refuse, filesystem::Root, stage::Mounted, target::Target};
 
 pub const RECAB_VERSION: &str = env!("CARGO_PKG_VERSION");
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use distro_contract::release::{
     self as contract, Architecture, Artifact, Identity, Policy, ReleaseManifest, SystemInventory,
     Trust,
@@ -161,18 +161,39 @@ pub fn verify_bundle(
     trusted_local: bool,
     expected: Option<&Identity>,
 ) -> Result<VerifiedRelease> {
-    verify_in(manifest, trust, trusted_local, expected, false, None, None, None)
+    verify_in(
+        manifest,
+        Verification {
+            trust,
+            trusted_local,
+            expected,
+            allow_flavour: false,
+            cache_parent: None,
+            produced: None,
+            delegated: None,
+        },
+    )
 }
-fn verify_in(
-    manifest: &Path,
-    trust: Option<&Trust>,
+struct Verification<'a> {
+    trust: Option<&'a Trust>,
     trusted_local: bool,
-    expected: Option<&Identity>,
+    expected: Option<&'a Identity>,
     allow_flavour: bool,
-    cache_parent: Option<&Path>,
-    produced: Option<(&Path, &contract::RootfsProvenance)>,
-    delegated: Option<(Option<&Target>, &Policy)>,
-) -> Result<VerifiedRelease> {
+    cache_parent: Option<&'a Path>,
+    produced: Option<(&'a Path, &'a contract::RootfsProvenance)>,
+    delegated: Option<(Option<&'a Target>, &'a Policy)>,
+}
+
+fn verify_in(manifest: &Path, verification: Verification<'_>) -> Result<VerifiedRelease> {
+    let Verification {
+        trust,
+        trusted_local,
+        expected,
+        allow_flavour,
+        cache_parent,
+        produced,
+        delegated,
+    } = verification;
     crate::system::require_root("verify release")?;
     let parent = manifest
         .parent()
@@ -186,19 +207,37 @@ fn verify_in(
         contract::MAX_MANIFEST as u64,
     )?;
     let delegation = if let Some((target, policy)) = delegated {
-        let mut proof = read(&input, Path::new(contract::production::AUTHORITY_FILE), contract::production::MAX_AUTHORITY as u64)?;
+        let mut proof = read(
+            &input,
+            Path::new(contract::production::AUTHORITY_FILE),
+            contract::production::MAX_AUTHORITY as u64,
+        )?;
         let signature = read(&input, Path::new(contract::SIGNATURE), 64)?;
         let signer = if let Some(target) = target {
-            let authenticated = crate::update::production::signer(target, policy, &input, &bytes, &signature)?;
-            proof = authenticated.1; authenticated.0
+            let authenticated =
+                crate::update::production::signer(target, policy, &input, &bytes, &signature)?;
+            proof = authenticated.1;
+            authenticated.0
         } else {
             let identity = ReleaseManifest::parse(&bytes)?.identity;
-            contract::production::AuthorityProof::parse(&proof)?.verify(policy.production.as_ref().unwrap(), &identity.distro, &identity.channel, crate::update::production::now()?)?
-                .verify(contract::production::SigningRole::Release, &bytes, &signature)?
+            contract::production::AuthorityProof::parse(&proof)?
+                .verify(
+                    policy.production.as_ref().unwrap(),
+                    &identity.distro,
+                    &identity.channel,
+                    crate::update::production::now()?,
+                )?
+                .verify(
+                    contract::production::SigningRole::Release,
+                    &bytes,
+                    &signature,
+                )?
         };
         Some((signer, proof))
-    } else { None };
-    let trust = delegation.as_ref().map(|v|&v.0).or(trust);
+    } else {
+        None
+    };
+    let trust = delegation.as_ref().map(|v| &v.0).or(trust);
     let signature = if let Some(trust) = trust {
         let signature = read(&input, Path::new(contract::SIGNATURE), 64)?;
         contract::verify_signature(&bytes, &signature, trust)?;
@@ -239,7 +278,10 @@ fn verify_in(
         fs::write(directory.path().join(contract::SIGNATURE), signature)?;
     }
     if let Some((_, proof)) = &delegation {
-        fs::write(directory.path().join(contract::production::AUTHORITY_FILE), proof)?;
+        fs::write(
+            directory.path().join(contract::production::AUTHORITY_FILE),
+            proof,
+        )?;
     }
     crate::filesystem::flush(&Root::open(directory.path())?)?;
     // Freeze names as well as bytes. The path-only mount/recstrap interfaces
@@ -253,7 +295,9 @@ fn verify_in(
     let verified = VerifiedRelease {
         manifest: parsed,
         bytes,
-        authentication: if delegation.is_some() { "delegated" } else if trust.is_some() {
+        authentication: if delegation.is_some() {
+            "delegated"
+        } else if trust.is_some() {
             "distribution_signature"
         } else {
             "trusted_local"
@@ -288,8 +332,16 @@ pub fn verify_produced_bundle(
 ) -> Result<VerifiedRelease> {
     let policy = read_policy(&Root::open(root)?)?;
     verify_in(
-        manifest, trust, trusted_local, None, false, None, Some((root, proof)),
-        policy.production.as_ref().map(|_|(None, &policy)),
+        manifest,
+        Verification {
+            trust,
+            trusted_local,
+            expected: None,
+            allow_flavour: false,
+            cache_parent: None,
+            produced: Some((root, proof)),
+            delegated: policy.production.as_ref().map(|_| (None, &policy)),
+        },
     )
 }
 fn validate_set(target: &Target, verified: &VerifiedRelease) -> Result<()> {
@@ -311,7 +363,10 @@ fn validate_root(path: &Path, verified: &VerifiedRelease, produced: bool) -> Res
     let inventory =
         SystemInventory::parse(&fs::read(verified.member(&manifest.artifacts.inventory))?)?;
     let root = Root::open(path)?;
-    ensure!(root.metadata(Path::new(crate::merge::BASELINE))?.is_none(),"release images must not contain an installed personalized baseline");
+    ensure!(
+        root.metadata(Path::new(crate::merge::BASELINE))?.is_none(),
+        "release images must not contain an installed personalized baseline"
+    );
     let identity = root
         .optional_text(Path::new("etc/os-release"))?
         .context("release has no os-release")?;
@@ -328,7 +383,10 @@ fn validate_root(path: &Path, verified: &VerifiedRelease, produced: bool) -> Res
         "release rootfs identity differs from manifest"
     );
     let policy = read_policy(&root)?;
-    ensure!(policy.production.is_none() || verified.authentication == "delegated", "delegated release cannot use unsigned/local or legacy-key authentication");
+    ensure!(
+        policy.production.is_none() || verified.authentication == "delegated",
+        "delegated release cannot use unsigned/local or legacy-key authentication"
+    );
     ensure!(
         policy.channel == manifest.identity.channel
             && policy.sequence == manifest.identity.sequence,
@@ -397,13 +455,15 @@ pub(crate) fn for_target(
     let (identity, policy) = installed(target)?;
     verify_in(
         manifest,
-        policy.trust.as_ref(),
-        trusted_local,
-        Some(&identity),
-        allow_flavour,
-        None,
-        None,
-        policy.production.as_ref().map(|_|(Some(target), &policy)),
+        Verification {
+            trust: policy.trust.as_ref(),
+            trusted_local,
+            expected: Some(&identity),
+            allow_flavour,
+            cache_parent: None,
+            produced: None,
+            delegated: policy.production.as_ref().map(|_| (Some(target), &policy)),
+        },
     )
 }
 /// Import a verified release into a content-addressed cache. The installed
@@ -433,22 +493,29 @@ pub(crate) fn import_locked(
     manifest: &Path,
     trusted_local: bool,
 ) -> Result<ImportedRelease> {
-    import_locked_options(target,manifest,trusted_local,false)
+    import_locked_options(target, manifest, trusted_local, false)
 }
-pub(crate) fn import_locked_options(target:&Target,manifest:&Path,trusted_local:bool,allow_flavour:bool)->Result<ImportedRelease> {
+pub(crate) fn import_locked_options(
+    target: &Target,
+    manifest: &Path,
+    trusted_local: bool,
+    allow_flavour: bool,
+) -> Result<ImportedRelease> {
     let parent = target.state_dir.join("releases");
     fs::create_dir_all(&parent)?;
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
     let (identity, policy) = installed(target)?;
     let mut verified = verify_in(
         manifest,
-        policy.trust.as_ref(),
-        trusted_local,
-        Some(&identity),
-        allow_flavour,
-        Some(&parent),
-        None,
-        policy.production.as_ref().map(|_|(Some(target), &policy)),
+        Verification {
+            trust: policy.trust.as_ref(),
+            trusted_local,
+            expected: Some(&identity),
+            allow_flavour,
+            cache_parent: Some(&parent),
+            produced: None,
+            delegated: policy.production.as_ref().map(|_| (Some(target), &policy)),
+        },
     )?;
     let cache = parent.join(verified.id());
     if cache.exists() {
