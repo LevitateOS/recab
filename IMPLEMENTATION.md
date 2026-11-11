@@ -1022,7 +1022,8 @@ metadata/entry publication failures in both directions. They also cover actual
 lock serialization, stale revision refusal, prepared failure service removal,
 shared data, independent profiles and active/prepared Recipe selections.
 Metadata-only changes preserve the existing data inode; their later removal
-survives reverse synchronization.
+survives reverse synchronization. The reproduction recipe also ran through the
+real worker with its declared, hash-verified release-context input.
 A full Recipe work filesystem now returns the contextual state refusal (21),
 with the candidate unselectable and active root unchanged. Native boot identities
 remain observations, not exercised firmware/init boots. The origin helper also
@@ -1040,7 +1041,7 @@ race, and the signed discovery/download/merge regression passed with re-staging
 under concurrent renames. The original cause is resolved.
 
 The expanded native lifecycle passed for both inits on x86_64.
-Measured Y payload was 1,051,060 bytes (systemd) / 1,051,058 bytes (OpenRC),
+Measured Y payload was 1,051,066 bytes (systemd) / 1,051,064 bytes (OpenRC),
 with root block writes 1,105,920 / 1,104,896 bytes, rather than rewriting the
 32 MiB file. The reports identify actual input binaries, kernel, runtime and
 probe hashes and retain conservative accounting after interrupted finalization.
