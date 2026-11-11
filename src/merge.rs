@@ -285,7 +285,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 fn unhex(s: &str) -> Result<Vec<u8>> {
     ensure!(
-        s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit()),
+        s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid merge path bytes"
     );
     (0..s.len())
@@ -1258,20 +1258,20 @@ fn resume(sys: &System, mut j: Journal) -> Result<MergeStatus> {
                 "validated release baseline changed"
             );
             let uuid = sys.backend.slot_partuuid(&sys.boot, p.slot)?;
-            crate::candidate::check(
-                &mount.point,
-                &sys.target.root,
-                p.slot,
-                &uuid,
-                &crate::immutable::state_partition(&sys.target)?,
-                &sys.backend.partition()?,
-                &v.kernel(),
-                &v.initramfs(),
-                &sys.state
+            crate::candidate::check(crate::candidate::Request {
+            root: &mount.point,
+            source: &sys.target.root,
+            slot: p.slot,
+            uuid: &uuid,
+            state_uuid: &crate::immutable::state_partition(&sys.target)?,
+            esp_uuid: &sys.backend.partition()?,
+            kernel_path: &v.kernel(),
+            initrd_path: &v.initramfs(),
+            known_kernel: &sys.state
                     .require_ready(sys.boot.selection.active)?
                     .kernel_digest,
-                j.allow_flavour,
-            )?;
+            change_flavour: j.allow_flavour,
+        })?;
             if fs::symlink_metadata(mount.point.join(WORK)).is_ok() {
                 Root::open(&mount.point)?
                     .entry(Path::new(WORK), false)?
@@ -1418,12 +1418,10 @@ fn resume(sys: &System, mut j: Journal) -> Result<MergeStatus> {
         let writer = crate::sync::Synchronization::merged(
             directory.path(),
             &mount.point,
-            desired.clone(),
-            &j.removals,
+            crate::sync::Selection { desired: desired.clone(), removals: &j.removals, sources },
             p.slot,
             &uuid,
             &p.id,
-            sources,
         )?;
         let report = writer.apply(SyncReport {
             accounting_complete: !was_frozen,
@@ -1441,20 +1439,20 @@ fn resume(sys: &System, mut j: Journal) -> Result<MergeStatus> {
         crate::candidate::accounts(&Root::open(&mount.point)?)?;
         // Full boot/runtime validation uses the selected release's matching boot
         // set. No baseline is advanced merely because a conflict was resolved.
-        crate::candidate::check(
-            &mount.point,
-            &sys.target.root,
-            p.slot,
-            &uuid,
-            &crate::immutable::state_partition(&sys.target)?,
-            &sys.backend.partition()?,
-            &v.kernel(),
-            &v.initramfs(),
-            &sys.state
+        crate::candidate::check(crate::candidate::Request {
+            root: &mount.point,
+            source: &sys.target.root,
+            slot: p.slot,
+            uuid: &uuid,
+            state_uuid: &crate::immutable::state_partition(&sys.target)?,
+            esp_uuid: &sys.backend.partition()?,
+            kernel_path: &v.kernel(),
+            initrd_path: &v.initramfs(),
+            known_kernel: &sys.state
                 .require_ready(sys.boot.selection.active)?
                 .kernel_digest,
-            j.allow_flavour,
-        )?;
+            change_flavour: j.allow_flavour,
+        })?;
         assigned_labels(&mut j.next.inventory, &inventory(&mount.point)?);
         write_baseline(&mount.point, &j.next)?;
         // This checkpoint owns completion after private inputs are collected.

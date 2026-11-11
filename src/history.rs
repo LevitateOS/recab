@@ -278,7 +278,7 @@ pub fn history() -> Result<History> {
         changes_of(&state, &mut seen, &mut ordered, records as u64 * 2 + 1);
     }
     // Newest first; the later in the log, the newer, when times are equal.
-    ordered.sort_by(|a, b| (b.1.time, b.0).cmp(&(a.1.time, a.0)));
+    ordered.sort_by_key(|a| std::cmp::Reverse((a.1.time, a.0)));
     Ok(History {
         schema_version: HISTORY_SCHEMA_VERSION,
         entries: ordered.into_iter().map(|(_, entry)| entry).collect(),

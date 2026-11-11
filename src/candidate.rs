@@ -34,7 +34,7 @@ fn relative(p: &str) -> Result<&Path> {
 pub(crate) fn kernel(path: &Path) -> Result<(u16, String)> {
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();
-    if size < 4096 || size > 512 * 1024 * 1024 {
+    if !(4096..=512 * 1024 * 1024).contains(&size) {
         return Err(refuse("invalid kernel image size"));
     }
     let mut header = [0u8; 4096];
@@ -111,18 +111,21 @@ pub(crate) fn kernel(path: &Path) -> Result<(u16, String)> {
     Ok((machine, release))
 }
 
-pub(crate) fn check(
-    root: &Path,
-    source: &Path,
-    slot: Slot,
-    uuid: &str,
-    state_uuid: &str,
-    esp_uuid: &str,
-    kernel_path: &Path,
-    initrd_path: &Path,
-    known_kernel: &str,
-    change_flavour: bool,
-) -> Result<Checked> {
+pub(crate) struct Request<'a> {
+    pub root: &'a Path,
+    pub source: &'a Path,
+    pub slot: Slot,
+    pub uuid: &'a str,
+    pub state_uuid: &'a str,
+    pub esp_uuid: &'a str,
+    pub kernel_path: &'a Path,
+    pub initrd_path: &'a Path,
+    pub known_kernel: &'a str,
+    pub change_flavour: bool,
+}
+
+pub(crate) fn check(request: Request<'_>) -> Result<Checked> {
+    let Request { root, source, slot, uuid, state_uuid, esp_uuid, kernel_path, initrd_path, known_kernel, change_flavour } = request;
     let opened = Root::open(root)?;
     let old = Root::open(source)?;
     let profile = text(&opened, "etc/os-release")?;
@@ -669,7 +672,7 @@ fn module_stream(input: &mut impl Read, release: &str) -> Result<(String, u16, b
         }
         carry.extend_from_slice(&buffer[..n]);
         version |= carry.windows(needle.len() + 1).any(|w| {
-            &w[..needle.len()] == needle
+            w[..needle.len()] == needle
                 && (w[needle.len()] == 0 || w[needle.len()].is_ascii_whitespace())
         });
         if carry.len() > 128 {

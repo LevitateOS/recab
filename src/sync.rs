@@ -17,6 +17,13 @@ use crate::generation::{EXCLUDED, Extent, Inventory, MARKER, Node, digest, exten
 
 const RANGE: u64 = 1024 * 1024;
 
+pub(crate) struct Selection<'a> {
+    pub desired: Inventory,
+    pub removals: &'a [Vec<u8>],
+    pub sources: BTreeMap<Vec<u8>, PathBuf>,
+}
+
+
 /// Logical writes made by the synchronizer, not SSD/controller write amplification.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -327,8 +334,8 @@ impl Synchronization {
         // An excluded real directory was not traversed; never recursively erase it
         // to turn it into a symlink, even when the desired source has that link.
         for node in &desired.entries {
-            if !node.path.contains(&b'/') && EXCLUDED.contains(&node.path.as_slice()) {
-                if destination_root
+            if !node.path.contains(&b'/') && EXCLUDED.contains(&node.path.as_slice())
+                && destination_root
                     .metadata(path(&node.path))?
                     .is_some_and(|m| m.is_dir())
                     && node.kind != "dir"
@@ -337,7 +344,6 @@ impl Synchronization {
                         "cannot replace a shared/runtime directory with a system entry",
                     ));
                 }
-            }
         }
         removals.sort_by(|a, b| depth(b).cmp(&depth(a)).then(b.cmp(a)));
         let mut operations = removals
@@ -464,14 +470,15 @@ impl Synchronization {
         uuid: &str,
         id: &str,
     ) -> Result<Self> {
-        Self::selection(source,destination,desired,&removals.iter().map(|p|p.as_bytes().to_vec()).collect::<Vec<_>>(),slot,uuid,id,false,BTreeMap::new())
+        Self::selection(source,destination,Selection {desired, removals: &removals.iter().map(|p|p.as_bytes().to_vec()).collect::<Vec<_>>(), sources: BTreeMap::new()},slot,uuid,id,false)
     }
     /// Complete, already resolved merge selection. Every descendant removal is
     /// explicit; no recursive removal can cross into shared/runtime contents.
-    pub(crate) fn merged(source:&Path,destination:&Path,desired:Inventory,removals:&[Vec<u8>],slot:Slot,uuid:&str,id:&str,sources:BTreeMap<Vec<u8>,PathBuf>)->Result<Self> {
-        Self::selection(source,destination,desired,removals,slot,uuid,id,true,sources)
+    pub(crate) fn merged(source:&Path,destination:&Path,selection:Selection<'_>,slot:Slot,uuid:&str,id:&str)->Result<Self> {
+        Self::selection(source,destination,selection,slot,uuid,id,true)
     }
-    fn selection(source:&Path,destination:&Path,mut desired:Inventory,removals:&[Vec<u8>],slot:Slot,uuid:&str,id:&str,tree:bool,sources:BTreeMap<Vec<u8>,PathBuf>)->Result<Self> {
+    fn selection(source:&Path,destination:&Path,selection:Selection<'_>,slot:Slot,uuid:&str,id:&str,tree:bool)->Result<Self> {
+        let Selection { mut desired, removals, sources } = selection;
         let source = Root::open(source)?;
         let destination_root = Root::open(destination)?;
         desired.entries.retain(|n| !n.path.is_empty());
@@ -488,10 +495,7 @@ impl Synchronization {
             .map(|n| (n.path.clone(), n))
             .collect::<BTreeMap<_, _>>();
         let mut operations = Vec::new();
-        let mut deleting = removals
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut deleting = removals.to_vec();
         for node in &desired.entries {
             if actual
                 .get(&node.path)

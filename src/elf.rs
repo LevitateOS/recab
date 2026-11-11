@@ -85,7 +85,7 @@ impl Elf {
             let mut entries = Vec::new();
             let mut table = None;
             let mut table_size = None;
-            for d in bytes.chunks_exact(16) {
+            for d in bytes.as_chunks::<16>().0 {
                 let key = u64_at(d, 0);
                 let value = u64_at(d, 8);
                 if key == 0 {

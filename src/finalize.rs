@@ -89,18 +89,18 @@ pub fn finalize(request: &FinalizeRequest) -> Result<Finalization> {
         _ if merged_inputs.is_some() => {let inputs=merged_inputs.as_ref().unwrap();(inputs.kernel(),inputs.initramfs())},
         _ => sys.backend.inputs(&sys.boot, active)?,
     };
-    let checked = crate::candidate::check(
-        &mount.point,
-        &sys.target.root,
-        slot,
-        &uuid,
-        &state_uuid,
-        &esp_uuid,
-        &kernel,
-        &initrd,
-        &source.kernel_digest,
-        request.change_flavour || merged_inputs.as_ref().is_some_and(|v|crate::release::installed(&sys.target).is_ok_and(|(identity,_)|identity.flavour!=v.manifest().identity.flavour)),
-    )
+    let checked = crate::candidate::check(crate::candidate::Request {
+            root: &mount.point,
+            source: &sys.target.root,
+            slot,
+            uuid: &uuid,
+            state_uuid: &state_uuid,
+            esp_uuid: &esp_uuid,
+            kernel_path: &kernel,
+            initrd_path: &initrd,
+            known_kernel: &source.kernel_digest,
+            change_flavour: request.change_flavour || merged_inputs.as_ref().is_some_and(|v|crate::release::installed(&sys.target).is_ok_and(|(identity,_)|identity.flavour!=v.manifest().identity.flavour)),
+        })
     .map_err(|error| crate::error::or_class(error, ErrorClass::StateOrDetection))?;
     let policy = crate::runtime::Policy::check(&mount.point, checked.init)?;
     sys.backend.preflight_objects(&checked)?;

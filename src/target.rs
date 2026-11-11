@@ -22,6 +22,7 @@ pub fn state_file() -> String {
 }
 
 /// recab's audit log on an installed system, as an absolute path.
+#[cfg(feature = "contracts")]
 pub fn audit_file() -> String {
     format!("{STATE_MOUNT}/{STATE_DIR}/{AUDIT_FILE}")
 }

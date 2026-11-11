@@ -41,15 +41,13 @@ pub fn trial(timeout: Duration) -> Result<TrialOutcome> {
     // Never read stale state through an unmounted /var directory, or recreate
     // state there. Keep the run lock even when the durable ledger is absent.
     let mounted = Store::new(&target).require_mounted();
-    let sys = if mounted.is_ok() {
+    let sys = mounted.and_then(|()| {
         System::read_locked(target.clone(), held.take().unwrap()).and_then(|sys| {
             anyhow::ensure!(sys.state_found, "durable recab state is missing");
             sys.state.check_mutable()?;
             Ok(sys)
         })
-    } else {
-        Err(mounted.unwrap_err())
-    };
+    });
     if held.is_none() && sys.is_err() {
         held = Some(lock(&target, "trial recovery")?);
     }

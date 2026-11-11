@@ -424,7 +424,7 @@ pub(crate) fn import_locked_options(target:&Target,manifest:&Path,trusted_local:
     let parent = target.state_dir.join("releases");
     fs::create_dir_all(&parent)?;
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))?;
-    let (identity, policy) = installed(&target)?;
+    let (identity, policy) = installed(target)?;
     let mut verified = verify_in(
         manifest,
         policy.trust.as_ref(),

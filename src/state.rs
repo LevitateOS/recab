@@ -201,7 +201,7 @@ impl PersistentState {
             StateSchema::Legacy(1)
             | StateSchema::Current {
                 major: 2,
-                minor: 0 | 1 | 2 | 3 | 4 | 5,
+                minor: 0..=5,
             } => Ok(()),
             _ => Err("unsupported recab state format; use a compatible recovery tool".into()),
         }

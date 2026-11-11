@@ -517,7 +517,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     revision,
                 } => recab::update::cancel(&preparation, revision),
             }
-            .map_err(|e| recab::update_error(e))?;
+            .map_err(recab::update_error)?;
             println!("{}", serde_json::to_string(&result)?);
         }
         Command::Release {

@@ -283,18 +283,18 @@ pub(crate) fn run(target: Target, request: &InitRequest, a: &Path, b: &Path) -> 
     if record.generation.is_none() {
         crate::immutable::prepare(&target.root, Slot::A, &state)?;
     }
-    let checked = crate::candidate::check(
-        &target.root,
-        &target.root,
-        Slot::A,
-        &roots[0],
-        &state,
-        &esp,
-        &kernel,
-        &initrd,
-        &crate::generation::hash_file(&kernel)?,
-        false,
-    )?;
+    let checked = crate::candidate::check(crate::candidate::Request {
+            root: &target.root,
+            source: &target.root,
+            slot: Slot::A,
+            uuid: &roots[0],
+            state_uuid: &state,
+            esp_uuid: &esp,
+            kernel_path: &kernel,
+            initrd_path: &initrd,
+            known_kernel: &crate::generation::hash_file(&kernel)?,
+            change_flavour: false,
+        })?;
     if Root::open(&target.root)?
         .metadata(Path::new("usr/lib/recab/kernel.json"))?
         .is_none()
@@ -387,18 +387,18 @@ pub(crate) fn run(target: Target, request: &InitRequest, a: &Path, b: &Path) -> 
             record.synchronization = Some(report);
             save(&target, &record)?;
         }
-        crate::candidate::check(
-            &destination.point,
-            &target.root,
-            Slot::B,
-            &roots[1],
-            &state,
-            &esp,
-            &kernel,
-            &initrd,
-            &checked.kernel_digest,
-            false,
-        )?;
+        crate::candidate::check(crate::candidate::Request {
+            root: &destination.point,
+            source: &target.root,
+            slot: Slot::B,
+            uuid: &roots[1],
+            state_uuid: &state,
+            esp_uuid: &esp,
+            kernel_path: &kernel,
+            initrd_path: &initrd,
+            known_kernel: &checked.kernel_digest,
+            change_flavour: false,
+        })?;
         record_matches(&destination.point, Slot::B, &record)?;
         destination.seal()?;
         record_matches(&target.root, Slot::A, &record)?;
