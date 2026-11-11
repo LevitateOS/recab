@@ -34,8 +34,8 @@ Provisioned metadata base:
 `https://levitateos.github.io/LevitateOS/updates/`.
 GitHub Pages reports the canonical HTTPS project URL with no custom domain,
 workflow deployment and HTTPS enforcement. No custom domain purchase is required.
-Only public authority/provisioning metadata is prepared for initial deployment;
-the first public deployment is still pending. No release
+Public authority/provisioning metadata has been deployed and all nine public
+files verified over HTTPS through Recipe/Ginux. No release
 index or installed production default is enabled by provisioning.
 
 Use `/levitate/stable/x86_64/index.json` and
@@ -489,5 +489,7 @@ refusal, concurrent real publisher processes, expired-index renewal, generated
 Pages/parts through Recipe/Ginux, root epoch recovery, real Git commits/pushes
 to a disposable default-branch remote with stale-base refusal, and Pages
 payload/link/size/history exclusions. GitHub remote upload/deployment execution
-and installed public-origin evidence remain unverified; local fixtures do not
+of system payloads and installed public-origin evidence remain unverified;
+the metadata-only Pages bootstrap deployment succeeded and its exact public
+files were verified through Recipe/Ginux. Local fixtures do not
 establish a production service. No full builds or VM tests were run.

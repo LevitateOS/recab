@@ -1083,8 +1083,9 @@ origin, independent role keys/delegations, private working-key files and
 master-restricted GitHub signing/deployment environments are now provisioned.
 Public production policy is staged separately under `release/updates/production/`;
 normal variant defaults remain unchanged. Only public authority/provisioning
-metadata is prepared for deployment, without a release index. The first public
-deployment is still pending. The release runner and validated
+metadata has been deployed, without a release index. Recipe/Ginux verified the
+exact bytes of all nine public files over the canonical HTTPS origin. The
+release runner and validated
 production artifacts remain pending. Extra offline backup setup is deferred as
 requested; private root/release keys have not been uploaded to GitHub. Do not
 redirect installed systems to a fixture or publish unchecked development artifacts.
