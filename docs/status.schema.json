@@ -272,6 +272,12 @@
           "description": "False when a previous failed producer may have written unreported bytes.",
           "type": "boolean"
         },
+        "assembly_write_bytes": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "downloaded": {
           "type": "boolean"
         },
@@ -293,6 +299,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reused_parts": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "total_bytes": {
           "format": "uint64",
           "minimum": 0,
@@ -309,6 +321,12 @@
           "type": "integer"
         },
         "verified_files": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verified_parts": {
+          "default": 0,
           "format": "uint32",
           "minimum": 0,
           "type": "integer"

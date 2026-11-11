@@ -502,11 +502,13 @@ signature of the exact manifest bytes is mandatory. Trust comes from
 variant defaults have no production endpoint/key. Online discovery/acquisition is
 implemented, including baseline-aware merging of the prepared continuation.
 The approved production hosting, signing and publication design is in
-[RELEASE-ENGINEERING.md](RELEASE-ENGINEERING.md). Its policy, authority/index
-contracts and metadata tools are being implemented; production acquisition and
-enablement remain pending. The existing reader explicitly refuses delegated
-production policy while that path is incomplete. Shared anti-rollback floors
-now survive release/Recipe changes and slot rollback.
+[RELEASE-ENGINEERING.md](RELEASE-ENGINEERING.md). Its delegated production reader authenticates root-authorized index and release
+roles, acquires bounded parts through Recipe/Ginux HTTPS, and assembles and
+validates the complete release through the existing importer. Production
+enablement remains pending applicable validation, public publishing and origin
+configuration. Shared anti-rollback floors survive release/Recipe changes and
+slot rollback. Production media requires delegated signatures; `--trusted-local`
+cannot bypass production trust.
 
 Import verifies identity/compatibility, copies and hashes the exact inputs into
 a private read-only set, mounts its actual EROFS image and checks the complete
@@ -801,15 +803,20 @@ rollback or same-sequence substitution. The exact signed manifest, URLs and
 hashes are retained under the manifest's SHA256; retry does not switch to a new
 release behind the caller's back.
 
-Interrupted download retains completed artifacts. Retry rehashes them and
-restarts only the incomplete artifact; byte-range resume within that artifact
-is not implemented. A successful download verifies the complete actual
+Interrupted download retains completed artifacts. Legacy feeds restart the
+incomplete artifact. Production feeds rehash completed parts of one partial
+assembly file and fetch only its remaining parts. Signed part boundaries are
+limited to 64 parts of at most 1 GiB per artifact; final whole-artifact hashes
+remain mandatory. A corrupt saved prefix is truncated at the first invalid
+part. HTTPS redirects are checked against installed delivery grants before
+each request; downgrade and unapproved destinations are refused. A successful download verifies the complete actual
 EROFS/kernel/initramfs/inventory set through the P07 importer. A cached release
 can be reverified and selected with the network disconnected. These commands
 work for either active slot.
 
 Status schema 10 reports `updates` and its structured `merge`. Download progress reports verified files/bytes,
-reused objects and Recipe process I/O for the current attempt. Failed producers
+reused objects, verified/reused parts, assembly bytes and Recipe process I/O for
+the current attempt. Failed producers
 can have unreported writes, so `accounting_complete` is false after interruption.
 Counts exclude other verification/cache copies, filesystem journals and device
 writes; no SMART or zero-write claim is made. Failed Recipe diagnostics remain
@@ -826,7 +833,13 @@ Focused integration uses `tests/finalization.py --release-builder <builder>
 --updates <recipe>` with existing native kernel/module artifacts and a matching
 Ginux launcher; `--updates-running B` exercises B to A. It runs a genuine signed local HTTP feed, disconnect/retry,
 index rollback refusal, offline reuse/selection and cancellation while X is
-prepared. It does not build a distribution or boot a VM.
+prepared. Add `--production-updates` to use separate real TLS metadata, asset
+and redirect origins with a disposable CA installed only in the fixture runtime.
+That mode checks delegated roles, transport substitution, truncated/tampered
+parts, part reuse, space refusal, expired discovery with offline cache reuse,
+known revocation, preserving merge and finalization. A complete private cache
+can be fully reverified after discovery expires; learned release-key revocations
+still prevent its use. It does not build a distribution or boot a VM.
 
 
 ## Release merging, conflicts and recovery (P09)

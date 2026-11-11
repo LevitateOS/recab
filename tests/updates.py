@@ -26,9 +26,13 @@ class Updates:
         threading.Thread(target=self.server.serve_forever,daemon=True).start()
         self.endpoint=f'127.0.0.1:{self.server.server_port}'
         self.policy={'channel':'development','sequence':1,'source':{'index':f'http://{self.endpoint}/index.json','recipe':'usr/share/recab/update-acquire.rhai'},'trust':{'ed25519':self.public}}
-        self.producer=(self.repo/'distro/builder/os-recipes/update-acquire.rhai').read_text().replace('network: [] /* recab configured endpoint */','network: '+json.dumps([self.endpoint]))
+        if h['args'].production_updates:
+            from production_updates import configure
+            configure(self,h)
+        self.producer=(self.repo/'distro/builder/os-recipes/update-acquire.rhai').read_text().replace('network: [] /* recab configured endpoint */','network: '+json.dumps(getattr(self,'endpoints',[self.endpoint])))
     def configure(self,root):
         (root/'usr/lib/recab/update-source.json').write_text(json.dumps(self.policy))
+        if hasattr(self,'authority_raw'):(root/'usr/lib/recab/release-keys.json').write_bytes(self.authority_raw)
         dest=root/'usr/share/recab/update-acquire.rhai';dest.parent.mkdir(parents=True,exist_ok=True);dest.write_text(self.producer)
     def seed(self,root,h):
         digest=hashlib.sha256()
@@ -60,6 +64,9 @@ class Updates:
             src=Path(name)
             if src.is_file():
                 dst=runtime/name.lstrip('/');dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dst);dst.chmod(0o755)
+        if hasattr(self,'certificate'):
+            for cert in ['etc/ssl/cert.pem','etc/ssl/certs/ca-certificates.crt','etc/pki/tls/certs/ca-bundle.crt']:
+                dst=runtime/cert;dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(self.certificate,dst)
         archive=base/'runtime.tar'
         with tarfile.open(archive,'w') as tar:
             for item in sorted(runtime.iterdir()):tar.add(item,arcname=item.name)
@@ -126,7 +133,7 @@ class Updates:
         (bundle/'system-sources.sha256').write_text(hashlib.sha256(b'genuine P08 native fixture').hexdigest()+'\n')
         (bundle/'boot').mkdir();shutil.copyfile(incoming_kernel,bundle/'boot/vmlinuz');shutil.copyfile(incoming_initrd,bundle/'boot/initramfs-installed.img')
         driver=base/'release-input-check'
-        run(os.environ.get('RECAB_TEST_RUSTC','rustc'),'--edition','2024',str(self.repo/'tools/recab/tests/release_input.rs'),'--extern','recab='+str(self.repo/'target/debug/librecab.rlib'),'--extern','distro_builder='+str(self.repo/'target/debug/libdistro_builder.rlib'),'--extern','levitate_recipe='+str(self.repo/'target/debug/liblevitate_recipe.rlib'),'-L','dependency='+str(self.repo/'target/debug/deps'),'-o',str(driver))
+        run(os.environ.get('RECAB_TEST_RUSTC','rustc'),'--edition','2024',str(self.repo/'tools/recab/tests/fixtures/release_input.rs'),'--extern','recab='+str(self.repo/'target/debug/librecab.rlib'),'--extern','distro_builder='+str(self.repo/'target/debug/libdistro_builder.rlib'),'--extern','levitate_recipe='+str(self.repo/'target/debug/liblevitate_recipe.rlib'),'-L','dependency='+str(self.repo/'target/debug/deps'),'-o',str(driver))
         run(str(driver),'--pack',str(source),str(bundle/'filesystem.erofs'));run(str(driver),'--pack',str(bundle/'overlay'),str(bundle/'overlay.erofs'))
         fixture=base/'repo';(fixture/'distro/variants/levitate').mkdir(parents=True)
         for item in self.repo.iterdir():
@@ -137,7 +144,13 @@ class Updates:
         for item in variant.iterdir():
             if item.name!='distro.toml':(fixture/'distro/variants/levitate'/item.name).symlink_to(item,target_is_directory=item.is_dir())
         text=(variant/'distro.toml').read_text().replace('sequence = 1','sequence = 2').replace('init = "systemd"','init = "'+h['args'].init+'"')
-        text+='\n[release.trust]\ned25519 = "'+self.public+'"\n[release.source]\nindex = "'+self.policy['source']['index']+'"\nrecipe = "distro/builder/os-recipes/update-acquire.rhai"\n'
+        if h['args'].production_updates:
+            from production_updates import variant_policy
+            text+=variant_policy(self)
+            (fixture/'distro/variants/levitate/release-keys.json').unlink(missing_ok=True)
+            (fixture/'distro/variants/levitate/release-keys.json').write_bytes(self.authority_raw)
+        else:
+            text+='\n[release.trust]\ned25519 = "'+self.public+'"\n[release.source]\nindex = "'+self.policy['source']['index']+'"\nrecipe = "distro/builder/os-recipes/update-acquire.rhai"\n'
         (fixture/'distro/variants/levitate/distro.toml').write_text(text)
         def builder(*args):
             try:return run(self.builder,'--repo-root',str(fixture),*args)
@@ -161,6 +174,9 @@ class Updates:
             builder('release','manifest','levitate','base',str(original_source),str(original_bundle),'--signing-key',str(self.key))
             (fixture/'distro/variants/levitate/distro.toml').write_text(text)
         builder('release','manifest','levitate','base',str(source),str(bundle),'--signing-key',str(self.key))
+        if h['args'].production_updates:
+            from production_updates import exercise
+            return exercise(self,h,active,bundle)
         builder('release','index','levitate',str(bundle),str(self.publish),'1','--signing-key',str(self.key))
         for path in self.publish.rglob('*'):
             if path.name=='.index.lock':continue

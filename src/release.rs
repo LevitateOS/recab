@@ -107,7 +107,6 @@ fn read_policy(root: &Root) -> Result<Policy> {
     ensure!(bytes.len() <= 65536, "release policy exceeds bound");
     let policy: Policy = serde_json::from_slice(&bytes)?;
     policy.validate()?;
-    ensure!(policy.production.is_none(), "delegated production policy needs the production acquisition/verification reader; legacy unsigned/local trust is not permitted");
     Ok(policy)
 }
 fn copy(root: &Root, artifact: &Artifact, destination: &Path) -> Result<()> {
@@ -162,7 +161,7 @@ pub fn verify_bundle(
     trusted_local: bool,
     expected: Option<&Identity>,
 ) -> Result<VerifiedRelease> {
-    verify_in(manifest, trust, trusted_local, expected, false, None, None)
+    verify_in(manifest, trust, trusted_local, expected, false, None, None, None)
 }
 fn verify_in(
     manifest: &Path,
@@ -172,6 +171,7 @@ fn verify_in(
     allow_flavour: bool,
     cache_parent: Option<&Path>,
     produced: Option<(&Path, &contract::RootfsProvenance)>,
+    delegated: Option<(Option<&Target>, &Policy)>,
 ) -> Result<VerifiedRelease> {
     crate::system::require_root("verify release")?;
     let parent = manifest
@@ -185,6 +185,20 @@ fn verify_in(
         Path::new(manifest.file_name().context("manifest filename missing")?),
         contract::MAX_MANIFEST as u64,
     )?;
+    let delegation = if let Some((target, policy)) = delegated {
+        let mut proof = read(&input, Path::new(contract::production::AUTHORITY_FILE), contract::production::MAX_AUTHORITY as u64)?;
+        let signature = read(&input, Path::new(contract::SIGNATURE), 64)?;
+        let signer = if let Some(target) = target {
+            let authenticated = crate::update::production::signer(target, policy, &input, &bytes, &signature)?;
+            proof = authenticated.1; authenticated.0
+        } else {
+            let identity = ReleaseManifest::parse(&bytes)?.identity;
+            contract::production::AuthorityProof::parse(&proof)?.verify(policy.production.as_ref().unwrap(), &identity.distro, &identity.channel, crate::update::production::now()?)?
+                .verify(contract::production::SigningRole::Release, &bytes, &signature)?
+        };
+        Some((signer, proof))
+    } else { None };
+    let trust = delegation.as_ref().map(|v|&v.0).or(trust);
     let signature = if let Some(trust) = trust {
         let signature = read(&input, Path::new(contract::SIGNATURE), 64)?;
         contract::verify_signature(&bytes, &signature, trust)?;
@@ -224,6 +238,9 @@ fn verify_in(
     if let Some(signature) = signature {
         fs::write(directory.path().join(contract::SIGNATURE), signature)?;
     }
+    if let Some((_, proof)) = &delegation {
+        fs::write(directory.path().join(contract::production::AUTHORITY_FILE), proof)?;
+    }
     crate::filesystem::flush(&Root::open(directory.path())?)?;
     // Freeze names as well as bytes. The path-only mount/recstrap interfaces
     // cannot reopen a different mutable source after validation.
@@ -236,7 +253,7 @@ fn verify_in(
     let verified = VerifiedRelease {
         manifest: parsed,
         bytes,
-        authentication: if trust.is_some() {
+        authentication: if delegation.is_some() { "delegated" } else if trust.is_some() {
             "distribution_signature"
         } else {
             "trusted_local"
@@ -269,14 +286,10 @@ pub fn verify_produced_bundle(
     trusted_local: bool,
     proof: &contract::RootfsProvenance,
 ) -> Result<VerifiedRelease> {
+    let policy = read_policy(&Root::open(root)?)?;
     verify_in(
-        manifest,
-        trust,
-        trusted_local,
-        None,
-        false,
-        None,
-        Some((root, proof)),
+        manifest, trust, trusted_local, None, false, None, Some((root, proof)),
+        policy.production.as_ref().map(|_|(None, &policy)),
     )
 }
 fn validate_set(target: &Target, verified: &VerifiedRelease) -> Result<()> {
@@ -315,6 +328,7 @@ fn validate_root(path: &Path, verified: &VerifiedRelease, produced: bool) -> Res
         "release rootfs identity differs from manifest"
     );
     let policy = read_policy(&root)?;
+    ensure!(policy.production.is_none() || verified.authentication == "delegated", "delegated release cannot use unsigned/local or legacy-key authentication");
     ensure!(
         policy.channel == manifest.identity.channel
             && policy.sequence == manifest.identity.sequence,
@@ -389,6 +403,7 @@ pub(crate) fn for_target(
         allow_flavour,
         None,
         None,
+        policy.production.as_ref().map(|_|(Some(target), &policy)),
     )
 }
 /// Import a verified release into a content-addressed cache. The installed
@@ -433,6 +448,7 @@ pub(crate) fn import_locked_options(target:&Target,manifest:&Path,trusted_local:
         allow_flavour,
         Some(&parent),
         None,
+        policy.production.as_ref().map(|_|(Some(target), &policy)),
     )?;
     let cache = parent.join(verified.id());
     if cache.exists() {

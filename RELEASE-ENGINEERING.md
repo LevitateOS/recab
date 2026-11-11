@@ -415,8 +415,31 @@ existing update reader. The builder can authorize public roles and authenticate
 a staged production feed through explicit CLI commands. These commands do not
 fetch/validate payloads or enable the service.
 
-The installed production acquisition/assembly reader, delegation-aware media
-publication, GitHub publishing/refresh workflows, public-origin scenario mode
-and profile selection are still to be implemented. Until they are integrated,
-the legacy reader explicitly refuses a delegated production policy instead of
-falling back to unsigned/local trust. Existing development defaults are retained.
+The installed production acquisition/assembly reader now uses the existing
+Recipe producer with explicit HTTPS prefix and redirect grants. It persists
+root/delegation/revocation knowledge before payload acquisition, retains exact
+signed index/manifest proofs, and assembles authenticated parts into one partial
+file per artifact. Retries rehash the saved prefix; complete artifacts pass the
+existing full release verifier and preserving merge. Complete private caches
+remain re-verifiable offline after discovery expiry; known release revocations
+block reuse. Assembly and Recipe I/O are reported separately; verifier copies,
+filesystem journals and physical device writes are outside these counters.
+
+The builder embeds the public factory authority, requires an external authorized
+release key, and includes the public proof in production media. No unsigned or
+legacy trust fallback can admit production content. The old v1 publisher refuses
+production policies: transport publication, GitHub publishing/refresh workflows,
+public-origin scenario mode and profile selection remain pending. Existing
+development defaults remain without a production origin or trust root. No
+public production service, installed boot trial or production readiness is
+claimed by native fixtures.
+
+Focused native validation for this reader passed A→B with systemd and B→A
+with OpenRC, using real Recipe/Ginux workers, disposable ext4/EROFS systems,
+separate HTTPS metadata/asset/redirect origins and a private fixture CA. It
+covered role separation, whole-image substitution, interrupted/tampered parts,
+verified-part reuse, capacity refusal, expired discovery with offline cache,
+preserving apply/reproduction/finalization, and learned revocation of a cached
+release. Both are native glibc fixtures, not installed distro boot evidence.
+Rust consumer checks and both affected frontend typechecks passed. No full
+builds or VM tests were run.

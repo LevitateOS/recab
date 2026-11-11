@@ -1,6 +1,7 @@
 //! Recipe owns every network request. This coordinator verifies signed metadata,
 //! retains pinned inputs and never opens a writable system for check/download.
 use crate::{filesystem::Root, system::System, target::Target};
+pub(crate) mod production;
 use anyhow::{Context, Result, ensure};
 use distro_contract::release::{
     self as format, Artifact, Identity, Policy, ReleaseIndex, ReleaseManifest,
@@ -37,6 +38,12 @@ pub struct DownloadProgress {
     pub downloaded: bool,
     /// False when a previous failed producer may have written unreported bytes.
     pub accounting_complete: bool,
+    #[serde(default)]
+    pub assembly_write_bytes: u64,
+    #[serde(default)]
+    pub verified_parts: u32,
+    #[serde(default)]
+    pub reused_parts: u32,
 }
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +66,8 @@ struct Record {
     source: String,
     #[serde(default)]
     feed: String,
+    #[serde(default)]
+    production: bool,
     highest_index: u64,
     index_hash: String,
     highest_release: Option<(u64, String)>,
@@ -72,6 +81,8 @@ struct Pin {
     manifest_json: String,
     signature: Vec<u8>,
     base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    production: Option<production::Proof>,
 }
 #[derive(Serialize, Deserialize)]
 struct Pending {
@@ -145,8 +156,14 @@ fn record(target: &Target, source: &str, identity: &Identity, policy: &Policy) -
     value.schema_version = 1;
     value.source = source.into();
     value.feed = feed;
+    value.production = policy.production.is_some();
     if value.view.phase.is_empty() { value.view.phase = "idle".into(); }
     let floor = floor(target, &value.feed)?;
+    if policy.production.is_some() {
+        value.highest_index = floor.index_sequence;
+        value.index_hash = floor.index_digest.clone();
+        value.highest_release = floor.release.clone();
+    }
     if floor.index_sequence > value.highest_index {
         value.highest_index = floor.index_sequence;
         value.index_hash = floor.index_digest;
@@ -165,6 +182,10 @@ fn record(target: &Target, source: &str, identity: &Identity, policy: &Policy) -
 }
 fn persist(target: &Target, record: &mut Record) -> Result<()> {
     root_dir(&directory(target))?;
+    if record.production {
+        record.view.highest_index = floor(target, &record.feed)?.index_sequence;
+        return save(&record_path(target), record);
+    }
     let previous = floor(target, &record.feed)?;
     let mut next = previous.clone();
     ensure!(record.highest_index >= next.index_sequence && (record.highest_index == 0
@@ -193,7 +214,7 @@ fn source_configuration(target: &Target) -> Result<(Identity, Policy, String, Pa
     let (identity, policy) = crate::release::installed(target)?;
     let source=policy.source.as_ref().context("no update source configured; the image producer must supply release.source and distribution release trust")?;
     ensure!(
-        policy.trust.is_some(),
+        policy.trust.is_some() || policy.production.is_some(),
         "no distribution release key configured"
     );
     let root = Root::open(&target.root)?;
@@ -204,7 +225,7 @@ fn source_configuration(target: &Target) -> Result<(Identity, Policy, String, Pa
         "acquisition recipe must be a bounded root-owned slot file"
     );
     let recipe_hash = crate::generation::hash_reader(&mut file)?;
-    let id = format::digest(&serde_json::to_vec(&(
+    let id = if let Some(production) = &policy.production { production.feed_id(&identity)? } else { format::digest(&serde_json::to_vec(&(
         &policy,
         &identity.distro,
         &identity.architecture,
@@ -212,7 +233,7 @@ fn source_configuration(target: &Target) -> Result<(Identity, Policy, String, Pa
         identity.libc,
         identity.flavour,
         recipe_hash,
-    ))?);
+    ))?) };
     let recipe = target.root.join(&source.recipe);
     Ok((identity, policy, id, recipe))
 }
@@ -241,7 +262,8 @@ fn checked_pin(
     policy: &Policy,
 ) -> Result<(Pin, ReleaseManifest)> {
     valid_id(id)?;
-    let pin: Pin = load(&pin_path(target, id), 2 * 1024 * 1024)?;
+    let pin: Pin = load(&pin_path(target, id), 4 * 1024 * 1024)?;
+    if policy.production.is_some() { return production::checked_pin(target, id, source, identity, policy, pin); }
     ensure!(
         pin.schema_version == 1
             && pin.id == id
@@ -295,20 +317,24 @@ fn acquire(
     sha: &str,
     size: u64,
 ) -> Result<Acquired> {
-    let origin = url::Url::parse(&policy.source.as_ref().context("source missing")?.index)?;
-    ensure!(
-        url::Url::parse(uri)?.origin() == origin.origin(),
-        "acquisition leaves configured origin"
-    );
+    let (origins, prefixes) = if let Some(production) = &policy.production {
+        let origins = production.request_origins(uri)?;
+        let prefixes = if production.metadata_url(uri).is_ok() { vec![production.metadata_base.clone()] }
+            else { std::iter::once(production.asset_prefix.clone()).chain(production.redirect_origins.iter().map(|o|format!("{o}/"))).collect() };
+        (origins, Some(prefixes))
+    } else {
+        let origin = url::Url::parse(&policy.source.as_ref().context("source missing")?.index)?;
+        ensure!(url::Url::parse(uri)?.origin() == origin.origin(), "acquisition leaves configured origin");
+        (vec![origin.origin().ascii_serialization()], None)
+    };
     let scope = directory(target)
         .join("recipe")
         .join(crate::prepare::new_id()?);
     root_dir(&scope)?;
     let request = scope.join("request.json");
-    save(
-        &request,
-        &serde_json::json!({"url":uri,"sha256":sha,"size":size}),
-    )?;
+    let mut input = serde_json::json!({"url":uri,"sha256":sha,"size":size});
+    if let Some(prefixes) = prefixes { input["prefixes"] = serde_json::to_value(prefixes)?; }
+    save(&request, &input)?;
     let output = scope.join("result.json");
     eprintln!(
         "recab: acquiring {} ({} bytes{})",
@@ -320,8 +346,8 @@ fn acquire(
             " verified"
         }
     );
-    let status =
-        Command::new(std::env::var_os("RECAB_RECIPE_BIN").unwrap_or_else(|| "recipe".into()))
+    let mut command = Command::new(std::env::var_os("RECAB_RECIPE_BIN").unwrap_or_else(|| "recipe".into()));
+    command
             .current_dir(&scope)
             .arg("install")
             .arg(recipe)
@@ -339,13 +365,12 @@ fn acquire(
             .arg(&output)
             .arg("--input")
             .arg(format!("request={}", request.display()))
-            .arg("--network-host")
-            .arg(format::endpoint(&policy.source.as_ref().unwrap().index)?)
+
             .arg("--network-max-bytes")
-            .arg(size.saturating_add(1024 * 1024).to_string())
-            .stdout(std::process::Stdio::from(std::io::stderr()))
-            .status()
-            .context("starting Recipe update acquisition")?;
+            .arg(size.saturating_add(size / 50).saturating_add(1024 * 1024).to_string())
+            .stdout(std::process::Stdio::from(std::io::stderr()));
+    for origin in origins { command.arg("--network-host").arg(format::endpoint(&origin)?); }
+    let status = command.status().context("starting Recipe update acquisition")?;
     ensure!(
         status.success(),
         "Recipe acquisition failed; completed objects are retained for retry; diagnostics: {}",
@@ -413,6 +438,7 @@ pub(crate) fn cached_summary(target:&Target,id:&str)->Result<ReleaseSummary> {
 pub fn check() -> Result<UpdateStatus> {
     let sys = System::locked("update-check")?;
     let (identity, policy, source, recipe) = configuration(&sys)?;
+    if policy.production.is_some() { return production::check(&sys, &identity, &policy, &source, &recipe); }
     let mut state = record(&sys.target, &source, &identity, &policy)?;
     state.view.phase = "checking".into();
     state.view.last_error = None;
@@ -521,6 +547,7 @@ pub fn check() -> Result<UpdateStatus> {
                 manifest_json: String::from_utf8(raw)?,
                 signature,
                 base_url,
+                production: None,
             },
         )?;
         state.view.available = Some(summarize(&id, &manifest));
@@ -623,6 +650,7 @@ pub fn download(requested: Option<&str>) -> Result<UpdateStatus> {
             .join(&id)
             .join(format::MANIFEST);
         if cached.exists() {
+            if pin.production.is_some() { production::cache_metadata(&sys.target, &policy, &pin, cached.parent().unwrap())?; }
             let verified = crate::release::for_target(&sys.target, &cached, false, false)?;
             ensure!(verified.id() == id, "cached release identity mismatch");
             let p = state.view.download.as_mut().unwrap();
@@ -630,6 +658,7 @@ pub fn download(requested: Option<&str>) -> Result<UpdateStatus> {
             p.reused_files = 4;
             p.verified_bytes = p.total_bytes;
             p.downloaded = true;
+            if pin.production.is_some() { production::complete(&sys.target, &pin)?; }
             state.view.phase = "downloaded".into();
             return Ok(());
         }
@@ -643,6 +672,10 @@ pub fn download(requested: Option<&str>) -> Result<UpdateStatus> {
             &pin.signature,
             Some(0o600),
         )?;
+        if pin.production.is_some() {
+            production::download(&sys.target, &recipe, &policy, &pin, &manifest, &transfer, &mut state)?;
+        }
+        if pin.production.is_none() {
         for artifact in manifest.artifacts.all() {
             let destination = transfer.join(&artifact.path);
             let reused = matches_file(&destination, artifact)?;
@@ -666,14 +699,16 @@ pub fn download(requested: Option<&str>) -> Result<UpdateStatus> {
             let p = state.view.download.as_mut().unwrap();
             p.verified_files += 1;
             p.verified_bytes += artifact.size;
-            if reused {
+            if reused && pin.production.is_none() {
                 p.reused_files += 1;
             }
             persist(&sys.target, &mut state)?;
         }
+        }
         let imported =
             crate::release::import_locked(&sys.target, &transfer.join(format::MANIFEST), false)?;
         ensure!(imported.id == id, "downloaded release identity changed");
+        if pin.production.is_some() { production::complete(&sys.target, &pin)?; }
         state.view.phase = "downloaded".into();
         state.view.download.as_mut().unwrap().downloaded = true;
         if let Err(error) = fs::remove_dir_all(&transfer) {
