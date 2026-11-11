@@ -406,7 +406,7 @@ fn acquire(
     }
     command
             .env("TMPDIR", &scratch)
-            .current_dir(&scope)
+            .current_dir(scope)
             .arg("install")
             .arg(recipe)
             .args([
