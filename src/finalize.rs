@@ -251,7 +251,7 @@ pub fn finalize(request: &FinalizeRequest) -> Result<Finalization> {
     }
 }
 
-fn check_record(root: &Path, slot: Slot, uuid: &str, peer: &str, g: &Generation) -> Result<()> {
+pub(crate) fn check_record(root: &Path, slot: Slot, uuid: &str, peer: &str, g: &Generation) -> Result<()> {
     let root = crate::filesystem::Root::open(root)?;
     let text = root
         .optional_text(Path::new(recinit::installed::BOOT_RECORD))?
@@ -277,6 +277,7 @@ pub(crate) fn verify_slot(sys: &System, slot: Slot) -> Result<()> {
     if slot == sys.boot.selection.active {
         crate::immutable::require_readonly(&sys.target)?;
         g.verify_root(&sys.target.root, slot, &uuid)?;
+        crate::candidate::runtime_protocol(&crate::filesystem::Root::open(&sys.target.root)?)?;
         if let Some(seal) = &record.seal {
             check_record(&sys.target.root, slot, &uuid, &peer, g)?;
             verify_entry(sys, slot, g, seal)?;
@@ -290,6 +291,7 @@ pub(crate) fn verify_slot(sys: &System, slot: Slot) -> Result<()> {
             .unwrap_or_else(|| g.id.clone());
         let mounted = crate::slot_mount::SlotMount::open(sys, slot, &id)?;
         g.verify_root(&mounted.point, slot, &uuid)?;
+        crate::candidate::runtime_protocol(&crate::filesystem::Root::open(&mounted.point)?)?;
         if let Some(seal) = &record.seal {
             check_record(&mounted.point, slot, &uuid, &peer, g)?;
             verify_entry(sys, slot, g, seal)?;

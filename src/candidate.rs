@@ -263,19 +263,25 @@ pub(crate) fn check(
     })
 }
 
-fn runtime(root: &Root, machine: u16, libc: &str) -> Result<()> {
+pub(crate) fn runtime_protocol(root: &Root) -> Result<serde_json::Value> {
     let runtime: serde_json::Value =
         serde_json::from_str(&text(root, "usr/lib/recab/runtime.json")?)?;
+    let minor = u64::from(distro_contract::release::STATE_MINOR);
     if runtime["version"] != 1
         || runtime["state_major"] != 2
-        || runtime["state_minor_min"].as_u64().is_none_or(|n| n > 3)
-        || runtime["state_minor_max"].as_u64().is_none_or(|n| n < 3)
+        || runtime["state_minor_min"].as_u64().is_none_or(|n| n > minor)
+        || runtime["state_minor_max"].as_u64().is_none_or(|n| n < minor)
         || runtime["boot_protocol"] != 3
     {
         return Err(refuse(
             "candidate recab runtime cannot read the finalized state/boot protocol",
         ));
     }
+    Ok(runtime)
+}
+
+fn runtime(root: &Root, machine: u16, libc: &str) -> Result<()> {
+    let runtime = runtime_protocol(root)?;
     let binary = relative(
         runtime["binary"]
             .as_str()

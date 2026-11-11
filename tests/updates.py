@@ -316,5 +316,8 @@ class Updates:
         finalized=cli(active,'finalize');check(finalized['seal']['kernel_release']==incoming_release and finalized['generation']['kernel_digest']==incoming_hash,'finalizer used running kernel instead of merged boot set');cli(active,'set-next',inactive);cli(active,'rollback')
         cli(active,'stage','--manifest',str(bundle/'release.json'));check(run('blkid','-c','/dev/null','-s','UUID','-o','value',h['dev'][inactive]).stdout==filesystem_uuid,'stage reformatted the inactive system')
         ledger=(state/'state.json').read_bytes();cli(active,'update','apply',id);check((state/'state.json').read_bytes()==ledger,'reapplying completed release changed preparation')
-        changed=base/'Y';changed.write_text('later Y\n');cli(active,'edit','etc/config','--file',str(changed));cli(active,'finalize')
+        changed=base/'Y';changed.write_text('later Y\n');cli(active,'edit','etc/config','--file',str(changed));last=cli(active,'finalize')
+        if h['args'].trials:
+            from trials import exercise
+            return exercise(h,active,inactive,last['generation'])
         return {'result':'PASS','p09':'preserving merge/conflicts/recovery','running':running,'prepared':inactive,'checks':['C plus N retained','local/release deletions','metadata and directory/type conflicts','edited/C/subtree resolutions and stale CAS','structured account fields/member removals','no account bodies in shared state','actual partial-write kill and frozen-input tamper refusal','captured-C and post-cleanup checkpoint recovery','hardlinks','Recipe reproduction bound to new release and selected receipt retained','new baseline only after complete validation','bound finalization/trial inputs (including an existing newer kernel when supplied)','idempotent apply, manifest stage without mkfs, and later Y'],'adopted_original':bool(original_bundle),'numeric_id_collision_checked':h['args'].merge_id_collision,'full_build':False,'vm_boot':False}

@@ -7,7 +7,7 @@ an actual VM boot can establish PID 1, hardware-driver and service behavior.
 import argparse,copy,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
 sys.dont_write_bytecode=True
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");p.add_argument('--trials',action='store_true',help='exercise generation-bound trial recovery on these real filesystems');args=p.parse_args()
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
 BIN=str(args.binary.resolve(strict=True));KERNEL=args.kernel.resolve(strict=True);MODULE=args.module.resolve(strict=True)
 GUID='4a67b082-0a4c-41cf-b6c7-440b29bb8c4f'
@@ -308,6 +308,9 @@ try:
     # Idempotence and stale revision refusal.
     same=cli(active,'finalize');check(same['generation']['id']==complete['generation']['id'],'idempotent finalization changed identity')
     current=cli(active,'status')['preparation'];cli(active,'finalize','--preparation',current['id'],'--revision','0',code=21,contains='stale')
+    if args.trials:
+        from trials import exercise
+        result=exercise(globals(),active,'B',complete['generation']);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     cli(active,'set-next','B');check((efi/f'efivars/LoaderEntryOneShot-{GUID}').exists(),'trial was not scheduled')
     # Supply observed boot records, without claiming a VM boot occurred.
     run('umount',str(roots['A']/'var'));mounts.remove('A/var');run('umount',str(roots['A']));mounts.remove('A')

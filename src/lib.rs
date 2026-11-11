@@ -46,6 +46,7 @@ mod systemd_boot;
 mod target;
 mod trial;
 mod trial_options;
+mod trial_record;
 pub mod update;
 
 use anyhow::Result;

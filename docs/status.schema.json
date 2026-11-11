@@ -917,6 +917,14 @@
     "TrialRecord": {
       "description": "How the last judged trial boot ended (kept in the state file, and shown\nas is by `status`).",
       "properties": {
+        "attempt": {
+          "default": null,
+          "description": "Identifies this scheduled attempt, including retries of the same generation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "committed": {
           "description": "The trial was healthy and committed; otherwise it was abandoned.",
           "type": "boolean"
@@ -924,6 +932,21 @@
         "detail": {
           "description": "How startup ended, and the failed units if any.",
           "type": "string"
+        },
+        "fallback_generation": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "generation": {
+          "default": null,
+          "description": "Missing only in historical records written before generation-bound assessment.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "slot": {
           "$ref": "#/$defs/Slot"

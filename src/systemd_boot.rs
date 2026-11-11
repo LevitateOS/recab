@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 
 use crate::efivars::{EfiVars, Var};
 use crate::entry::{
-    cmdline_root, cmdline_root_text, entry_file, entry_name, layout_name, loader_default,
-    loader_with_default, same_entry, slot_of_entry, Entry, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE,
-    LOADER_CONF,
+    ENTRIES_DIR, Entry, INITRD_FILE, KERNEL_FILE, LOADER_CONF, cmdline_root, cmdline_root_text,
+    entry_file, entry_name, layout_name, loader_default, loader_with_default, same_entry,
+    slot_of_entry,
 };
 use crate::error::refuse;
 use crate::state::{BootChange, PersistentState, Selection, Slot};
-use crate::target::{partuuid, Kind, Target};
+use crate::target::{Kind, Target, partuuid};
 use crate::trial_options::{make_default, make_trial};
 
 /// Where the target ships systemd-boot's EFI binaries, relative to its root.
@@ -159,7 +159,7 @@ impl SystemdBoot {
             _ => {
                 return Err(refuse(
                     "running root does not identify exactly one recorded slot",
-                ))
+                ));
             }
         };
         let active_generation = match self.target.kind {
@@ -227,29 +227,27 @@ impl SystemdBoot {
         })
     }
 
-    /// Whether this boot is a one-shot trial, from the firmware alone: the
-    /// slot systemd-boot booted is not the default slot. It reads the
-    /// default variable, and loader.conf only when the variable is unset
-    /// (`init` and every new default set it). `None` when the variables do
-    /// not name two slots.
-    pub fn firmware_trial(&self) -> Result<Option<bool>> {
+    pub(crate) fn firmware_selected(&self) -> Result<Option<Slot>> {
         let prefix = self.target.entry_prefix()?;
-        let Some(selected) = self
+        Ok(self
             .vars
             .get(Var::Selected)?
-            .and_then(|id| slot_of_entry(&prefix, &id))
-        else {
-            return Ok(None);
-        };
-        let default = match self.vars.get(Var::Default)? {
-            Some(id) => Some(id),
-            None => target_root::read_optional(&self.loader_conf())?
+            .as_deref()
+            .and_then(|s| slot_of_entry(&prefix, s)))
+    }
+    pub(crate) fn firmware_slots(&self) -> Result<(Option<Slot>, Option<Slot>, bool)> {
+        let prefix = self.target.entry_prefix()?;
+        Ok((
+            self.vars
+                .get(Var::Selected)?
                 .as_deref()
-                .and_then(loader_default),
-        };
-        Ok(default
-            .and_then(|id| slot_of_entry(&prefix, &id))
-            .map(|default| selected != default))
+                .and_then(|s| slot_of_entry(&prefix, s)),
+            self.vars
+                .get(Var::Default)?
+                .as_deref()
+                .and_then(|s| slot_of_entry(&prefix, s)),
+            self.vars.get(Var::OneShot)?.is_some(),
+        ))
     }
 
     /// Write `change` (`plan` checked the slot can boot), checking first
@@ -291,7 +289,7 @@ impl SystemdBoot {
                     if boot
                         .raw_default
                         .as_deref()
-                        .is_some_and(|raw| !same_entry(raw, &default_id))
+                        .is_none_or(|raw| !same_entry(raw, &default_id))
                     {
                         step!(self.vars.set(Var::Default, Some(&default_id)));
                         firmware.push(Var::Default.name());
@@ -313,12 +311,14 @@ impl SystemdBoot {
                 let loader_conf = self.loader_conf();
                 let before =
                     step!(target_root::read_optional(&loader_conf).map_err(anyhow::Error::from));
-                step!(target_root::write_durable(
-                    &loader_conf,
-                    loader_with_default(before.as_deref(), &id).as_bytes(),
-                    None
-                )
-                .with_context(|| format!("writing '{}'", loader_conf.display())));
+                step!(
+                    target_root::write_durable(
+                        &loader_conf,
+                        loader_with_default(before.as_deref(), &id).as_bytes(),
+                        None
+                    )
+                    .with_context(|| format!("writing '{}'", loader_conf.display()))
+                );
                 if let Err(cause) = self.vars.set(Var::Default, Some(&id)) {
                     let restore = match &before {
                         Some(text) => {
@@ -643,13 +643,13 @@ fn install_loader(root: &Path, esp: &Path) -> Result<()> {
             return Err(refuse(format!(
                 "'{}' has no systemd-boot EFI binary; extract a complete system first",
                 source_dir.display()
-            )))
+            )));
         }
         _ => {
             return Err(refuse(format!(
                 "'{}' has systemd-boot for more than one architecture",
                 source_dir.display()
-            )))
+            )));
         }
     };
     let source = source_dir.join(&name);
@@ -792,7 +792,9 @@ impl SystemdBoot {
                     &mut root.entry(Path::new(&path), false)?.open()?,
                 )? != *digest
                 {
-                    return Err(refuse("immutable boot object is corrupt; refusing to overwrite a possibly referenced payload"));
+                    return Err(refuse(
+                        "immutable boot object is corrupt; refusing to overwrite a possibly referenced payload",
+                    ));
                 }
             } else {
                 need = need.saturating_add(fs::metadata(source)?.len());

@@ -55,6 +55,14 @@ impl std::str::FromStr for Slot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrialRecord {
     pub slot: Slot,
+    /// Identifies this scheduled attempt, including retries of the same generation.
+    #[serde(default)]
+    pub attempt: Option<String>,
+    /// Missing only in historical records written before generation-bound assessment.
+    #[serde(default)]
+    pub generation: Option<String>,
+    #[serde(default)]
+    pub fallback_generation: Option<String>,
     /// The trial was healthy and committed; otherwise it was abandoned.
     pub committed: bool,
     /// How startup ended, and the failed units if any.
@@ -72,7 +80,10 @@ pub(crate) enum StateSchema {
 }
 impl Default for StateSchema {
     fn default() -> Self {
-        Self::Current { major: 2, minor: 3 }
+        Self::Current {
+            major: distro_contract::release::STATE_MAJOR,
+            minor: distro_contract::release::STATE_MINOR,
+        }
     }
 }
 
@@ -190,7 +201,7 @@ impl PersistentState {
             StateSchema::Legacy(1)
             | StateSchema::Current {
                 major: 2,
-                minor: 0 | 1 | 2 | 3,
+                minor: 0 | 1 | 2 | 3 | 4,
             } => Ok(()),
             _ => Err("unsupported recab state format; use a compatible recovery tool".into()),
         }
@@ -728,7 +739,15 @@ pub(crate) fn plan(
         Request::Stage { id } => {
             // Media staging uses the same preserving continuation. Input and
             // merge verdicts are supplied by the release engine, not mkfs.
-            return plan(Request::Prepare {id,expected_id:None,expected_revision:None},sel,state);
+            return plan(
+                Request::Prepare {
+                    id,
+                    expected_id: None,
+                    expected_revision: None,
+                },
+                sel,
+                state,
+            );
         }
     };
     Ok(Some(transition))
@@ -818,16 +837,13 @@ pub enum Startup {
     Emergency,
     /// Still starting when the deadline passed.
     TimedOut,
-    /// No verdict (shutting down, the init unreachable).
+    /// No verdict: an explicit shutdown or assessment cancellation.
     Inconclusive,
 }
 
 /// What the trial service knows about this boot once startup ended.
 pub(crate) struct TrialInput {
     pub startup: Startup,
-    /// The firmware booted a slot other than its default (a one-shot), from
-    /// the firmware alone; `None` when its variables name no two slots.
-    pub firmware_trial: Option<bool>,
     /// How startup ended, in words, for the record.
     pub detail: String,
     pub unix_time: u64,
@@ -837,8 +853,6 @@ pub(crate) struct TrialInput {
 pub(crate) struct TrialView<'a> {
     pub sel: &'a Selection,
     pub state: &'a PersistentState,
-    /// recab had written state (it lives on /var, which may be what broke).
-    pub state_found: bool,
 }
 
 /// Where a failed trial reboots.
@@ -846,8 +860,6 @@ pub(crate) struct TrialView<'a> {
 pub(crate) enum Reboot {
     /// Into the known-good slot (made the default first if it is not).
     Into(Slot),
-    /// The slots could not be read: into the firmware's default.
-    FirmwareDefault,
     /// Not at all, and why.
     Not(String),
 }
@@ -867,56 +879,19 @@ pub(crate) enum Judgment {
     },
 }
 
-/// Judge a boot. It is a trial when recab scheduled this slot's boot
-/// (`set-next`) and has not committed it; a slot picked from the boot menu,
-/// or a trial an operator already rolled back, is left alone. `view` is
-/// `None` when the ESP or /var could not be read: then the firmware alone
-/// tells a one-shot boot, and a failed one reboots into its default.
-pub(crate) fn judge(input: &TrialInput, view: Option<TrialView>) -> Judgment {
-    if input.startup == Startup::Inconclusive {
+/// Judge a generation-aware ledger. Missing metadata recovery is handled by
+/// trial's firmware ticket, never by guessing from reusable slot letters.
+pub(crate) fn judge(input: &TrialInput, view: TrialView) -> Judgment {
+    if input.startup == Startup::Inconclusive || view.state.check_mutable().is_err() {
         return Judgment::Ignore;
     }
     let failed = input.startup != Startup::Running;
-    let one_shot = input.firmware_trial == Some(true);
-    let Some(TrialView {
-        sel,
-        state,
-        state_found,
-    }) = view
-    else {
-        return if failed && one_shot {
-            Judgment::Failed {
-                transition: None,
-                reboot: Reboot::FirmwareDefault,
-            }
-        } else {
-            Judgment::Ignore
-        };
-    };
-    if state.check_mutable().is_err() {
-        return if failed && one_shot {
-            Judgment::Failed {
-                transition: None,
-                reboot: Reboot::FirmwareDefault,
-            }
-        } else {
-            Judgment::Ignore
-        };
-    }
+    let TrialView { sel, state } = view;
     let active = sel.active;
     let is_trial = state.pending_trial_slot == Some(active)
-        && !committed(state, sel)
         && state.pending_trial_generation.as_deref() == sel.active_generation.as_deref()
         && state.pending_trial_generation.is_some();
     if !is_trial {
-        // No state on /var but a one-shot boot that failed: /var itself may
-        // be what failed to mount; there is nothing to record it in.
-        if failed && !state_found && one_shot {
-            return Judgment::Failed {
-                transition: None,
-                reboot: Reboot::FirmwareDefault,
-            };
-        }
         // Another boot used up the one-shot of the trial recab scheduled: a
         // later boot of that slot from the menu is no trial.
         if let Some(scheduled) = state.pending_trial_slot.filter(|slot| *slot != active) {
@@ -935,6 +910,10 @@ pub(crate) fn judge(input: &TrialInput, view: Option<TrialView>) -> Judgment {
     }
     let record = TrialRecord {
         slot: active,
+        attempt: None,
+        generation: sel.active_generation.clone(),
+        fallback_generation: known_good(state, sel)
+            .and_then(|s| state.slot(s)?.generation.as_ref().map(|g| g.id.clone())),
         committed: !failed,
         detail: input.detail.clone(),
         unix_time: input.unix_time,

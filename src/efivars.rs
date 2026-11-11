@@ -3,12 +3,12 @@
 //! efivarfs (or, in a scratch tree, a directory of plain files). Changing
 //! them needs no `bootctl`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use crate::error::{classified, or_class, ErrorClass};
+use crate::error::{ErrorClass, classified, or_class};
 use crate::target::Firmware;
 
 /// systemd-boot's vendor GUID, which names its EFI variables.
@@ -29,6 +29,8 @@ pub(crate) enum Var {
     OneShot,
     /// The entry this boot started (set by systemd-boot).
     Selected,
+    /// recab recovery ticket; lives in recab's own vendor namespace.
+    RecabTrial,
 }
 
 impl Var {
@@ -37,6 +39,7 @@ impl Var {
             Var::Default => "LoaderEntryDefault",
             Var::OneShot => "LoaderEntryOneShot",
             Var::Selected => "LoaderEntrySelected",
+            Var::RecabTrial => "RecabTrial",
         }
     }
 }
@@ -54,13 +57,20 @@ impl EfiVars {
     }
 
     fn path(firmware: &Firmware, var: Var) -> PathBuf {
-        firmware.efivars.join(format!("{}-{LOADER_VENDOR_GUID}", var.name()))
+        let guid = if var == Var::RecabTrial {
+            "a69e7a1c-44ab-42f5-93ed-836a4c103bad"
+        } else {
+            LOADER_VENDOR_GUID
+        };
+        firmware.efivars.join(format!("{}-{guid}", var.name()))
     }
 
     /// The variable's entry id; `None` when it is unset, empty, or there is
     /// no firmware to read (systemd-boot treats an empty value as unset).
     pub fn get(&self, var: Var) -> Result<Option<String>> {
-        let Some(firmware) = &self.firmware else { return Ok(None) };
+        let Some(firmware) = &self.firmware else {
+            return Ok(None);
+        };
         let path = Self::path(firmware, var);
         let context = || format!("reading the EFI variable '{}'", path.display());
         let Some(bytes) = target_root::read_optional_bytes(&path).with_context(context)? else {
@@ -75,7 +85,9 @@ impl EfiVars {
             .map(|pair| u16::from_le_bytes(*pair))
             .take_while(|unit| *unit != 0)
             .collect();
-        let value = String::from_utf16(&units).map_err(|_| anyhow!("not a UTF-16 string")).with_context(context)?;
+        let value = String::from_utf16(&units)
+            .map_err(|_| anyhow!("not a UTF-16 string"))
+            .with_context(context)?;
         Ok((!value.is_empty()).then_some(value))
     }
 
@@ -88,13 +100,19 @@ impl EfiVars {
             )
         })?;
         for (dir, missing) in [
-            (&firmware.efi_dir, "this host does not appear to be booted in UEFI mode"),
+            (
+                &firmware.efi_dir,
+                "this host does not appear to be booted in UEFI mode",
+            ),
             (&firmware.efivars, "mount efivarfs or boot under UEFI"),
         ] {
             if !dir.is_dir() {
                 return Err(classified(
                     ErrorClass::BackendUnavailable,
-                    format!("changing the boot selection needs '{}', which is missing: {missing}", dir.display()),
+                    format!(
+                        "changing the boot selection needs '{}', which is missing: {missing}",
+                        dir.display()
+                    ),
                 ));
             }
         }
@@ -104,7 +122,8 @@ impl EfiVars {
     /// Set the variable to `value`, or remove it with `None`. A failure is the
     /// backend's (exit 20).
     pub fn set(&self, var: Var, value: Option<&str>) -> Result<()> {
-        self.write(var, value).map_err(|err| or_class(err, ErrorClass::BackendUnavailable))
+        self.write(var, value)
+            .map_err(|err| or_class(err, ErrorClass::BackendUnavailable))
     }
 
     fn write(&self, var: Var, value: Option<&str>) -> Result<()> {
@@ -119,7 +138,9 @@ impl EfiVars {
         }
         let Some(value) = value else {
             return match fs::remove_file(&path) {
-                Err(err) if err.kind() != ErrorKind::NotFound => Err(anyhow!(err)).with_context(context),
+                Err(err) if err.kind() != ErrorKind::NotFound => {
+                    Err(anyhow!(err)).with_context(context)
+                }
                 _ => Ok(()),
             };
         };
@@ -132,11 +153,16 @@ impl EfiVars {
         }
         // efivarfs replaces a variable with each complete write; it is never
         // truncated.
-        let mut file =
-            fs::OpenOptions::new().write(true).create(true).truncate(false).open(&path).with_context(context)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(context)?;
         let written = file.write(&bytes).with_context(context)?;
         if written != bytes.len() {
-            return Err(anyhow!("short write ({written} of {} bytes)", bytes.len())).with_context(context);
+            return Err(anyhow!("short write ({written} of {} bytes)", bytes.len()))
+                .with_context(context);
         }
         Ok(())
     }

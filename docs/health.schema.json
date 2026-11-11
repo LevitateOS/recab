@@ -34,7 +34,7 @@
         },
         {
           "const": "inconclusive",
-          "description": "No verdict (shutting down, the init unreachable).",
+          "description": "No verdict: an explicit shutdown or assessment cancellation.",
           "type": "string"
         }
       ]

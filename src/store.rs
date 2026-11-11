@@ -1,13 +1,13 @@
 //! recab's state file, audit log and run lock.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
-use crate::error::{classified, refuse, ErrorClass};
+use crate::error::{ErrorClass, classified, refuse};
 use crate::state::{Operation, PersistentState, Slot};
 use crate::target::Target;
 
@@ -17,6 +17,7 @@ use crate::target::Target;
 const AUDIT_SCHEMA_VERSION: u32 = 1;
 
 pub(crate) struct Store {
+    target: Target,
     state_path: PathBuf,
     audit_path: PathBuf,
     lock_path: PathBuf,
@@ -40,6 +41,7 @@ struct AuditEvent<'a> {
 impl Store {
     pub fn new(target: &Target) -> Self {
         Self {
+            target: target.clone(),
             state_path: target.state_path(),
             audit_path: target.audit_path(),
             lock_path: target.lock.clone(),
@@ -129,6 +131,7 @@ impl Store {
     }
 
     pub fn save(&self, state: &PersistentState) -> Result<()> {
+        self.require_mounted()?;
         state.check_mutable()?;
         let mut current = state.clone();
         current.schema = crate::state::StateSchema::default();
@@ -144,6 +147,33 @@ impl Store {
         })
     }
 
+    pub(crate) fn require_mounted(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let uuid = crate::immutable::state_partition(&self.target)?;
+        let root = crate::filesystem::Root::open(&self.target.root)?;
+        if let Some(config) =
+            root.optional_text(std::path::Path::new(recinit::installed::IMMUTABLE_CONFIG))?
+        {
+            anyhow::ensure!(
+                config.split_whitespace().nth(1) == Some(format!("PARTUUID={uuid}").as_str()),
+                "mounted /var does not match immutable state identity"
+            );
+        }
+        // The override is used by genuine disk integration as well; it must
+        // still land on the same filesystem, never on a bare root directory.
+        let mut parent = self.target.state_dir.as_path();
+        while !parent.exists() {
+            parent = parent
+                .parent()
+                .context("state path has no existing parent")?;
+        }
+        anyhow::ensure!(
+            fs::metadata(parent)?.dev() == fs::metadata(self.target.root.join("var"))?.dev(),
+            "recab state directory is outside its mounted state partition"
+        );
+        Ok(())
+    }
+
     /// Append an audit event. The log is a record, not state: a failure to
     /// write it is reported as a warning and does not undo the operation.
     pub fn audit(
@@ -154,6 +184,7 @@ impl Store {
         after: &PersistentState,
     ) {
         let result = (|| -> Result<()> {
+            self.require_mounted()?;
             let event = AuditEvent {
                 schema: AUDIT_SCHEMA_VERSION,
                 timestamp_unix: now()?,

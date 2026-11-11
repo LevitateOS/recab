@@ -235,8 +235,8 @@ read-only verified inputs. Running A, prepared B with pending X, state and boot
 entries remain unchanged. The host lacks EROFS zstd, so mounted consumer checks
 use a genuine small LZ4 fixture; producer provenance avoids that host limitation.
 No full distro/ISO/kernel builds or VM boots were run. P08 acquisition/index
-publishing and P09 release merging are implemented below; P10/P11 assessment and
-complete frontend work remain.
+publishing, P09 release merging and P10 assessment recovery are implemented
+below; P11 complete frontend work remains.
 
 The starting-point description below records the pre-implementation audit.
 
@@ -829,6 +829,46 @@ recinit failure behavior. Depends on P04; exercise the full candidate from P09.
 Evidence: healthy trials commit and degraded, timed-out and assessment-error
 trials return to the correct generation on both inits. Shutdown gets no success
 verdict. Missing state/ESP and failed EFI writes yield honest recoverable states.
+
+P10 implementation:
+
+- Health probes share one monotonic deadline, drain bounded nonblocking output,
+  and terminate helper process groups and reap direct children on every exit.
+  Cancellation and explicit init shutdown states leave the trial undecided.
+  Collection/spawn errors and unreachable init answers fail a confirmed trial.
+- Scheduling writes a small firmware recovery ticket before the one-shot. It
+  binds both root partitions, generations and seals. New trial verdicts carry
+  both generation IDs; state writers use format 2.4. Compatibility is rechecked
+  before mutation, selection and fallback, including previously finalized
+  generations from older writers. A reused slot cannot be committed through
+  an older pending record or recovery ticket.
+- Trials recover from missing/unmounted state through the ticket, command-line
+  identity and selected EFI entry. State and audit writes prove the declared
+  ext4 `/var` is mounted; bare substitute directories are refused. Missing ESP
+  recovery requires the checked fallback root, unchanged EFI default and no
+  remaining one-shot. Mounted ESP recovery validates the fallback payloads.
+- A failed verdict is checkpointed before selection and bound to a unique
+  attempt, so a read-only EFI store cannot erase it and an explicit retry of
+  the same generation can succeed independently. An already verified firmware
+  fallback needs no rewrite, so read-only EFI does not block a safe reboot. The
+  verdict is reconciled when the fallback runs. Healthy partial commits are
+  assessed again against the same candidate identity. Failed selection or an unbootable
+  fallback produces a recoverable error and no claimed reboot.
+- Existing systemd shutdown/isolation and OpenRC inactive/failed behavior is
+  preserved. Recinit already reboots failed trial boots after consuming the
+  one-shot; its committed default retains emergency-shell behavior. Hardware
+  hangs still require a supported hardware watchdog; none is claimed here.
+
+Focused CLI/library compilation and generated TUI typechecking passed. Native
+GPT/ext4/vfat CLI checks cover both directions on systemd and OpenRC: healthy,
+degraded, timed-out and assessment-error trials; helper cancellation and pipe
+owners; missing ledger, unmounted `/var` and ESP; required EFI-write failures
+and safe recovery with read-only EFI; partial commits; old-reader and reused
+slot refusal; latched failures and independent same-generation retries. A
+signed P09 merge candidate with the existing newer cached kernel also passed
+systemd checks in both directions. These use observed boot/init records.
+Full builds, VM boots, physical firmware writes and hard-hang watchdog recovery
+remain unverified.
 
 ### P11 Expose the lifecycle in CLI and existing frontends
 

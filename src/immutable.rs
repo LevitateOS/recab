@@ -24,7 +24,9 @@ pub(crate) fn state_partition(target: &Target) -> Result<String> {
                 point.display()
             ))
         })?;
-    if state.fstype != "ext4" {
+    use std::os::unix::fs::MetadataExt;
+    if state.fstype != "ext4" || state.root != Path::new("/")
+        || std::fs::metadata(&point)?.dev() != libc::makedev(state.dev.0, state.dev.1) {
         return Err(refuse(
             "immutable A/B needs an ext4 state partition at /var",
         ));

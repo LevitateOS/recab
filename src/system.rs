@@ -6,9 +6,9 @@
 use anyhow::Result;
 use std::path::Path;
 
-use crate::error::{classified, or_class, ErrorClass};
-use crate::state::{plan, PersistentState, Request, Transition};
-use crate::store::{now, Lock, Store};
+use crate::error::{ErrorClass, classified, or_class};
+use crate::state::{PersistentState, Request, Transition, plan};
+use crate::store::{Lock, Store, now};
 use crate::systemd_boot::{Boot, SelectError, SystemdBoot};
 use crate::target::Target;
 
@@ -44,6 +44,17 @@ impl System {
         let system = Self::read_with(target, Some(lock))?;
         system.state.check_mutable()?;
         crate::installation::require_complete(&system.target)?;
+        crate::candidate::runtime_protocol(&crate::filesystem::Root::open(&system.target.root)?)?;
+        if let Some(ticket) = crate::trial_record::Ticket::read(&system.target)? {
+            anyhow::ensure!(
+                ticket.matches(&system.state),
+                "trial recovery generations differ from state; run recab trial to recover"
+            );
+            anyhow::ensure!(
+                matches!(command, "commit" | "rollback" | "set-next"),
+                "a trial recovery ticket is pending; run recab trial or rollback before changing a system"
+            );
+        }
         Ok(system)
     }
 
@@ -112,6 +123,7 @@ impl System {
         if matches!(transition.operation, crate::state::Operation::Commit(_)) {
             self.verify_active_generation()?;
         }
+        self.store.require_mounted()?;
         let name = transition.operation.name();
         if let Some(change) = transition.boot {
             crate::filesystem::private_mounts()?;
@@ -125,6 +137,16 @@ impl System {
                 slot,
                 transition.next.require_ready(slot)?,
             )?;
+            if matches!(transition.operation, crate::state::Operation::SetNext(_)) {
+                let ticket = crate::trial_record::Ticket::scheduled(self, slot)?;
+                if let Some(existing) = crate::trial_record::Ticket::read(&self.target)? {
+                    anyhow::ensure!(
+                        existing.matches(&self.state) && existing.candidate.slot == slot,
+                        "another generation-bound trial needs recovery"
+                    );
+                }
+                ticket.write(&self.target)?;
+            }
             self.backend
                 .select(&self.boot, change, || self.target.init())
                 .map_err(|err| select_failed(name, err))?;
@@ -143,6 +165,12 @@ impl System {
                 err.context(format!("{name} aborted"))
             }
         })?;
+        if matches!(
+            transition.operation,
+            crate::state::Operation::Commit(_) | crate::state::Operation::Rollback(_)
+        ) {
+            crate::trial_record::Ticket::clear(&self.target)?;
+        }
         self.store.audit(
             transition.operation,
             self.boot.selection.active,
@@ -179,7 +207,7 @@ pub(crate) fn require_root(command: &str) -> Result<()> {
 }
 
 /// The error of a failed boot-selection change, saying what it changed.
-fn select_failed(name: &str, err: SelectError) -> anyhow::Error {
+pub(crate) fn select_failed(name: &str, err: SelectError) -> anyhow::Error {
     let SelectError {
         cause,
         firmware,

@@ -159,7 +159,7 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   updated kernel/initramfs; a changed kernel/module set requires the release
   producer's `usr/lib/recab/kernel.json` binding. The candidate must include a
   recab binary matching its producer's `usr/lib/recab/runtime.json`, supporting
-  state 2.3 and immutable boot protocol v3. The retained fallback must have a
+  state 2.4 and immutable boot protocol v3. The retained fallback must have a
   compatible reader and installed boot protocol too; legacy adoption remains
   explicit work, rather than stranding rollback on an older writer.
 
@@ -284,10 +284,32 @@ recab rollback        # later, if wanted: back to A, while A still holds its sys
   - OpenRC: startup has finished when the default runlevel is entered, no
     service is starting and the `openrc` process has exited (OpenRC's state
     directory, `/run/openrc`); a service OpenRC marked failed, a crashed
-    daemon (`rc-status --crashed`) or the single-user runlevel is a failure. When the ESP or `/var` cannot be read, the firmware
-  still tells: a failed boot whose `LoaderEntrySelected` is not the default is a
-  one-shot trial, and is rebooted. Health-collection errors can currently return
-  before recovery, and helper subprocesses are not all bounded by the timeout.
+    daemon (`rc-status --crashed`) or the single-user runlevel is a failure.
+    Inactive one-shot services count as successful.
+  - The deadline covers the complete assessment, including failed-unit and
+    crashed-daemon helpers and descendants holding output pipes open. Helpers
+    are terminated and reaped on timeout, cancellation or collection error.
+    An explicit shutdown gets no verdict; an unreachable init or failed probe
+    fails a confirmed trial.
+  - Before selecting the one-shot, recab saves a generation-bound recovery ticket
+    in the `RecabTrial` EFI variable (vendor GUID
+    `a69e7a1c-44ab-42f5-93ed-836a4c103bad`). It binds the candidate and fallback
+    partitions, generations and boot seals, independently of shared `/var`.
+    Both generation identities and the unique trial attempt also appear in new
+    `last_trial` records. A failed assessment is checkpointed on `/var` even
+    when EFI writes fail; a later explicit retry gets its own attempt identity.
+    An already verified firmware fallback needs no EFI rewrite, so read-only
+    firmware does not block that safe reboot.
+  - A missing or unreadable ledger cannot authorize a commit. Recovery uses the
+    ticket, checked running command line and firmware selection, and verifies
+    the fallback root and available ESP payloads. With the ESP unmounted, only
+    the ticket's unchanged firmware default and a consumed one-shot authorize
+    recovery. No state is created through an unmounted `/var` directory.
+  - If a required EFI selection fails or the fallback is unavailable/corrupt,
+    recab reports a recovery error and retains the ticket without claiming a reboot. A failure
+    stays failed until the fallback runs. That boot reconciles its durable
+    verdict; commit retries after partial writes remain bound to the same
+    generation. Preparation is blocked until an outstanding ticket is resolved.
 - `health` waits for startup like `trial` and prints the verdict (`--json`:
   `schema_version`, `init`, `startup`, `finished`, `state`, `failed`); it changes nothing and needs no A/B
   layout. It exits non-zero only when no verdict can be formed.
@@ -320,7 +342,8 @@ known-good default. Something has to cause that reboot:
 | Failure | What reboots |
 |---|---|
 | Units or services fail, emergency mode, single-user runlevel | the trial service (on systemd it starts early and survives isolation) |
-| Startup never finishes | `recab trial`'s timeout |
+| Startup or an assessment helper never finishes | `recab trial`'s complete-assessment timeout |
+| Health collection fails in a confirmed trial | the trial service, after verifying its generation-bound fallback |
 | The root cannot be mounted | `rd.emergency=reboot` in recinit's installed initramfs, on both distros |
 | PID 1 crashes | systemd: `systemd.crash_action=reboot`; OpenRC: the kernel panics, `panic=10` |
 | Kernel panic | `panic=10` |
@@ -338,9 +361,9 @@ The A/B layout mounts its state partition at `/var`, so both slots share recab's
 - Audit log (JSON lines): `/var/lib/recab/audit.log`
 - Lock: `/run/lock/recab.lock`, held by every run that changes anything
 
-Mutations now write state format `{"major":2,"minor":3}`. The new reader also
-accepts 2.0/2.1/2.2 and promotes them on mutation. Earlier writers refuse 2.3, so they
-cannot drop in-progress Recipe publications or publish an incomplete candidate. Both slot runtimes need a compatible version before deployment. The structured major
+Mutations now write state format `{"major":2,"minor":4}`. The reader also
+accepts 2.0/2.1/2.2/2.3 and promotes them on mutation. Earlier writers refuse 2.4, so they
+cannot discard generation-bound trial recovery restrictions. Both slot runtimes need a compatible version before deployment. The structured major
 version intentionally cannot be read by the old numeric-schema writer, which
 would otherwise ignore new safety restrictions. Numeric schema 1 is inspectable
 but read-only; adoption with compatible runtimes is still required. Unsupported
@@ -526,7 +549,7 @@ payload and receipt; other edits/finalization refuse until recovery or explicit
 discard. Failed producers publish no candidate changes. The prepared system is
 unmounted between commands; finalization validates and seals it for trial boot.
 
-`last_change` and a pending `change` appear in status schema 6 / state 2.3.
+`last_change` and a pending `change` first appeared in status schema 6 / state 2.3.
 Reports separate logical candidate payload writes from package projection bytes
 and `/proc/self/io` deltas for Recipe and the recab invocation (including reaped children and streams). Returned invocation counters cover cleanup; the persisted record predates that observation and leaves it unmeasured.
 The latter includes runtime input staging, checkpoints, exports and diagnostics;
@@ -545,8 +568,8 @@ The previously recorded release-image `ab-update` run on 2026-11-08 passed acros
 both LevitateOS (systemd) and AcornOS (OpenRC), using fresh A/B installations
 and live-tools images under the libvirt user session with OVMF. All eight
 scenarios in `test all` passed on each distro. This is historical evidence for
-those artifacts, not validation of the current working tree or the missing
-continuation, incremental synchronization and matching initial slots.
+those artifacts. It does not validate the current continuation, synchronization,
+matching initial slots, release merge or generation-bound trial recovery.
 
 ```sh
 cargo xtask test all levitate
@@ -559,15 +582,21 @@ These commands consume existing release images. A passing result for the same
 inputs is reused unless `--force` is supplied. Run records and their input
 references are in `.artifacts/out/<distro>/scenarios/<scenario>/<run>/run-manifest.json`.
 
-`ab-update` checks what the host checks cannot: that the installed system boots
-from a slot `recab stage` wrote, that OVMF keeps and consumes the one-shot
-variable, that `recab-trial.service` reboots out of a degraded trial and commits
-a healthy one, that the machine keeps its identity, and that commit and
-rollback survive reboots.
+The existing `ab-update` scenario still uses the legacy staging flow and needs
+updating before it can validate the current lifecycle. Required boot evidence
+includes actual slot roots, OVMF one-shot consumption, both init systems' trial
+services, the installed initramfs and retained identity across reboot. Native
+filesystem checks cannot establish those behaviors, physical firmware support
+or recovery from hardware hangs.
 
-The runs exercise the installed initramfs, real efivarfs writes through OVMF,
-and each distro's actual service-health reporting. Physical hardware and
-injected initramfs or PID 1 failures remain untested by this scenario.
+Pass `--trials` to `tests/finalization.py` with its `--binary`, `--kernel` and
+`--module` arguments, and `--init systemd` or `--init openrc`, for focused trial
+checks on disposable GPT/ext4/vfat partitions. It covers both directions,
+health helpers and cancellation, missing state/ESP, failed EFI writes,
+partial-commit reconciliation, invalid fallbacks and generation reuse refusal.
+Combining it with `--updates` and `--release-builder` exercises the merged
+release candidate. These checks use observed boot/init records; they do not
+boot a VM or write physical firmware variables.
 
 ## Exit Codes
 
@@ -580,7 +609,7 @@ a `[RECAB_ERR_*]` tag and exits with its class's code:
 | 20 | `RECAB_ERR_BACKEND` | no UEFI or efivars, or the running os-release has no distro profile (`REC_*`) |
 | 21 | `RECAB_ERR_STATE` | refused, or the slots or state could not be read |
 | 22 | `RECAB_ERR_PARTIAL_UPDATE` | the boot selection changed only in part, or recab's state was not saved after it changed |
-| 23 | `RECAB_ERR_TRIAL_FAILED` | a trial boot was not healthy and was not committed |
+| 23 | `RECAB_ERR_TRIAL_FAILED` | trial assessment/commit failed, or recovery needs attention |
 
 They are defined in [`src/error.rs`](src/error.rs).
 
