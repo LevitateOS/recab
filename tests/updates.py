@@ -317,7 +317,16 @@ class Updates:
         check(all(b'local-password-hash-secret' not in path.read_bytes() for path in state.rglob('*.json') if path.is_file()),'account secret leaked into shared state')
         check(cli(active,'inventory','--root',str(roots[running]))==before_a,'merge changed running system')
         finalized=cli(active,'finalize');check(finalized['seal']['kernel_release']==incoming_release and finalized['generation']['kernel_digest']==incoming_hash,'finalizer used running kernel instead of merged boot set');cli(active,'set-next',inactive);cli(active,'rollback')
-        cli(active,'stage','--manifest',str(bundle/'release.json'));check(run('blkid','-c','/dev/null','-s','UUID','-o','value',h['dev'][inactive]).stdout==filesystem_uuid,'stage reformatted the inactive system')
+        # Real unrelated renames race the kernel's scoped '..' resolution of
+        # sbin/init. Before bounded openat2 retries this could refuse EAGAIN.
+        race=base/'rename-race';race.mkdir();(race/'left').mkdir();stop=threading.Event()
+        def rename_race():
+            while not stop.is_set():
+                os.rename(race/'left',race/'right');os.rename(race/'right',race/'left')
+        renamer=threading.Thread(target=rename_race);renamer.start()
+        try:cli(active,'stage','--manifest',str(bundle/'release.json'))
+        finally:stop.set();renamer.join();(race/'left').rmdir();race.rmdir()
+        check(run('blkid','-c','/dev/null','-s','UUID','-o','value',h['dev'][inactive]).stdout==filesystem_uuid,'stage reformatted the inactive system')
         ledger=(state/'state.json').read_bytes();cli(active,'update','apply',id);check((state/'state.json').read_bytes()==ledger,'reapplying completed release changed preparation')
         changed=base/'Y';changed.write_text('later Y\n');cli(active,'edit','etc/config','--file',str(changed));last=cli(active,'finalize')
         if h['args'].lifecycle:

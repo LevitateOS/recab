@@ -118,21 +118,39 @@ impl Root {
             mode: 0,
             resolve: 0x10 | 0x02,
         };
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_openat2,
-                self.0.as_raw_fd(),
-                name.as_ptr(),
-                &how,
-                std::mem::size_of::<How>(),
-            )
+        // A concurrent rename can make the kernel unable to prove that a
+        // symlink's '..' stays inside this root. openat2(2) explicitly permits
+        // retrying EAGAIN. Retain every resolution flag and bound the retries;
+        // never fall back to an unconstrained path open.
+        let fd = {
+            let mut fd = -1;
+            for attempt in 0..32 {
+                fd = unsafe {
+                    libc::syscall(
+                        libc::SYS_openat2,
+                        self.0.as_raw_fd(),
+                        name.as_ptr(),
+                        &how,
+                        std::mem::size_of::<How>(),
+                    )
+                };
+                if fd >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EAGAIN) {
+                    break;
+                }
+                if attempt < 31 {
+                    std::thread::yield_now();
+                }
+            }
+            fd
         };
         if fd < 0 {
             let err = std::io::Error::last_os_error();
             return if err.kind() == std::io::ErrorKind::NotFound {
                 Ok(None)
             } else {
-                Err(err.into())
+                Err(err).with_context(|| {
+                    format!("resolving system path '{}' within its root", relative.display())
+                })
             };
         }
         let file = unsafe { File::from_raw_fd(fd as i32) };
