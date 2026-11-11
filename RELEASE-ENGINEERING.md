@@ -34,7 +34,8 @@ Provisioned metadata base:
 `https://levitateos.github.io/LevitateOS/updates/`.
 GitHub Pages reports the canonical HTTPS project URL with no custom domain,
 workflow deployment and HTTPS enforcement. No custom domain purchase is required.
-Only public authority/provisioning metadata is deployed initially; no release
+Only public authority/provisioning metadata is prepared for initial deployment;
+the first public deployment is still pending. No release
 index or installed production default is enabled by provisioning.
 
 Use `/levitate/stable/x86_64/index.json` and
