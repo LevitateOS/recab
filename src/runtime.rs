@@ -1,9 +1,8 @@
 //! Explicit runtime exceptions, without a writable /etc overlay.
 use crate::error::refuse;
 use crate::filesystem::Root;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use distro_profile::InitSystem;
-use std::fs;
 use std::path::Path;
 
 const DROPIN: &str = "[Unit]\nConditionKernelCommandLine=!recab.immutable\n";
@@ -31,15 +30,17 @@ impl Policy {
         let opened = Root::open(root)?;
         let mut changes = Vec::new();
         for p in ["etc/mtab", "etc/resolv.conf"] {
-            let meta = opened.metadata(Path::new(p))?;
+            let meta = opened
+                .file_type(Path::new(p))
+                .with_context(|| format!("checking runtime policy {p}"))?;
             let target = if p == "etc/mtab" {
                 "/proc/self/mounts"
             } else {
                 "/run/NetworkManager/resolv.conf"
             };
             match meta {
-                Some(m) if m.file_type().is_symlink() => {
-                    let link = fs::read_link(opened.entry(Path::new(p), false)?.path())?;
+                Some(libc::S_IFLNK) => {
+                    let link = opened.entry(Path::new(p), false)?.read_link()?;
                     if link != Path::new(target)
                         && !(p == "etc/mtab" && link == Path::new("/proc/mounts"))
                     {
@@ -48,9 +49,9 @@ impl Policy {
                         )));
                     }
                 }
-                Some(m) if m.is_file() && p == "etc/resolv.conf" => {} // Explicit static DNS remains immutable.
-                Some(m) if !m.is_file() => {
-                    return Err(refuse("runtime path has an unsupported type"))
+                Some(libc::S_IFREG) if p == "etc/resolv.conf" => {} // Explicit static DNS remains immutable.
+                Some(m) if m != libc::S_IFREG => {
+                    return Err(refuse("runtime path has an unsupported type"));
                 }
                 _ => changes.push(Change {
                     path: p.into(),
@@ -59,8 +60,8 @@ impl Policy {
             }
         }
         let static_dns = opened
-            .metadata(Path::new("etc/resolv.conf"))?
-            .is_some_and(|m| m.is_file());
+            .file_type(Path::new("etc/resolv.conf"))?
+            .is_some_and(|m| m == libc::S_IFREG);
         add(
             &opened,
             &mut changes,
@@ -97,24 +98,23 @@ impl Policy {
     pub fn apply(self, root: &Path) -> Result<()> {
         let opened = Root::open(root)?;
         for change in self.changes {
-            let entry = opened.entry(Path::new(&change.path), true)?;
-            if let Some(m) = entry.metadata()? {
-                if !m.is_file() {
+            let entry = opened
+                .entry(Path::new(&change.path), true)
+                .with_context(|| format!("opening runtime policy {}", change.path))?;
+            if let Some(m) = entry.file_type()? {
+                if m != libc::S_IFREG {
                     return Err(refuse("runtime policy target changed type"));
                 }
                 // Detach before changing configuration: no writes through aliases.
-                fs::remove_file(entry.path())?;
+                entry.remove_file()?;
             }
             match change.contents {
                 Some(text) => entry.write(text.as_bytes(), 0o644)?,
-                None => std::os::unix::fs::symlink(
-                    if change.path == "etc/mtab" {
-                        "/proc/self/mounts"
-                    } else {
-                        "/run/NetworkManager/resolv.conf"
-                    },
-                    entry.path(),
-                )?,
+                None => entry.symlink(Path::new(if change.path == "etc/mtab" {
+                    "/proc/self/mounts"
+                } else {
+                    "/run/NetworkManager/resolv.conf"
+                }))?,
             }
         }
         Ok(())
@@ -127,7 +127,10 @@ fn add(
     wanted: &str,
     known: &[&str],
 ) -> Result<()> {
-    if root.metadata(Path::new(p))?.is_some_and(|m| !m.is_file()) {
+    if root
+        .file_type(Path::new(p))?
+        .is_some_and(|m| m != libc::S_IFREG)
+    {
         return Err(refuse("runtime policy must be a regular file"));
     }
     let current = root.optional_text(Path::new(p))?;

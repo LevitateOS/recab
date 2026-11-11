@@ -2,12 +2,12 @@
 //! descriptors stay alive through each operation; symlinks are never parents
 //! of writes, and reads that follow links resolve them inside this root.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -83,6 +83,16 @@ impl Root {
         }
     }
 
+    pub fn file_type(&self, relative: &Path) -> Result<Option<u32>> {
+        match self
+            .entry(relative, false)
+            .and_then(|entry| entry.file_type())
+        {
+            Err(err) if missing(&err) => Ok(None),
+            value => value,
+        }
+    }
+
     pub fn names(&self, relative: &Path) -> Result<Vec<OsString>> {
         let dir = if relative.as_os_str().is_empty() {
             self.0.try_clone()?
@@ -110,6 +120,18 @@ impl Root {
                 .any(|c| !matches!(c, Component::Normal(_)))
         {
             bail!("invalid system path '{}'", relative.display());
+        }
+        // Ordinary package files need only descriptor-relative, no-follow opens.
+        // Keep the pinned parent alive from the metadata check through the open.
+        // Symlink resolution below retains the kernel's in-root constraints.
+        match self.entry(relative, false) {
+            Ok(entry) => match entry.file_type()? {
+                None => return Ok(None),
+                Some(libc::S_IFREG) => return entry.open().map(Some),
+                _ => {}
+            },
+            Err(err) if missing(&err) => return Ok(None),
+            Err(_) => {} // A symlink parent still uses constrained resolution below.
         }
         // RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS; absolute symlink targets
         // remain inside this root rather than reaching the host filesystem.
@@ -149,7 +171,10 @@ impl Root {
                 Ok(None)
             } else {
                 Err(err).with_context(|| {
-                    format!("resolving system path '{}' within its root", relative.display())
+                    format!(
+                        "resolving system path '{}' within its root",
+                        relative.display()
+                    )
                 })
             };
         }
@@ -213,30 +238,41 @@ impl Entry {
     pub fn metadata(&self) -> Result<Option<fs::Metadata>> {
         Ok(target_root::metadata(&self.path())?)
     }
+    pub fn file_type(&self) -> Result<Option<u32>> {
+        let name = CString::new(self.name.as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the name and writable stat buffer remain valid for this call.
+        let rc = unsafe {
+            libc::fstatat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            return if err.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(err.into())
+            };
+        }
+        // SAFETY: fstatat initialized the complete stat structure on success.
+        Ok(Some(unsafe { stat.assume_init() }.st_mode & libc::S_IFMT))
+    }
     pub fn open(&self) -> Result<File> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(self.path())?;
+        let file = self.open_at(libc::O_RDONLY | libc::O_NONBLOCK, 0)?;
         if !file.metadata()?.is_file() {
             bail!("system payload is not a regular file");
         }
         Ok(file)
     }
     fn open_directory(&self) -> Result<File> {
-        Ok(OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(self.path())?)
+        self.open_at(libc::O_RDONLY | libc::O_DIRECTORY, 0)
     }
     pub fn write(&self, bytes: &[u8], mode: u32) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .mode(mode)
-            .open(self.path())?;
+        let mut file = self.open_at(libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK, mode)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.nlink() != 1 {
             bail!("system write target must be a regular file without hardlink aliases");
@@ -244,6 +280,65 @@ impl Entry {
         file.set_len(0)?;
         file.write_all(bytes)?;
         file.set_permissions(fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+    fn open_at(&self, flags: i32, mode: u32) -> Result<File> {
+        let name = CString::new(self.name.as_bytes())?;
+        // SAFETY: the parent owns its descriptor and name is NUL terminated.
+        let fd = unsafe {
+            libc::openat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                mode,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("opening system entry {:?} (flags={flags:#x})", self.name)
+            });
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    pub fn read_link(&self) -> Result<PathBuf> {
+        let name = CString::new(self.name.as_bytes())?;
+        let mut bytes = vec![0u8; 4096];
+        // SAFETY: the name and output buffer remain valid for this call.
+        let n = unsafe {
+            libc::readlinkat(
+                self.parent.as_raw_fd(),
+                name.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if n as usize == bytes.len() {
+            bail!("system symlink target exceeds 4095 bytes");
+        }
+        bytes.truncate(n as usize);
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+    pub fn symlink(&self, target: &Path) -> Result<()> {
+        let name = CString::new(self.name.as_bytes())?;
+        let target = CString::new(target.as_os_str().as_bytes())?;
+        // SAFETY: both strings are NUL terminated; the parent remains pinned.
+        let rc =
+            unsafe { libc::symlinkat(target.as_ptr(), self.parent.as_raw_fd(), name.as_ptr()) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    pub fn remove_file(&self) -> Result<()> {
+        let name = CString::new(self.name.as_bytes())?;
+        // SAFETY: the parent remains pinned and name is NUL terminated.
+        let rc = unsafe { libc::unlinkat(self.parent.as_raw_fd(), name.as_ptr(), 0) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         Ok(())
     }
     pub fn remove(&self) -> Result<()> {
