@@ -117,6 +117,9 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
     },
+    /// List what happened to this computer's systems, newest first, from
+    /// recab's audit log and state (read-only; --json for structured output).
+    History,
     /// Show detected A/B status
     Status {
         /// Read the system installed under this root (its root partition
@@ -351,6 +354,7 @@ fn main() -> ExitCode {
         Command::Prepare { .. } => "prepare",
         Command::Discard { .. } => "discard",
         Command::Compare { .. } => "compare",
+        Command::History => "history",
         Command::Inventory { .. } => "inventory",
         Command::Status { .. } => "status",
         Command::Stage { .. } => "stage",
@@ -660,6 +664,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string(&comparison)?);
             } else {
                 print_comparison(&comparison);
+            }
+        }
+        Command::History => {
+            let history = recab::history::history()?;
+            if cli.json {
+                println!("{}", serde_json::to_string(&history)?);
+            } else {
+                recab::history::print(&history);
             }
         }
         Command::Inventory { root } => {

@@ -19,6 +19,7 @@ mod filesystem;
 mod finalize;
 mod fstab;
 mod generation;
+pub mod history;
 mod immutable;
 mod init;
 mod init_system;
