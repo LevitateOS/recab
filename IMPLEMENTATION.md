@@ -1053,6 +1053,30 @@ workflow, and verify installed check/download/apply against those published
 artifacts. Keep key material out of the repository and logs. Local fixture
 success must not be reported as a working production update service.
 
+Current delivery: production remains disabled. Neither variant supplies an
+update source or distribution trust key; both still declare development
+sequence 1. The requested real index URL/channel, public key and external
+signing-key location, plus deployment destination/access, are missing. Do not
+invent these values, generate an unapproved production authority, redirect
+installed systems to a fixture or publish unchecked development artifacts.
+Applicable P13 VM runtime evidence is also outstanding. Installed acquisition
+and apply against a real published service have not been verified.
+
+The existing builder publisher now checks signing-key location/authority before
+writing public release objects, refusing keys in the checkout or supplied
+prepared/published trees. The local lifecycle fixture now includes the
+content-addressed index signature that the actual recab consumer requests;
+`index.sig` alone was insufficient. These changes prepare the existing workflow;
+they do not configure or deploy a production update service.
+
+Focused local checks passed using an existing signed scratch release: actual
+feed publication, exact manifest bytes, addressed index signature verification,
+checkout/public-tree/wrong-authority key refusals, and the packed ISO's
+content-addressed signature served through its real loopback HTTP helper.
+Private key bytes were excluded. These are local integration observations;
+no production endpoint, installed production apply, full build or VM run was
+performed.
+
 ## Deployment and recovery rules
 
 The first delivery targets fresh installs, whose two initial systems contain
