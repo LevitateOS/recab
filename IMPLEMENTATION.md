@@ -1013,6 +1013,15 @@ lock serialization, stale revision refusal, prepared failure service removal,
 shared data and an independent Recipe profile. Native boot identities remain
 observations, not exercised firmware/init boots. The origin helper also passed
 an actual TCP truncated-transfer/retry and unsafe path/symlink refusal check.
+Fixture packing passed against a current signed scratch release, including ISO
+extraction, exact manifest/rootfs bytes, index signature verification and
+private-key exclusion. An older state-2.4 release was correctly refused.
+An additional signed-merge regression run reached finalization/rollback but
+failed its later manifest `stage` with `EAGAIN` ("Resource temporarily
+unavailable"); that run is not a passing regression result and remains to be
+investigated. Re-staging the retained disk under syscall tracing succeeded;
+the original refusal has not been reproduced or explained. The independent
+write/fidelity checks above passed separately.
 
 Measured Y payload was 1,049,847 bytes (systemd) / 1,049,854 bytes (OpenRC),
 with root block writes about 1.10 MB, rather than rewriting the 32 MiB file.
