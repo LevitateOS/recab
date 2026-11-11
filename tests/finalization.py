@@ -7,7 +7,9 @@ an actual VM boot can establish PID 1, hardware-driver and service behavior.
 import argparse,copy,ctypes,errno,gzip,hashlib,json,os,re,shutil,signal,struct,subprocess,tempfile,time,sys
 sys.dont_write_bytecode=True
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");p.add_argument('--trials',action='store_true',help='exercise generation-bound trial recovery on these real filesystems');p.add_argument('--lifecycle',action='store_true');p.add_argument('--deployment',action='store_true');args=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--binary',required=True,type=Path);p.add_argument('--kernel',required=True,type=Path);p.add_argument('--module',required=True,type=Path);p.add_argument('--init',choices=['systemd','openrc'],default='systemd');p.add_argument('--installation',action='store_true');p.add_argument('--recsetup',type=Path);p.add_argument('--busybox',type=Path);p.add_argument('--changes',type=Path,help='exercise real Recipe/Ginux system changes in both directions');p.add_argument('--release-builder',type=Path,help='exercise release manifest production/import with existing native artifacts');p.add_argument("--updates",type=Path,help="exercise signed HTTP updates through this Recipe binary");p.add_argument("--updates-running",choices=["A","B"],default="A");p.add_argument("--update-kernel",type=Path);p.add_argument("--update-module",type=Path);p.add_argument("--adopt-baseline",action="store_true");p.add_argument("--merge-id-collision",action="store_true");p.add_argument('--trials',action='store_true',help='exercise generation-bound trial recovery on these real filesystems');p.add_argument('--lifecycle',action='store_true');p.add_argument('--deployment',action='store_true');p.add_argument('--write-reduction',type=Path,help='real Recipe binary for the P13 large-file lifecycle');p.add_argument('--probe-recipes',type=Path,help='sources from ab-update-fixture recipes');args=p.parse_args()
+if args.write_reduction and (not args.probe_recipes or any([args.installation,args.updates,args.release_builder,args.changes,args.trials,args.lifecycle,args.deployment])):p.error('--write-reduction needs --probe-recipes and runs independently of the other modes')
+if args.probe_recipes and not args.write_reduction:p.error('--probe-recipes requires --write-reduction')
 if os.geteuid()!=0:p.error('root with mount/loop access is required')
 # Keep scratch mounts out of concurrent host sessions and their namespaces.
 libc=ctypes.CDLL(None,use_errno=True)
@@ -174,7 +176,7 @@ try:
         updates=Updates(globals())
     image=base/'scratch.img'
     root_mib=128
-    state_mib=512 if args.updates else (128 if args.release_builder else 32)
+    state_mib=512 if (args.updates or args.write_reduction) else (128 if args.release_builder else 32)
     with image.open('wb') as f:f.truncate((root_mib*2+state_mib+112)*1024*1024)
     run('sfdisk',str(image),input=f'label:gpt\nsize={root_mib}M,type=L,name=TEST_A\nsize={root_mib}M,type=L,name=TEST_B\nsize={state_mib}M,type=L,name=TEST_STATE\nsize=96M,type=U,name=TEST_ESP\n'.encode())
     loop=run('losetup','--find','--show','--partscan',str(image)).stdout.decode().strip()
@@ -223,6 +225,9 @@ try:
         cli(dict(env,RECAB_ROOT=str(root)),'install-unit','--root',str(root),'--init',args.init)
         check((root/'usr/lib/recab/runtime.json').exists(),'producer runtime compatibility record missing')
         check(not (root/'usr/lib/recab/carried').exists() and not (root/'usr/lib/recab/baseline').exists(),'obsolete carry metadata was packaged')
+        if args.write_reduction:
+            from write_reduction import seed
+            seed(root)
         if updates:
             updates.seed(root,globals())
             cli(dict(env,RECAB_ROOT=str(root)),'baseline','--root',str(root))
@@ -269,6 +274,10 @@ try:
     def running(slot,g):
         (proc/'cmdline').write_text(f'root=PARTUUID={uuid[slot]} ro recab.immutable recab.slot={slot} recab.generation={g["id"]}\n');(proc/'self/mountinfo').write_text(Path('/proc/self/mountinfo').read_text());return dict(env,RECAB_ROOT=str(roots[slot]))
     active=running(first,ga if first=='A' else gb)
+    if args.write_reduction:
+        from write_reduction import exercise
+        args.changes=args.write_reduction
+        result=exercise(globals(),active);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)
     if args.deployment:
         from deployment import exercise
         result=exercise(globals(),active);success=True;print(json.dumps(result,indent=2));raise SystemExit(0)

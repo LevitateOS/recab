@@ -596,20 +596,56 @@ matching initial slots, release merge or generation-bound trial recovery.
 ```sh
 cargo xtask test all levitate
 cargo xtask test all acorn
-cargo xtask test ab-update levitate
-cargo xtask test ab-update acorn
+cargo xtask test ab-update levitate --update-fixture /absolute/path/levitate-update-fixture.iso
+cargo xtask test ab-update acorn --update-fixture /absolute/path/acorn-update-fixture.iso
 ```
 
 These commands consume existing release images. A passing result for the same
 inputs is reused unless `--force` is supplied. Run records and their input
 references are in `.artifacts/out/<distro>/scenarios/<scenario>/<run>/run-manifest.json`.
 
-The existing `ab-update` scenario still uses the legacy staging flow and needs
-updating before it can validate the current lifecycle. Required boot evidence
-includes actual slot roots, OVMF one-shot consumption, both init systems' trial
-services, the installed initramfs and retained identity across reboot. Native
-filesystem checks cannot establish those behaviors, physical firmware support
-or recovery from hardware hangs.
+The current `ab-update` scenario exercises matching initial A/B systems, X plus
+a signed downloaded release, conflict resolution, failed and healthy trials in
+both directions, Y, repeated incremental continuation, discard and rollback.
+It requires `--update-fixture /absolute/path/fixture.iso` and an existing install
+whose matching public update policy was personalized before sealing. See
+[`install-tests`](../../testing/install-tests/README.md) for explicit fixture
+production and independently runnable scenario commands. No scenario builds its
+inputs or installs prerequisites.
+
+The rewritten VM lifecycle has not yet been run against current artifacts.
+Required boot evidence includes actual slot roots, OVMF one-shot consumption,
+both init systems' trial services, the installed initramfs and retained identity
+across reboot. Native filesystem checks cannot establish those behaviors,
+physical firmware support or recovery from hardware hangs. Recipe/Ginux and
+the runtime/build/boot owners still need their aarch64 port; x86_64 results on
+both distros do not establish cross-architecture completion.
+
+For the independent native large-file check, export the same probe recipes and
+use existing recab, Recipe, Ginux, kernel and module artifacts:
+
+```sh
+target/debug/ab-update-fixture recipes --output /tmp/recab-probes --init systemd
+sudo env GINUX_BIN=/absolute/path/ginux python3 tools/recab/tests/finalization.py \
+  --binary /absolute/path/recab --kernel /absolute/path/vmlinuz \
+  --module /absolute/path/native.ko --write-reduction /absolute/path/recipe \
+  --probe-recipes /tmp/recab-probes
+```
+
+Use `--init openrc` for both recipe export and the native check to exercise its
+service publication. This mode uses disposable GPT/ext4/vfat partitions and real
+Recipe/Ginux producers. It checks metadata/path fidelity, actual copy
+interruption and recovery, space refusal, lock serialization, stale revisions,
+independent Recipe profiles, and repeated synchronization. Boot identities are
+supplied observations in this native check, not VM boots.
+
+On x86_64, both init variants passed: Y wrote about 1.05 MB of candidate payload
+and 1.10 MB on the isolated root block device for a one-byte edit to a 32 MiB
+file; unchanged continuation wrote zero payload. The full native invocation
+reported about 204 MB of process writes including staging/export. Its scratch
+TMPDIR was disk-backed. Producer counters are included in invocation counters,
+not additional traffic to sum. These results demonstrate bounded root writes;
+they do not establish low total SSD traffic, a SMART change or a lifetime gain.
 
 Pass `--trials` to `tests/finalization.py` with its `--binary`, `--kernel` and
 `--module` arguments, and `--init systemd` or `--init openrc`, for focused trial

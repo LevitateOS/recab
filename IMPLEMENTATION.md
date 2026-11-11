@@ -992,6 +992,47 @@ corresponding Recipe/Ginux launcher, worker, runtime image and boot artifact
 support through their existing owners before claiming cross-architecture
 completion. x86_64 results on both distros do not establish aarch64 support.
 
+Implementation status: the named scenario and focused install/runtime checks
+now exercise the new lifecycle. `--update-fixture` selects an existing signed
+release fixture and participates in run records/cache fingerprints. The packer
+uses the release owner's manifest/index/signature contract and an explicitly
+built static guest HTTP helper. Install personalizes public policy and local
+fidelity probes before sealing. The scenario checks first-use B, preserves X
+through interrupted download and conflict resolution, exercises failed and
+healthy trials in both directions, then Y, repeated continuation, discard and
+rollback. It records actual generations, boots, application counters and root
+block sectors. Runtime now executes a real output-only Recipe/Ginux worker.
+
+Focused x86_64 native evidence passed with both systemd and OpenRC using real
+GPT/ext4/vfat and Recipe/Ginux. The checks cover 32 MiB publication, one-range
+Y edits, repeated synchronization, zero unchanged payload, root protection,
+owner/mode/ACL/xattr/capability fidelity, hardlinked files and symlinks, sparse
+and non-UTF-8 paths, deletions, unchanged filesystem UUIDs, actual insufficient
+space, kill after an observed payload write and captured-plan recovery, actual
+lock serialization, stale revision refusal, prepared failure service removal,
+shared data and an independent Recipe profile. Native boot identities remain
+observations, not exercised firmware/init boots. The origin helper also passed
+an actual TCP truncated-transfer/retry and unsafe path/symlink refusal check.
+
+Measured Y payload was 1,049,847 bytes (systemd) / 1,049,854 bytes (OpenRC),
+with root block writes about 1.10 MB, rather than rewriting the 32 MiB file.
+Unchanged continuation wrote zero payload. Full native invocation process
+writes were about 204 MB, including about 170 MB of producer writes and 33.6 MB
+of projected content. Those counters overlap; do not add them. Scratch TMPDIR
+was disk-backed. Total SSD write reduction remains unproven: staging/export
+traffic still needs attention and filesystem/controller effects are separate.
+
+P13 is **not complete**. No new VM scenario or full system build was run.
+The existing pre-fixture install artifacts cannot prove this flow. The fault
+matrix below still requires applicable boot and boundary observations.
+REQ-DESIGN-030 remains unmet: Recipe validates native x86_64 targets and worker
+ELF, Ginux uses x86_64 startup/ptrace/register/syscall code, the runtime is pinned
+to amd64, builder launcher/tool recipes target x86_64, and libvirt/ISO identity
+select x86_64/q35/OVMF. These existing owners need an actual aarch64 port and
+matching artifacts; removing Recipe's guard or adding an AA64 filename does
+not provide it. Do not infer cross-architecture or production-update success
+from the native fixture checks.
+
 ### P14 Enable production online updates
 
 Owners: distro release configuration, builder publishing workflow and recab
@@ -1089,8 +1130,8 @@ accumulated implementation. Existing named commands remain:
 ```sh
 cargo xtask test all levitate
 cargo xtask test all acorn
-cargo xtask test ab-update levitate
-cargo xtask test ab-update acorn
+cargo xtask test ab-update levitate --update-fixture /absolute/path/levitate-update-fixture.iso
+cargo xtask test ab-update acorn --update-fixture /absolute/path/acorn-update-fixture.iso
 ```
 
 Run VMs through the libvirt user session, with existing kernel artifacts unless
