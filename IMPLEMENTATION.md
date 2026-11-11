@@ -1070,12 +1070,18 @@ workflow, and verify installed check/download/apply against those published
 artifacts. Keep key material out of the repository and logs. Local fixture
 success must not be reported as a working production update service.
 
-Current delivery: production remains disabled. Neither variant supplies an
-update source or distribution trust key; both still declare development
-sequence 1. The requested real index URL/channel, public key and external
-signing-key location, plus deployment destination/access, are missing. Do not
-invent these values, generate an unapproved production authority, redirect
-installed systems to a fixture or publish unchecked development artifacts.
+Current delivery: production remains disabled. The
+[release engineering proposal](RELEASE-ENGINEERING.md) designs a service using
+GitHub Pages metadata and immutable GitHub Release payloads, with signing roles,
+transport, publication, freshness and recovery specified. It awaits Vince's
+explicit design approval before implementation or production provisioning.
+The service is to be designed and provisioned here, not supplied as unexplained
+external configuration. Neither variant currently supplies an update source or
+distribution trust key; both still declare development sequence 1. The Pages
+origin, actual generated keys/delegations, external private-key custody and
+GitHub publication configuration are not yet provisioned. Do not generate an
+unapproved production authority, redirect installed systems to a fixture or
+publish unchecked development artifacts.
 Applicable P13 VM runtime evidence is also outstanding. Installed acquisition
 and apply against a real published service have not been verified.
 
