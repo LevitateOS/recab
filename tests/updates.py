@@ -135,9 +135,10 @@ class Updates:
         driver=base/'release-input-check'
         run(os.environ.get('RECAB_TEST_RUSTC','rustc'),'--edition','2024',str(self.repo/'tools/recab/tests/fixtures/release_input.rs'),'--extern','recab='+str(self.repo/'target/debug/librecab.rlib'),'--extern','distro_builder='+str(self.repo/'target/debug/libdistro_builder.rlib'),'--extern','levitate_recipe='+str(self.repo/'target/debug/liblevitate_recipe.rlib'),'-L','dependency='+str(self.repo/'target/debug/deps'),'-o',str(driver))
         run(str(driver),'--pack',str(source),str(bundle/'filesystem.erofs'));run(str(driver),'--pack',str(bundle/'overlay'),str(bundle/'overlay.erofs'))
-        fixture=base/'repo';(fixture/'distro/variants/levitate').mkdir(parents=True)
+        fixture=base/'repo';self.fixture=fixture;(fixture/'distro/variants/levitate').mkdir(parents=True)
         for item in self.repo.iterdir():
-            if item.name!='distro':(fixture/item.name).symlink_to(item,target_is_directory=item.is_dir())
+            if item.name not in ['distro','.artifacts']:(fixture/item.name).symlink_to(item,target_is_directory=item.is_dir())
+        (fixture/'.artifacts').mkdir()
         for item in (self.repo/'distro').iterdir():
             if item.name!='variants':(fixture/'distro'/item.name).symlink_to(item,target_is_directory=item.is_dir())
         variant=self.repo/'distro/variants/levitate'

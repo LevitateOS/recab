@@ -63,6 +63,8 @@ def variant_policy(o):
 
 def exercise(o,h,active,bundle):
     cli,check,run=h['cli'],h['check'],h['run'];roots=h['roots'];running=h['first'];inactive=h['other']
+    from production_publication import exercise as publication_checks
+    publishing_checks=publication_checks(o,h,bundle,active)
     manifest_raw=(bundle/'release.json').read_bytes();manifest=json.loads(manifest_raw);release=digest(manifest_raw)
     path=o.publish/'meta/releases'/release;path.mkdir(parents=True)
     for name in ['release.json','release.sig']:shutil.copyfile(bundle/name,path/name)
@@ -165,4 +167,4 @@ def exercise(o,h,active,bundle):
         'checks':['real Recipe/Ginux HTTPS with explicit test CA','root/index/release role separation','signed transport prefix checks','TLS redirect confinement before request',
             'shared-state preflight','whole-artifact substitution refusal','real truncated-part retry','tampered partial rehash','valid-part reuse','whole-release verification and assembly accounting',
             'expired index refusal and offline verified cache','prepared X and active/boot preservation','offline preserving apply/reproduction/finalization','known revocation blocks cached reuse'],
-        'download':downloaded['download'],'scope':'native actual storage/producers; no public production service or VM boot'}
+        'publishing_checks':publishing_checks,'download':downloaded['download'],'scope':'native actual storage/producers; no public production service or VM boot'}

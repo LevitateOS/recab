@@ -428,8 +428,10 @@ filesystem journals and physical device writes are outside these counters.
 The builder embeds the public factory authority, requires an external authorized
 release key, and includes the public proof in production media. No unsigned or
 legacy trust fallback can admit production content. The old v1 publisher refuses
-production policies: transport publication, GitHub publishing/refresh workflows,
-public-origin scenario mode and profile selection remain pending. Existing
+production policies. Transport publication and GitHub publishing/refresh/monitoring
+workflows are now implemented; their operator guide is
+[release/updates/README.md](../../release/updates/README.md). Public-origin
+scenario mode and profile selection remain pending. Existing
 development defaults remain without a production origin or trust root. No
 public production service, installed boot trial or production readiness is
 claimed by native fixtures.
@@ -443,3 +445,24 @@ preserving apply/reproduction/finalization, and learned revocation of a cached
 release. Both are native glibc fixtures, not installed distro boot evidence.
 Rust consumer checks and both affected frontend typechecks passed. No full
 builds or VM tests were run.
+
+
+Production publishing now prepares bounded parts from the existing frozen
+producer-verified release, resumes matching immutable GitHub assets, verifies
+public parts through Recipe, and publishes candidate discovery. Daily refresh
+renews only current references; root-authorized epoch recovery and retained
+public authority history protect signing continuity. The workflows serialize
+metadata writers, refuse stale default-branch commits, deploy the complete
+current Pages tree in the same run, and provide an independent secret-free
+monitor. Tool builds, public acquisition and index signing use separate jobs;
+index private files are confined to a private runner tmpfs directory. Stable
+promotion requires the explicit validation switch and a matching actual run
+record. Neither that switch nor installed production defaults were enabled.
+
+Focused native CLI/filesystem/TLS checks cover producer splitting/resume/tamper
+refusal, concurrent real publisher processes, expired-index renewal, generated
+Pages/parts through Recipe/Ginux, root epoch recovery, real Git commits/pushes
+to a disposable default-branch remote with stale-base refusal, and Pages
+payload/link/size/history exclusions. GitHub remote upload/deployment execution
+and installed public-origin evidence remain unverified; local fixtures do not
+establish a production service. No full builds or VM tests were run.
