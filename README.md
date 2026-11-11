@@ -929,3 +929,10 @@ same full validation, read-only lifetime and cleanup; they do not create a
 second permanent release cache. Production public-origin scenario support and
 base/desktop artifact selectors are implemented in install-tests, with actual
 VM/public-service validation and production enablement still pending.
+
+Update acquisition also puts Recipe's leased runtime/payload scratch on shared
+recab storage. Ordinary failures remove their unverified request files; after a
+process kill, a later update command removes abandoned requests whose inherited
+lease is no longer held by Recipe. Verified transfer files and authenticated
+assembly checkpoints remain available for retry. Small verifier mountpoints can
+still use `/tmp`; they do not contain compressed release payloads.

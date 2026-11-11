@@ -509,7 +509,6 @@ pub(super) fn download(
         &target.state_dir,
         needed.saturating_add(frozen).saturating_add(overhead),
     )?;
-    space(&std::env::temp_dir(), overhead)?;
     target_root::write_durable(
         &transfer.join(AUTHORITY_FILE),
         &serde_json::to_vec(&pin.production.as_ref().unwrap().authority)?,

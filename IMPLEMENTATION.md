@@ -1092,9 +1092,11 @@ epochs, bounded transport maps and metadata validity windows. The builder's
 `release authorize` and `release verify-feed` commands consume actual key files
 and staged metadata without builds or network access. Private signing files
 must remain external and inaccessible to group/other users. The current
-installed reader refuses delegated production policy until the new acquisition
-and verification path is integrated; it cannot interpret a root anchor as an
-unsigned/local fallback.
+installed reader verifies delegated production policy through Recipe acquisition
+and the existing release validator; it cannot interpret a root anchor as an
+unsigned/local fallback. Public-origin mode and explicit base/desktop artifact
+selection are implemented in the existing independent install/ab-update scenarios.
+Their installed public-service lifecycle evidence remains pending.
 
 The existing online reader now persists anti-rollback floors in shared state
 under authority/profile identity rather than release sequence, Recipe bytes or
@@ -1126,6 +1128,32 @@ content-addressed signature served through its real loopback HTTP helper.
 Private key bytes were excluded. These are local integration observations;
 no production endpoint, installed production apply, full build or VM run was
 performed.
+
+The production acquisition, publishing/refresh/monitoring workflows and
+public-origin install/ab-update mode are implemented. The remaining rollout work
+is provisioning the canonical service/public authority and protected signing
+environment, producing compatible baseline/new release artifacts, and running
+the applicable actual public-origin lifecycle validation before enablement.
+No local/native result substitutes for that evidence. Installed defaults remain
+development-only.
+
+Additional implementation checks closed two recovery/storage gaps: Recipe's
+runtime/payload scratch now lives on shared recab storage, with failed-request
+cleanup and inherited leases for reclaiming requests after process cancellation;
+the publisher can atomically replace both profiles after signer revocation while
+keeping refresh and retained entries strict. Old release floors require actual
+release signatures; an index key alone cannot poison them. Publication and
+promotion bind the whole explicit profile set, with per-profile actual lifecycle
+evidence still required for stable promotion.
+
+Focused x86_64 tooling compilation, Python/workflow shell checks and the actual
+native TLS/Recipe/Ginux/ext4/EROFS regression passed. The native check covers
+atomic profile replacement after revocation, release-floor poisoning refusal,
+profile-set transport binding, truncated/cancelled acquisition and scratch
+reclamation, verified-part reuse, preserving offline apply/finalization and
+revoked-cache refusal. HTTP 429 checks exercise a bounded numeric retry and
+deferral for an HTTP-date rather than retrying early. These are local/native
+observations; no full builds, VM runs or public-service rollout ran.
 
 ## Deployment and recovery rules
 

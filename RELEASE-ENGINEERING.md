@@ -438,6 +438,16 @@ development defaults remain without a production origin or trust root. No
 public production service, installed boot trial or production readiness is
 claimed by native fixtures.
 
+The publisher accepts one explicit release or an atomic base/desktop publication
+set, including correction after a release signer is revoked. Old release floors
+come from manifests authenticated under their original authority; replacements
+and every retained profile require current release-role authorization. Refresh
+cannot bypass revocation or select replacements. Workflow public verification
+binds the complete selected set, and stable promotion checks actual installed
+evidence for each member before updating its index once. Acquisition scratch uses
+shared storage and leased request cleanup so failed/cancelled Recipe work does
+not become a permanent second payload cache.
+
 Focused native validation for this reader passed A→B with systemd and B→A
 with OpenRC, using real Recipe/Ginux workers, disposable ext4/EROFS systems,
 separate HTTPS metadata/asset/redirect origins and a private fixture CA. It

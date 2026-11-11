@@ -2,7 +2,7 @@
 All HTTP(S), TLS, signing, producer execution, cache assembly and merges are real.
 Only firmware/boot identities are fixture observations; no VM or public service.
 """
-import copy,hashlib,http.server,json,os,shutil,socket,ssl,subprocess,threading,time
+import copy,email.utils,hashlib,http.server,json,os,shutil,signal,socket,ssl,subprocess,threading,time
 from pathlib import Path
 
 def raw(value):return json.dumps(value,separators=(',',':')).encode()
@@ -28,12 +28,19 @@ def configure(o,h):
     o.run('openssl','req','-new','-newkey','rsa:2048','-nodes','-subj','/CN=127.0.0.1','-keyout',str(server_key),'-out',str(csr))
     ext.write_text('subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
     o.run('openssl','x509','-req','-in',str(csr),'-CA',str(ca),'-CAkey',str(ca_key),'-CAcreateserial','-days','1','-extfile',str(ext),'-out',str(cert))
-    o.certificate=ca;o.fail=None;o.bad_redirect=False;o.requests=[];o.servers=[]
+    o.certificate=ca;o.fail=None;o.pause=None;o.throttle=None;o.bad_redirect=False;o.requests=[];o.servers=[]
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self,*args,**kw):super().__init__(*args,directory=str(o.publish),**kw)
         def log_message(self,*args):pass
         def do_GET(self):
             o.requests.append((self.server.kind,self.path))
+            if self.server.kind=='cdn' and o.throttle and self.path==o.throttle['path']:
+                throttle=o.throttle;o.throttle=None
+                self.send_response(429);self.send_header('Retry-After',throttle['after']);self.send_header('Content-Length','0');self.end_headers();return
+            if self.server.kind=='cdn' and o.pause and self.path==o.pause['path']:
+                pause=o.pause;o.pause=None;pause['entered'].set()
+                pause['resume'].wait(60)
+                return
             if self.server.kind=='asset':
                 target='http://127.0.0.1:'+str(o.cdn.server_port)+'/forbidden' if o.bad_redirect else o.cdn_origin+self.path
                 self.send_response(302);self.send_header('Location',target);self.send_header('Content-Length','0');self.end_headers();return
@@ -116,13 +123,40 @@ def exercise(o,h,active,bundle):
     o.bad_redirect=True;cli(active,'update','download',code=21,contains='Recipe acquisition failed');o.bad_redirect=False
     check(not any(path=='/forbidden' for _,path in o.requests),'a forbidden HTTPS downgrade was followed');protected(before)
     root_parts=parts[manifest['artifacts']['rootfs']['path']];first='/objects/'+root_parts[0]['sha256']+'.part';second='/objects/'+root_parts[1]['sha256']+'.part'
+    requests=lambda path:sum(kind=='cdn' and seen==path for kind,seen in o.requests)
+    count=requests(first);o.throttle={'path':first,'after':email.utils.formatdate(time.time()+60,usegmt=True)}
+    cli(active,'update','download',code=21,contains='non-numeric Retry-After');protected(before)
+    check(requests(first)==count+1,'Retry-After date was ignored and the origin was retried early')
+    count=requests(first);o.throttle={'path':first,'after':'1'}
     o.fail=second;cli(active,'update','download',code=21,contains='Recipe acquisition failed');protected(before)
+    check(requests(first)==count+2,'bounded numeric Retry-After did not retry the real HTTPS origin')
     partials=[p for p in (h['state']/'updates/assembly'/release).iterdir() if p.suffix!='.json']
     partial=max(partials,key=lambda p:p.stat().st_size)
     with partial.open('r+b') as f:b=f.read(1);f.seek(0);f.write(bytes([b[0]^1]));f.flush();os.fsync(f.fileno())
     o.fail=second;cli(active,'update','download',code=21,contains='Recipe acquisition failed')
+    check(not list((h['state']/'updates/recipe').iterdir()),'failed acquisition retained an unverified request tree')
     first_requests=sum(kind=='asset' and path==first for kind,path in o.requests)
-    downloaded=cli(active,'update','download');protected(before)
+    # Kill a real in-progress acquisition after an already durable first part.
+    # Recipe's inherited request lease must die with the process group, and the
+    # next command reclaims only the abandoned request (not verified assembly).
+    pause={'path':second,'entered':threading.Event(),'resume':threading.Event()};o.pause=pause
+    with (o.base/'cancelled-download.log').open('w+b') as log:
+        process=subprocess.Popen([h['BIN'],'--json','update','download'],env=active,stdout=log,stderr=log,start_new_session=True)
+        try:
+            check(pause['entered'].wait(60),'real download did not reach its cancellation boundary')
+            os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=10)
+        finally:
+            pause['resume'].set();o.pause=None
+            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=10)
+    check(list((h['state']/'updates/recipe').glob('request-*')),'cancelled request did not exercise stale scratch recovery')
+    cli(active,'update','check')
+    check(not list((h['state']/'updates/recipe').iterdir()),'retry did not reclaim abandoned acquisition scratch')
+    # Host TMPDIR still supplies small verifier mountpoints. The actual Recipe
+    # payload/runtime scratch must instead use recab's shared-state pool.
+    host_tmp=o.base/'host-tmp';host_tmp.mkdir()
+    downloaded=cli(dict(active,TMPDIR=str(host_tmp)),'update','download');protected(before)
+    check(not list(host_tmp.glob('recipe-scratch-*')) and list((h['state']/'updates/recipe-tmp').glob('recipe-scratch-*')),
+          'Recipe acquisition ignored shared-state scratch selection')
     check(downloaded['download']['downloaded'] and downloaded['download']['verified_files']==4,'production assembly did not publish complete release')
     check(downloaded['download']['reused_parts']>=1 and not downloaded['download']['accounting_complete'],'resume omitted verified-part reuse or invented accounting')
     check(sum(kind=='asset' and path==first for kind,path in o.requests)==first_requests,'valid first part was fetched again')
@@ -165,6 +199,8 @@ def exercise(o,h,active,bundle):
     finally:o.server.shutdown();o.server.server_close()
     return {'result':'PASS','running':running,'prepared':inactive,'production_enabled':False,'full_build':False,'vm_boot':False,
         'checks':['real Recipe/Ginux HTTPS with explicit test CA','root/index/release role separation','signed transport prefix checks','TLS redirect confinement before request',
-            'shared-state preflight','whole-artifact substitution refusal','real truncated-part retry','tampered partial rehash','valid-part reuse','whole-release verification and assembly accounting',
+            'shared-state preflight and disk-backed acquisition scratch','whole-artifact substitution refusal','real truncated-part retry','tampered partial rehash','valid-part reuse','whole-release verification and assembly accounting',
+            'real acquisition group cancellation and abandoned-request reclamation',
+            'bounded HTTP 429 delta-seconds retry and HTTP-date deferral without early retry',
             'expired index refusal and offline verified cache','prepared X and active/boot preservation','offline preserving apply/reproduction/finalization','known revocation blocks cached reuse'],
         'publishing_checks':publishing_checks,'download':downloaded['download'],'scope':'native actual storage/producers; no public production service or VM boot'}

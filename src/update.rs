@@ -10,7 +10,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom},
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::{
+            fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+            process::CommandExt,
+        },
+    },
     path::{Path, PathBuf},
     process::Command,
 };
@@ -300,14 +306,41 @@ fn checked_pin(
 }
 struct Acquired {
     file: fs::File,
-    scope: PathBuf,
+    _scope: tempfile::TempDir,
+    _lease: fs::File,
     write_bytes: u64,
     cancelled: u64,
 }
-impl Drop for Acquired {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.scope);
+fn recipe_scopes(target: &Target) -> Result<PathBuf> {
+    let scopes = directory(target).join("recipe");
+    root_dir(&scopes)?;
+    // All callers hold recab's run lock. A killed recab may leave Recipe alive
+    // briefly; its inherited lease protects that request until it has exited.
+    for entry in fs::read_dir(&scopes)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("request-")
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let path = entry.path();
+        let lease = path.join("lease");
+        if lease.try_exists()? {
+            let file = levitate_recipe::fsx::open_regular(&lease)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(error).context("cannot inspect Recipe request lease");
+            }
+            fs::remove_dir_all(&path)?;
+        } else {
+            // Interrupted before the lease was created: no child was started.
+            fs::remove_dir_all(&path)?;
+        }
     }
+    Ok(scopes)
 }
 fn acquire(
     target: &Target,
@@ -327,10 +360,23 @@ fn acquire(
         ensure!(url::Url::parse(uri)?.origin() == origin.origin(), "acquisition leaves configured origin");
         (vec![origin.origin().ascii_serialization()], None)
     };
-    let scope = directory(target)
-        .join("recipe")
-        .join(crate::prepare::new_id()?);
-    root_dir(&scope)?;
+    let scopes = recipe_scopes(target)?;
+    let scope_guard = tempfile::Builder::new().prefix("request-").tempdir_in(scopes)?;
+    let scope = scope_guard.path();
+    let lease = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(scope.join("lease"))?;
+    ensure!(
+        unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX) } == 0,
+        "cannot lock Recipe request"
+    );
+    // Recipe's leased scratch pool recovers abandoned workers on the next
+    // invocation. Keep this pool on shared storage: /tmp is RAM on installed
+    // systems and cannot be required to hold desktop release parts/runtimes.
+    let scratch = directory(target).join("recipe-tmp");
+    root_dir(&scratch)?;
     let request = scope.join("request.json");
     let mut input = serde_json::json!({"url":uri,"sha256":sha,"size":size});
     if let Some(prefixes) = prefixes { input["prefixes"] = serde_json::to_value(prefixes)?; }
@@ -347,7 +393,19 @@ fn acquire(
         }
     );
     let mut command = Command::new(std::env::var_os("RECAB_RECIPE_BIN").unwrap_or_else(|| "recipe".into()));
+    let lease_fd = lease.as_raw_fd();
+    // Only the Recipe child inherits this descriptor. Holding its request lease
+    // does not grant access to the running or prepared system.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(lease_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command
+            .env("TMPDIR", &scratch)
             .current_dir(&scope)
             .arg("install")
             .arg(recipe)
@@ -373,8 +431,7 @@ fn acquire(
     let status = command.status().context("starting Recipe update acquisition")?;
     ensure!(
         status.success(),
-        "Recipe acquisition failed; completed objects are retained for retry; diagnostics: {}",
-        scope.display()
+        "Recipe acquisition failed; verified transfer parts are retained for retry; see Recipe diagnostics above"
     );
     let result: serde_json::Value = load(&output, 2 * 1024 * 1024)?;
     let path = Path::new(
@@ -393,7 +450,8 @@ fn acquire(
         cancelled: result["producer_io"]["cancelled_write_bytes"]
             .as_u64()
             .unwrap_or(0),
-        scope,
+        _scope: scope_guard,
+        _lease: lease,
     })
 }
 fn metadata(
@@ -624,6 +682,7 @@ pub fn download(requested: Option<&str>) -> Result<UpdateStatus> {
         .or_else(|| state.view.available.as_ref().map(|a| a.id.clone()))
         .context("no checked release selected; run recab update check")?;
     let (pin, manifest) = checked_pin(&sys.target, &id, &source, &identity, &policy)?;
+    recipe_scopes(&sys.target)?;
     let transfer = directory(&sys.target).join("transfers").join(&id);
     let previously_interrupted = state
         .view
