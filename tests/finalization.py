@@ -210,7 +210,7 @@ try:
         install_elf(root,Path('/usr/bin/true'),'usr/lib/systemd/systemd' if args.init=='systemd' else 'sbin/openrc-init')
         (root/'sbin/init').symlink_to('../usr/lib/systemd/systemd' if args.init=='systemd' else 'openrc-init')
         install_elf(root,Path('/usr/bin/true'),'usr/bin/sh');install_elf(root,stripped,'usr/bin/recab')
-        (root/'etc/os-release').write_text(f'ID=lev\nNAME=LevitateOS\nREC_INIT={args.init}\nREC_LIBC=glibc\nREC_FLAVOUR=base\nREC_PACKAGES=rpm\nREC_PRIVILEGE=sudo\nREC_DESKTOP=plasma\nREC_KERNEL_LINE=latest\n')
+        (root/'etc/os-release').write_text(f'ID=lev\nNAME=LevitateOS\nREC_INIT={args.init}\nREC_LIBC=glibc\nREC_FLAVOUR=base\nREC_PACKAGES=rpm\nREC_PRIVILEGE=sudo\nREC_DESKTOP=plasma\nREC_KERNEL_LINE=latest\nREC_APPEARANCE=light\n')
         if args.release_builder:
             (root/'etc/os-release').write_text((root/'etc/os-release').read_text().replace('ID=lev\n','ID=levitateos\n')+'VERSION_ID=1.0\n')
             (root/'usr/lib/recab/update-source.json').write_text(json.dumps({'channel':'development','sequence':1,'source':None,'trust':None}))
