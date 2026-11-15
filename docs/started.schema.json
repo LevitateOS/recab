@@ -102,12 +102,17 @@
     "made_default": {
       "description": "The booted root became the boot default.",
       "type": "boolean"
+    },
+    "restarting": {
+      "description": "Startup did not finish on a root that is not the boot default, so\nthe machine is restarting into the default.",
+      "type": "boolean"
     }
   },
   "required": [
     "booted",
     "health",
-    "made_default"
+    "made_default",
+    "restarting"
   ],
   "title": "Started",
   "type": "object"

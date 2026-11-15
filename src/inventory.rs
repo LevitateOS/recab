@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -62,8 +62,9 @@ pub(crate) struct Inventory {
 impl Inventory {
     /// Everything `path` holds, its own files (fstab, slot marker) with
     /// their root-specific parts left out of the comparable digest.
-    pub fn capture(path: &Path) -> Result<Self> {
-        crate::filesystem::check_system_mounts(path)?;
+    /// Paths in `boundaries` (mount points, see
+    /// [`crate::filesystem::boundaries`]) are left out with all below them.
+    pub fn capture(path: &Path, boundaries: &BTreeSet<Vec<u8>>) -> Result<Self> {
         let root = Root::open(path)?;
         let entry = root.root_entry()?;
         let metadata = entry.metadata()?.context("system root disappeared")?;
@@ -88,6 +89,7 @@ impl Inventory {
             &root,
             Path::new(""),
             root.device()?,
+            boundaries,
             &mut links,
             &mut entries,
         )?;
@@ -120,11 +122,15 @@ fn scan(
     root: &Root,
     relative: &Path,
     device: u64,
+    boundaries: &BTreeSet<Vec<u8>>,
     links: &mut BTreeMap<(u64, u64), Vec<u8>>,
     entries: &mut Vec<Node>,
 ) -> Result<()> {
     for name in root.names(relative)? {
         let path = relative.join(&name);
+        if boundaries.contains(path.as_os_str().as_bytes()) {
+            continue;
+        }
         let metadata = root
             .metadata(&path)?
             .ok_or_else(|| refuse("system changed during inventory"))?;
@@ -213,7 +219,7 @@ fn scan(
         }
         entries.push(node);
         if directory {
-            scan(root, &path, device, links, entries)?;
+            scan(root, &path, device, boundaries, links, entries)?;
         }
         let after = root
             .metadata(&path)?

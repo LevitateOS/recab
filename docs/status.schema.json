@@ -43,6 +43,10 @@
       "$ref": "#/$defs/Slot",
       "description": "The other root: unlocked (read-write); changes go there."
     },
+    "other_bootable": {
+      "description": "The other root has a boot entry whose files are on the ESP, so it\ncan be started. `false` after a copy that did not finish.",
+      "type": "boolean"
+    },
     "other_mount": {
       "description": "Where the other root is mounted; `None` when it is not mounted.",
       "type": [
@@ -59,7 +63,8 @@
   "required": [
     "schema_version",
     "booted",
-    "other"
+    "other",
+    "other_bootable"
   ],
   "title": "Status",
   "type": "object"

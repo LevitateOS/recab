@@ -171,6 +171,16 @@ pub(crate) fn run(target: Target, request: &InitRequest, a: &Path, b: &Path) -> 
     let initrd = request.initrd.as_deref().ok_or_else(|| {
         refuse("an A/B installation boots through its installed initramfs (--initrd)")
     })?;
+    // Only recinit's installed init with this boot protocol locks the booted
+    // root and reads the three-field slot marker; any other initramfs would
+    // boot the roots unlocked or fail on the marker.
+    recinit::installed::check_immutable_initramfs(initrd).map_err(|err| {
+        refuse(format!(
+            "'{}' is not recinit's installed initramfs with boot protocol {}: {err}; build it with the matching recinit",
+            initrd.display(),
+            recinit::installed::IMMUTABLE_INIT_MARKER.trim_start_matches("# ")
+        ))
+    })?;
     let device_b = fs::canonicalize(b)?;
     if !fs::metadata(&device_b)?.file_type().is_block_device() {
         return Err(refuse(format!("'{}' is not a block device", b.display())));
@@ -212,15 +222,18 @@ pub(crate) fn run(target: Target, request: &InitRequest, a: &Path, b: &Path) -> 
             Mounted::new(&device_b, &point, "rw,nosuid,nodev")?
         }
     };
-    let desired = Inventory::capture(&target.root)?;
-    let sync = Synchronization::check(
+    let boundaries = crate::filesystem::boundaries(&[&target.root, &destination.point])?;
+    let desired = Inventory::capture(&target.root, &boundaries)?;
+    let prepared = Synchronization::prepare(
         &target.root,
         desired,
-        &destination.point,
+        boundaries.clone(),
         Slot::B,
         &roots[1],
         &roots[0],
     )?;
+    let observed = Synchronization::observe(&destination.point, &boundaries)?;
+    let sync = Synchronization::plan(&prepared, observed)?;
     sync.apply()?;
     sync.verify(&destination.point)?;
     drop(sync);

@@ -25,7 +25,12 @@ To change the system: write into `/run/recab/other` (Recipe does this), then
 the boot default and the root you came from is now the unlocked one. If it
 does not, the machine starts the previous root again. To start over from the
 running system, run `recab copy`: it overwrites the other root, and creates
-its filesystem anew when the old one cannot be mounted or copied into.
+its filesystem anew when the old one cannot be mounted or read. While a copy
+runs, the other root has no boot entry; if the copy stops, `recab status`
+says the other root cannot be started and `recab copy` finishes it. Mount
+points inside a root are left alone. If the other root ends in the emergency
+state or does not finish starting within 30 minutes, `recab started` restarts
+the machine into the boot default.
 
 `recab compare` shows how the two roots differ. `recab health` shows how
 startup ended.

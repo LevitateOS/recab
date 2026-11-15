@@ -356,21 +356,25 @@ pub fn compare(events: bool) -> Result<Comparison> {
         ]}),
     );
 
-    step(events, "running", "running");
-    let running_inventory = Inventory::capture(&running.target.root)?;
-    step(events, "running", "done");
-
-    step(events, "other", "running");
-    let other_inventory = match running.other_mount()? {
-        Some(point) => Inventory::capture(&point)?,
+    // The other root where it is mounted, else mounted read-only for this run.
+    let (point, _mounted) = match running.other_mount()? {
+        Some(point) => (point, None),
         None => {
             crate::filesystem::private_mounts()?;
             let device = crate::other::device(running.record.uuid(running.other()))?;
             let point = Path::new(OTHER_MOUNT).with_file_name("compare");
             let mounted = Mounted::new(&device, &point, "ro,noload,nosuid,nodev,noexec")?;
-            Inventory::capture(&mounted.point)?
+            (point, Some(mounted))
         }
     };
+    let boundaries = crate::filesystem::boundaries(&[&running.target.root, &point])?;
+
+    step(events, "running", "running");
+    let running_inventory = Inventory::capture(&running.target.root, &boundaries)?;
+    step(events, "running", "done");
+
+    step(events, "other", "running");
+    let other_inventory = Inventory::capture(&point, &boundaries)?;
     step(events, "other", "done");
 
     step(events, "compare", "running");
@@ -390,9 +394,10 @@ pub fn compare_roots(running: &Path, other: &Path) -> Result<Comparison> {
         files: 0,
         bytes: 0,
     };
+    let boundaries = crate::filesystem::boundaries(&[running, other])?;
     Ok(set_beside(
-        &Inventory::capture(running)?,
-        &Inventory::capture(other)?,
+        &Inventory::capture(running, &boundaries)?,
+        &Inventory::capture(other, &boundaries)?,
         side(),
         side(),
     ))

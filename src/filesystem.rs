@@ -444,21 +444,24 @@ pub(crate) fn private_mounts() -> Result<()> {
     Ok(())
 }
 
-/// Also catch bind mounts of the same device: st_dev alone cannot identify them.
-pub(crate) fn check_system_mounts(path: &Path) -> Result<()> {
-    let root = fs::canonicalize(path)?;
-    for mount in target_root::mount_table_at(Path::new("/proc/self/mountinfo"))? {
-        if let Ok(relative) = mount.mount_point.strip_prefix(&root) {
-            if relative.as_os_str().is_empty() {
-                continue;
-            }
-            let first = relative.components().next().unwrap().as_os_str();
-            if !crate::inventory::EXCLUDED.contains(&first.as_bytes()) {
-                bail!("unexpected mount inside system at '{}'", relative.display());
+/// The mount points below each of `roots`, relative to it: boundaries of a
+/// root's contents. A root is its own filesystem only; whatever is mounted
+/// inside it (bind mounts of the same device included, which st_dev alone
+/// cannot tell) is neither read nor copied nor removed.
+pub(crate) fn boundaries(roots: &[&Path]) -> Result<std::collections::BTreeSet<Vec<u8>>> {
+    let table = target_root::mount_table_at(Path::new("/proc/self/mountinfo"))?;
+    let mut found = std::collections::BTreeSet::new();
+    for root in roots {
+        let root = fs::canonicalize(root)?;
+        for mount in &table {
+            if let Ok(relative) = mount.mount_point.strip_prefix(&root) {
+                if !relative.as_os_str().is_empty() {
+                    found.insert(relative.as_os_str().as_bytes().to_vec());
+                }
             }
         }
     }
-    Ok(())
+    Ok(found)
 }
 
 pub(crate) fn flush(root: &Root) -> Result<()> {

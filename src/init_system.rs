@@ -22,7 +22,7 @@ const SYSTEMCTL: &str = "systemctl";
 const RC_STATUS: &str = "rc-status";
 
 /// Seconds `recab started` and `recab health` wait for startup to finish.
-pub const STARTUP_TIMEOUT_SECS: u64 = 900;
+pub const STARTUP_TIMEOUT_SECS: u64 = 1800;
 
 /// How startup ended.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
@@ -282,7 +282,7 @@ fn systemd_startup(systemctl: &str, deadline: Instant) -> Result<Health> {
             String::from_utf8_lossy(&out.stderr).trim()
         ),
     };
-    let failed = systemd_failed_units(systemctl, deadline)?;
+    let failed = listed(systemd_failed_units(systemctl, deadline));
     let startup = if startup == Startup::Running && !failed.is_empty() {
         Startup::Failed
     } else {
@@ -336,7 +336,7 @@ fn openrc_startup(target: &Target, deadline: Instant) -> Result<Health> {
                 if target_root::dir_names(&dir.join("starting"))?.is_empty()
                     && !openrc_running(target)? =>
             {
-                let failed = openrc_failed(target, deadline)?;
+                let failed = listed(openrc_failed(target, deadline));
                 let startup = if failed.is_empty() {
                     Startup::Running
                 } else {
@@ -356,7 +356,7 @@ fn openrc_startup(target: &Target, deadline: Instant) -> Result<Health> {
                 if startup == Startup::Inconclusive {
                     vec![]
                 } else {
-                    openrc_failed(target, deadline)?
+                    listed(openrc_failed(target, deadline))
                 },
             ));
         }
@@ -365,11 +365,20 @@ fn openrc_startup(target: &Target, deadline: Instant) -> Result<Health> {
                 init,
                 Startup::TimedOut,
                 TIMED_OUT.to_string(),
-                openrc_failed(target, deadline)?,
+                listed(openrc_failed(target, deadline)),
             ));
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// The failed services, or none when they cannot be listed: the list only
+/// informs, the startup verdict decides.
+fn listed(result: Result<Vec<String>>) -> Vec<String> {
+    result.unwrap_or_else(|err| {
+        eprintln!("recab: warning: listing the failed services failed: {err:#}");
+        Vec::new()
+    })
 }
 
 /// The service names in `dir` (a runlevel or an OpenRC state directory).
@@ -434,4 +443,19 @@ fn openrc_running(target: &Target) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Ask for a clean restart without waiting for it: systemd's, or the
+/// `reboot` of busybox init or OpenRC.
+pub(crate) fn reboot(init: InitSystem) -> Result<()> {
+    let mut command = match init {
+        InitSystem::Systemd => {
+            let mut command = Command::new(SYSTEMCTL);
+            command.args(["--no-block", "reboot"]);
+            command
+        }
+        InitSystem::Openrc => Command::new("reboot"),
+    };
+    target_root::run(&mut command)?;
+    Ok(())
 }

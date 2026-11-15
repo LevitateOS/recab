@@ -76,12 +76,18 @@ pub(crate) fn unlock(device: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Mount `device` (ext4) read-write at `point`, creating `point`.
-pub(crate) fn mount(device: &Path, point: &Path) -> Result<()> {
+/// Mount `device` (ext4) at `point`, read-write or read-only, creating
+/// `point`.
+pub(crate) fn mount(device: &Path, point: &Path, writable: bool) -> Result<()> {
     fs::create_dir_all(point).with_context(|| format!("creating '{}'", point.display()))?;
+    let options = if writable {
+        "rw,nosuid,nodev"
+    } else {
+        "ro,nosuid,nodev"
+    };
     target_root::run(
         Command::new("mount")
-            .args(["-t", "ext4", "-o", "rw,nosuid,nodev"])
+            .args(["-t", "ext4", "-o", options])
             .arg(device)
             .arg(point),
     )?;

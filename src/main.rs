@@ -228,6 +228,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     started.health.describe(Duration::from_secs(timeout)),
                     if started.made_default {
                         "; it is now the boot default"
+                    } else if started.restarting {
+                        "; restarting into the boot default"
                     } else {
                         ""
                     }
@@ -305,6 +307,7 @@ fn print_status(status: &Status) {
         booted,
         other,
         other_mount,
+        other_bootable,
         boot_default,
         next_boot_once,
     } = status;
@@ -312,6 +315,11 @@ fn print_status(status: &Status) {
     match other_mount {
         Some(point) => println!("Other root (unlocked, read-write): {other}, mounted at {point}"),
         None => println!("Other root (unlocked): {other}, not mounted"),
+    }
+    if !other_bootable {
+        println!(
+            "Root {other} cannot be started: it has no complete boot entry (a copy did not finish; run 'recab copy')"
+        );
     }
     match boot_default {
         Some(slot) => println!("Boot default: {slot}"),

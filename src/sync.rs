@@ -52,8 +52,11 @@ pub(crate) struct Synchronization {
     slot: Slot,
     partuuid: String,
     other: String,
-    temporary: String,
+    boundaries: BTreeSet<Vec<u8>>,
 }
+
+/// The scratch name a detached file is written under before its rename.
+const TEMPORARY: &str = ".recab-copy";
 
 fn path(bytes: &[u8]) -> &Path {
     Path::new(std::ffi::OsStr::from_bytes(bytes))
@@ -205,33 +208,47 @@ fn materialized(
     })
 }
 
+/// The booted root's side of a copy: checked and with the destination's
+/// own files already worked out. Nothing here touches the destination.
+pub(crate) struct Prepared {
+    source: std::path::PathBuf,
+    desired: Inventory,
+    boundaries: BTreeSet<Vec<u8>>,
+    slot: Slot,
+    partuuid: String,
+    other: String,
+}
+
+impl Prepared {
+    /// The mount points left out of the copy.
+    pub fn boundaries(&self) -> &BTreeSet<Vec<u8>> {
+        &self.boundaries
+    }
+}
+
+/// The destination as read: its root and what it holds.
+pub(crate) struct Observed {
+    root: Root,
+    inventory: Inventory,
+}
+
 impl Synchronization {
-    /// Plan the copy of `source` (read as `desired`) into `destination`
-    /// (root `slot`, PARTUUID `uuid`; `other`: the source root's PARTUUID),
-    /// reading the destination and checking the copy fits.
-    pub fn check(
+    /// Check the source (read as `desired`, without `boundaries`) for a copy
+    /// into root `slot` (PARTUUID `uuid`; `other`: the source root's
+    /// PARTUUID) and work out that root's own fstab and slot marker.
+    pub fn prepare(
         source: &Path,
         mut desired: Inventory,
-        destination: &Path,
+        boundaries: BTreeSet<Vec<u8>>,
         slot: Slot,
         uuid: &str,
         other: &str,
-    ) -> Result<Self> {
+    ) -> Result<Prepared> {
         let source_root = Root::open(source)?;
-        let destination_root = Root::open(destination)?;
-        let source_meta = source_root.root_entry()?.metadata()?.unwrap();
-        let destination_meta = destination_root.root_entry()?.metadata()?.unwrap();
-        if (source_meta.dev(), source_meta.ino())
-            == (destination_meta.dev(), destination_meta.ino())
-        {
-            return Err(refuse("source and destination identify the same root"));
-        }
-        let observed = Inventory::capture(destination)?;
-        let temporary = ".recab-copy".to_string();
         for node in &desired.entries {
             if path(&node.path)
                 .components()
-                .any(|c| c.as_os_str() == temporary.as_str())
+                .any(|c| c.as_os_str() == TEMPORARY)
             {
                 return Err(refuse("the source uses recab's scratch name"));
             }
@@ -262,6 +279,41 @@ impl Synchronization {
                     }]
                 });
             }
+        }
+        Ok(Prepared {
+            source: source.to_path_buf(),
+            desired,
+            boundaries,
+            slot,
+            partuuid: uuid.into(),
+            other: other.into(),
+        })
+    }
+
+    /// Read the destination. An error here means the destination itself
+    /// cannot be opened or read.
+    pub fn observe(destination: &Path, boundaries: &BTreeSet<Vec<u8>>) -> Result<Observed> {
+        Ok(Observed {
+            root: Root::open(destination)?,
+            inventory: Inventory::capture(destination, boundaries)?,
+        })
+    }
+
+    /// Plan the copy of `prepared` into the destination as `observed`,
+    /// checking it fits. Changes nothing.
+    pub fn plan(prepared: &Prepared, observed: Observed) -> Result<Self> {
+        let source_root = Root::open(&prepared.source)?;
+        let desired = prepared.desired.clone();
+        let Observed {
+            root: destination_root,
+            inventory: observed,
+        } = observed;
+        let source_meta = source_root.root_entry()?.metadata()?.unwrap();
+        let destination_meta = destination_root.root_entry()?.metadata()?.unwrap();
+        if (source_meta.dev(), source_meta.ino())
+            == (destination_meta.dev(), destination_meta.ino())
+        {
+            return Err(refuse("source and destination identify the same root"));
         }
         let wanted: BTreeMap<_, _> = desired
             .entries
@@ -323,6 +375,40 @@ impl Synchronization {
                 if destination_root.metadata(path(name))?.is_none() {
                     operations.push(Operation::Directory(name.to_vec()));
                 }
+            }
+        }
+        // Mount points below either root are boundaries: the folder is kept,
+        // nothing below it is read, copied or removed.
+        let mut boundaries = prepared
+            .boundaries
+            .iter()
+            .filter(|b| {
+                let first = b.split(|c| *c == b'/').next().unwrap_or_default();
+                !EXCLUDED.contains(&first)
+                    && !prepared
+                        .boundaries
+                        .iter()
+                        .any(|a| a != *b && b.starts_with(a) && b.get(a.len()) == Some(&b'/'))
+            })
+            .collect::<Vec<_>>();
+        boundaries.sort_by_key(|b| depth(b));
+        for name in boundaries {
+            let source_dir = matches!(source_root.metadata(path(name)), Ok(Some(m)) if m.is_dir());
+            let parent_wanted = path(name).parent().is_none_or(|p| {
+                p.as_os_str().is_empty() || wanted.contains_key(p.as_os_str().as_bytes())
+            });
+            if !source_dir || !parent_wanted {
+                continue;
+            }
+            match destination_root.metadata(path(name)) {
+                Ok(Some(m)) if !m.is_dir() => {
+                    return Err(refuse(format!(
+                        "'{}' is a mount point in the booted root, but not a folder in the other root",
+                        path(name).display()
+                    )));
+                }
+                Ok(Some(_)) => {}
+                _ => operations.push(Operation::Directory(name.to_vec())),
             }
         }
         let mut patched = BTreeSet::new();
@@ -400,10 +486,10 @@ impl Synchronization {
             desired,
             observed,
             operations,
-            slot,
-            partuuid: uuid.into(),
-            other: other.into(),
-            temporary,
+            slot: prepared.slot,
+            partuuid: prepared.partuuid.clone(),
+            other: prepared.other.clone(),
+            boundaries: prepared.boundaries.clone(),
         };
         result.capacity()?;
         Ok(result)
@@ -590,7 +676,7 @@ impl Synchronization {
         if !data_differs && !hole_change && !detach {
             return Ok(());
         }
-        let temporary_path = path(&node.path).with_file_name(&self.temporary);
+        let temporary_path = path(&node.path).with_file_name(TEMPORARY);
         let write_target = if detach {
             self.destination.entry(&temporary_path, false)?
         } else {
@@ -799,7 +885,7 @@ impl Synchronization {
     }
 
     pub fn verify(&self, destination: &Path) -> Result<()> {
-        if Inventory::capture(destination)?.digest()? != self.desired.digest()? {
+        if Inventory::capture(destination, &self.boundaries)?.digest()? != self.desired.digest()? {
             return Err(refuse("the copy does not match the booted root"));
         }
         Ok(())

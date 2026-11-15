@@ -17,7 +17,7 @@ use crate::entry::{
     cmdline_root, cmdline_root_text, entry_file, entry_name, layout_name, loader_default,
     loader_with_default, slot_of_entry, Entry, ENTRIES_DIR, INITRD_FILE, KERNEL_FILE, LOADER_CONF,
 };
-use crate::error::{classified, or_class, refuse, ErrorClass};
+use crate::error::{classified, refuse, ErrorClass};
 use crate::target::{partuuid, Kind, Target};
 use crate::Slot;
 
@@ -111,15 +111,57 @@ impl Esp {
             .and_then(|id| slot_of_entry(&self.prefix, id)))
     }
 
-    /// Make `slot` the boot default: the firmware's default variable (when
-    /// this machine's firmware variables can be changed), then loader.conf.
+    /// Make `slot` the boot default: loader.conf first, then the firmware's
+    /// default variable (when this machine's firmware variables can be
+    /// changed). When the variable cannot be written, it is removed so
+    /// loader.conf decides; only when neither works is the default left on
+    /// the variable's old entry, and that is a partial result.
     pub fn set_default(&self, slot: Slot) -> Result<()> {
         let id = self.id(slot);
-        if self.vars.can_change().is_ok() {
-            self.vars.set(Var::Default, Some(&id))?;
+        self.write_loader_default(&id)?;
+        if self.vars.can_change().is_err() {
+            return Ok(());
         }
-        self.write_loader_default(&id)
-            .map_err(|err| or_class(err, ErrorClass::PartialUpdate))
+        let Err(write) = self.vars.set(Var::Default, Some(&id)) else {
+            return Ok(());
+        };
+        match self.vars.set(Var::Default, None) {
+            Ok(()) => {
+                eprintln!(
+                    "recab: warning: the firmware refused LoaderEntryDefault ({write:#}); it was removed, so loader.conf's default '{id}' decides"
+                );
+                Ok(())
+            }
+            Err(remove) => Err(classified(
+                ErrorClass::PartialUpdate,
+                format!(
+                    "loader.conf now defaults to '{id}', but the firmware's LoaderEntryDefault could neither be set ({write:#}) nor removed ({remove:#}), and it still decides the default"
+                ),
+            )),
+        }
+    }
+
+    /// Remove `slot`'s boot entry, so the root cannot be started until it is
+    /// written again.
+    pub fn remove_entry(&self, slot: Slot) -> Result<()> {
+        let path = self.entry_path(Some(slot));
+        match fs::remove_file(&path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                return Err(
+                    anyhow::Error::from(err).context(format!("removing '{}'", path.display()))
+                );
+            }
+            _ => {}
+        }
+        if let Some(dir) = path.parent() {
+            target_root::sync_dir(dir)?;
+        }
+        Ok(())
+    }
+
+    /// `slot`'s entry exists and every file it loads is on the ESP.
+    pub fn bootable(&self, slot: Slot) -> Result<bool> {
+        Ok(self.missing_boot_file(slot)?.is_none())
     }
 
     /// Pick `slot` for the next boot only, or clear the pick (`None`).
