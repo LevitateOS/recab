@@ -55,7 +55,7 @@ pub use sync::SyncReport;
 
 /// Root identifier (A/B). Its one spelling (`A`, `B`) is used by the CLI
 /// and the JSON.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Slot {
     A,
@@ -96,7 +96,7 @@ impl std::str::FromStr for Slot {
 
 /// One `--machine-events` line on stderr: a command started, finished or
 /// failed.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {
     pub schema_version: u32,

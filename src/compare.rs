@@ -22,7 +22,7 @@ const FOLDER_DEPTH: usize = 3;
 /// Each root names its own partition in these; they differ by design.
 const OWN: &[&[u8]] = crate::immutable::SLOT_FILES;
 
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ComparedSystem {
     /// Absent when two trees were compared and not this computer's slots.
@@ -34,14 +34,14 @@ pub struct ComparedSystem {
     pub bytes: u64,
 }
 
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Same {
     pub files: u64,
     pub bytes: u64,
 }
 
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct FolderSize {
     pub path: String,
@@ -49,7 +49,7 @@ pub struct FolderSize {
     pub other_bytes: u64,
 }
 
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DifferenceKind {
@@ -63,7 +63,7 @@ pub enum DifferenceKind {
     Metadata,
 }
 
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Difference {
     pub path: String,
@@ -74,7 +74,7 @@ pub struct Difference {
     pub detail: Option<String>,
 }
 
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Comparison {
     pub schema_version: u32,

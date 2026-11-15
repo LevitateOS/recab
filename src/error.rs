@@ -16,7 +16,7 @@ pub(crate) const ERROR_SCHEMA_VERSION: u32 = 1;
 /// Each class once: its name (in JSON), exit status and text tag.
 macro_rules! classes {
     ($($(#[$doc:meta])* $class:ident => $name:literal, $code:literal, $tag:literal;)+) => {
-        #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+        #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
         pub enum ErrorClass {
             $($(#[$doc])* #[serde(rename = $name)] $class,)+
@@ -117,7 +117,7 @@ pub fn error_text(err: &anyhow::Error) -> String {
 }
 
 /// A failed command's error, as `--json` prints it on stderr.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorPayload {
     pub schema_version: u32,

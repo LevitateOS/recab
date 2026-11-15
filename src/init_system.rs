@@ -25,7 +25,7 @@ const RC_STATUS: &str = "rc-status";
 pub const STARTUP_TIMEOUT_SECS: u64 = 1800;
 
 /// How startup ended.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Startup {
@@ -42,7 +42,7 @@ pub enum Startup {
 }
 
 /// How startup of the running system ended (`recab health --json`).
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
     /// The schema of this record.

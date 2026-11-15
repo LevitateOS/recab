@@ -263,7 +263,7 @@ pub(crate) fn run(target: Target, request: &InitRequest, a: &Path, b: &Path) -> 
 }
 
 /// What `verify-installation` found: both roots and their boot entries.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifiedInstallation {
     pub schema_version: u32,

@@ -64,7 +64,7 @@ impl Running {
 }
 
 /// `recab status --json`.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Status {
     pub schema_version: u32,
@@ -100,7 +100,7 @@ pub fn status() -> Result<Status> {
 }
 
 /// What `recab copy` did.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Copied {
     pub from: Slot,
@@ -265,7 +265,7 @@ pub fn boot_other(cancel: bool) -> Result<Slot> {
 }
 
 /// What `recab started` found and did.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Started {
     pub booted: Slot,

@@ -284,10 +284,18 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 options,
             })?
         }
-        Command::VerifyInstallation { root } => println!(
-            "{}",
-            serde_json::to_string(&recab::verify_installation(&root)?)?
-        ),
+        Command::VerifyInstallation { root } => {
+            let verified = recab::verify_installation(&root)?;
+            if json {
+                println!("{}", serde_json::to_string(&verified)?);
+            } else {
+                println!(
+                    "verify-installation: PASSED. Boot files and entries for root A and root B are \
+                     on the EFI partition and A is the default. The installation is complete; \
+                     unmount and reboot."
+                );
+            }
+        }
         Command::InstallUnit { root, init, bin } => recab::install_unit(&root, init, &bin)?,
     }
     Ok(())

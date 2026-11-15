@@ -21,7 +21,7 @@ use crate::Slot;
 const RANGE: u64 = 1024 * 1024;
 
 /// What a copy wrote: logical writes, not SSD/controller write amplification.
-#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct SyncReport {
     pub payload_bytes_written: u64,
