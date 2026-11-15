@@ -76,7 +76,7 @@ JSON error on stderr; exit codes are stable per error class (13 permission,
 ## 3. Layout
 
 - Each root has its own `etc/fstab` (its root read-only, the shared `/var`)
-  and its slot marker `usr/lib/recab/immutable`:
+  and its root marker `usr/lib/recab/immutable` (three fields):
   `<A|B> PARTUUID=<var> PARTUUID=<other root>`. `copy` writes them right for
   the root it copies into.
 - The ESP holds systemd-boot, `loader/loader.conf` and one entry and kernel

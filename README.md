@@ -47,7 +47,7 @@ recab --json verify-installation --root /mnt
 
 with root A mounted at `/mnt`, its ESP at `/mnt/boot` and the shared `/var`
 partition at `/mnt/var`. `init` sets root A up for the locked boot (fstab,
-slot marker, runtime policy), copies it to root B, writes systemd-boot, both
+root marker, runtime policy), copies it to root B, writes systemd-boot, both
 entries and their kernels, and makes A the default.
 
 `recab install-unit --root <tree> --init systemd|openrc` writes the
@@ -59,7 +59,7 @@ it on the target, before `init`. It runs `recab started` once per boot.
 | | |
 |---|---|
 | `/var/lib/recab/installation.json` | the partitions of root A and root B; recab's only file |
-| `/usr/lib/recab/immutable` (each root) | slot marker: `<A\|B> PARTUUID=<var> PARTUUID=<other root>` |
+| `/usr/lib/recab/immutable` (each root) | root marker, three fields: `<A\|B> PARTUUID=<var> PARTUUID=<other root>` |
 | ESP `loader/entries/<id>-a.conf`, `<id>-b.conf` | one entry per root, the same apart from the root |
 | ESP `<id>-a/`, `<id>-b/` | each root's kernel and initramfs |
 | EFI `LoaderEntryDefault`, loader.conf `default` | the boot default |
@@ -70,6 +70,8 @@ it on the target, before `init`. It runs `recab started` once per boot.
 | File | |
 |---|---|
 | `src/main.rs` | the CLI |
+| `src/contract.rs`, `src/error.rs` | the JSON Schemas of `--json` output (`cargo xtask gen`), the error classes |
+| `src/filesystem.rs`, `src/target.rs` | file access confined to one root, the system a run looks at |
 | `src/ab.rs` | `status`, `copy`, `boot-other`, `started` |
 | `src/installation.rs`, `src/init.rs` | the installation record, `init`, `verify-installation` |
 | `src/boot.rs`, `src/entry.rs`, `src/efivars.rs` | the ESP, entries, loader.conf and the boot loader variables |
