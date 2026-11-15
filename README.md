@@ -51,8 +51,8 @@ slot marker, runtime policy), copies it to root B, writes systemd-boot, both
 entries and their kernels, and makes A the default.
 
 `recab install-unit --root <tree> --init systemd|openrc` writes the
-`recab-started` service, enabled, into recab's package tree. It runs
-`recab started` once per boot.
+`recab-started` service, enabled, into a system; recsetup's A/B boot step runs
+it on the target, before `init`. It runs `recab started` once per boot.
 
 ## What is where
 
