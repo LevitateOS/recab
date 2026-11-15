@@ -6,6 +6,8 @@
 //!   read-write at [`OTHER_MOUNT`]. Changes are made there.
 //! - Which is which follows only from which root booted.
 //! - `copy` makes the other root a copy of the booted root.
+//! - `update` installs a release into the other root and picks it for the
+//!   next boot.
 //! - The boot loader's default is the root that last finished starting;
 //!   starting the other root is a one-time pick (`boot-other`), and
 //!   `started` makes a root the default once it finished starting.
@@ -32,6 +34,7 @@ mod package;
 mod runtime;
 mod sync;
 mod target;
+mod update;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -52,6 +55,7 @@ pub use installation::{installation_file, verify as verify_installation, Verifie
 pub use other::OTHER_MOUNT;
 pub use package::{started_service_link, RECAB_BIN};
 pub use sync::SyncReport;
+pub use update::{update, Reporter, Updated};
 
 /// Root identifier (A/B). Its one spelling (`A`, `B`) is used by the CLI
 /// and the JSON.

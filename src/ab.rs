@@ -129,6 +129,11 @@ pub fn copy(quiet: bool) -> Result<Copied> {
     require_root("copy")?;
     let running = Running::read()?;
     let _lock = running.target.lock()?;
+    copy_locked(&running, quiet)
+}
+
+/// [`copy`], with the recab lock already held by the caller.
+pub(crate) fn copy_locked(running: &Running, quiet: bool) -> Result<Copied> {
     let (from, to) = (running.booted, running.other());
     let to_uuid = running.record.uuid(to).to_string();
     let from_uuid = running.record.uuid(from).to_string();
@@ -250,6 +255,13 @@ pub fn boot_other(cancel: bool) -> Result<Slot> {
         running.esp.set_one_time_pick(None)?;
         return Ok(other);
     }
+    pick_other(&running)
+}
+
+/// Pick the other root for the next boot only, with the recab lock already
+/// held by the caller. Refuses when its entry or a file it loads is missing.
+pub(crate) fn pick_other(running: &Running) -> Result<Slot> {
+    let other = running.other();
     if running.esp.entry(Some(other))?.is_none() {
         return Err(refuse(format!(
             "root {other} has no boot entry because a copy into it did not finish; run 'recab copy' to finish it"

@@ -18,6 +18,7 @@ recab status          # which root is booted, the other one, what boots next
 recab copy            # make the other root a copy of the booted root
 recab boot-other      # start the other root at the next boot, once
 recab boot-other --cancel
+recab update          # install the newest release into the other root, start it once
 ```
 
 To change the system: write into `/run/recab/other` (Recipe does this), then
@@ -34,6 +35,35 @@ the machine into the boot default.
 
 `recab compare` shows how the two roots differ. `recab health` shows how
 startup ended.
+
+## Updates
+
+`recab update [--json]` (root, A/B only) runs five steps, and nothing in them
+touches the booted root, its boot entry or the boot default:
+
+1. `recupdate fetch --json` downloads and verifies the release into
+   `/var/cache/recupdate/<serial>/`; recab checks `boot.tar.zst` against that
+   `release.json` (SHA-256) and unpacks it. The archive holds exactly two
+   regular files at its top level, `vmlinuz` and `initramfs.img`, the same
+   files `init` takes from the install medium.
+2. `recab copy`. The other root's boot entry is then removed again.
+3. `recipe --system apply-release <folder>` writes the release into the other
+   root.
+4. The other root's kernel, initramfs and entry are written, with the kernel
+   options the booted root's entry has.
+5. `recab boot-other`. If the other root finishes starting it becomes the
+   default; if not, the machine starts the previous root again.
+
+A failure in steps 2–4 leaves the other root without a boot entry
+(`other_bootable` false), so it cannot be started; the next `recab update` or
+`recab copy` overwrites it. With `--json`, stdout carries the JSON lines of
+`docs/release-engineering.md` §10 (`step`, the programs' `progress`, `done`,
+`failed`). `RECAB_RECUPDATE_BIN` and `RECAB_RECIPE_BIN` name other programs
+than `recupdate` and `recipe` on `PATH`; `RECUPDATE_CACHE_DIR` moves the
+release folder as it does for recupdate. The whole run holds the recab lock.
+
+Not done: `recab update` has never been run, against stand-ins or a real
+release.
 
 ## Installing
 
@@ -73,6 +103,7 @@ it on the target, before `init`. It runs `recab started` once per boot.
 | `src/contract.rs`, `src/error.rs` | the JSON Schemas of `--json` output (`cargo xtask gen`), the error classes |
 | `src/filesystem.rs`, `src/target.rs` | file access confined to one root, the system a run looks at |
 | `src/ab.rs` | `status`, `copy`, `boot-other`, `started` |
+| `src/update.rs` | `update` |
 | `src/installation.rs`, `src/init.rs` | the installation record, `init`, `verify-installation` |
 | `src/boot.rs`, `src/entry.rs`, `src/efivars.rs` | the ESP, entries, loader.conf and the boot loader variables |
 | `src/other.rs` | finding, unlocking, mounting and recreating the other root |

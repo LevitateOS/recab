@@ -256,6 +256,34 @@ impl Esp {
         )
     }
 
+    /// Give `to` a new kernel and initramfs (an update's), booted with the
+    /// kernel options `from` boots with and `to`'s own root. `from`'s entry
+    /// and files are not touched; refuses when `from`'s entry loads a file
+    /// from `to`'s directory.
+    pub fn install_boot_files(
+        &self,
+        from: Slot,
+        to: Slot,
+        to_uuid: &str,
+        kernel: &Path,
+        initrd: &Path,
+    ) -> Result<()> {
+        let entry = self
+            .entry(Some(from))?
+            .ok_or_else(|| refuse(format!("root {from} has no boot entry")))?;
+        let dir = format!("{}/", layout_name(&self.prefix, Some(to)));
+        if let Some(shared) = entry
+            .boot_files()
+            .into_iter()
+            .find(|file| file.to_ascii_lowercase().starts_with(&dir))
+        {
+            return Err(refuse(format!(
+                "root {from}'s entry loads '{shared}' from root {to}'s directory on the ESP, so root {to}'s boot files cannot be replaced without changing root {from}'s"
+            )));
+        }
+        self.write_slot(Some(to), to_uuid, kernel, Some(initrd), &entry.options())
+    }
+
     /// Copy the target's own systemd-boot onto its ESP, under its own name
     /// (`EFI/systemd/`) and as the firmware's default loader (`EFI/BOOT/`).
     pub fn install_loader(&self) -> Result<()> {

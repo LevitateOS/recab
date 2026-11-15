@@ -19,6 +19,7 @@ root and the roles swap. The boot default is the root that last finished\n\
 starting, so a root that does not finish starting is not booted again by default.\n\n\
 Common tasks:\n  recab status        Which root is booted, which is the other, what boots next\n  \
 recab copy          Make the other root a copy of the booted root\n  \
+recab update        Install the newest release into the other root and start it once\n  \
 recab boot-other    Start the other root at the next boot, once"
 )]
 struct Cli {
@@ -41,6 +42,11 @@ enum Command {
     /// Make the other root a copy of the booted root, boot files included.
     /// Creates its filesystem anew when it cannot be mounted or copied into.
     Copy,
+
+    /// Install the newest release into the other root and start it at the
+    /// next boot, once: recupdate fetch, copy, Recipe's apply-release, the
+    /// other root's boot files, boot-other. The booted root is not touched.
+    Update,
 
     /// Start the other root at the next boot, once.
     BootOther {
@@ -134,6 +140,7 @@ fn main() -> ExitCode {
     let operation = match &cli.cmd {
         Command::Status => "status",
         Command::Copy => "copy",
+        Command::Update => "update",
         Command::BootOther { .. } => "boot-other",
         Command::Started { .. } => "started",
         Command::Compare { .. } => "compare",
@@ -165,6 +172,9 @@ fn main() -> ExitCode {
         }
         Err(err) => {
             event("failed", format!("{err:#}"), Some(stable_exit_code(&err)));
+            if operation == "update" {
+                recab::Reporter { json }.failed(&err);
+            }
             if json {
                 eprintln!("{}", recab::ErrorPayload::of(&err).to_json());
             } else {
@@ -203,6 +213,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     r.metadata_updates
                 );
             }
+        }
+        Command::Update => {
+            let report = recab::Reporter { json };
+            let updated = recab::update(report)?;
+            report.done(&updated);
         }
         Command::BootOther { cancel } => {
             let other = recab::boot_other(cancel)?;
