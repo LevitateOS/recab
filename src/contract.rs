@@ -1,34 +1,36 @@
-//! recab's contract for `cargo xtask gen`: the JSON `status`, `health` and a
-//! failed `--json` command print, and the facts front ends need (error
-//! classes and exit codes, the state file, the slots).
+//! recab's contract for `cargo xtask gen`: the JSON its commands print with
+//! `--json`, and the facts front ends need (error classes and exit codes,
+//! the installation record, where the other root is mounted, the roots).
 
 use anyhow::Result;
 use std::collections::BTreeMap;
 use tool_contract::Contract;
 
-use crate::{ErrorClass, ErrorPayload, Finalization, Health, Inventory, Preparation, Slot, Status};
+use crate::{
+    Comparison, Copied, ErrorClass, ErrorPayload, Event, Health, Slot, Started, Status,
+    VerifiedInstallation,
+};
 
 pub fn export() -> Result<Contract> {
     let docs = concat!(env!("CARGO_MANIFEST_DIR"), "/docs");
     let mut c = Contract::new("recab", &["recab"]);
-    c.schema::<crate::VerifiedInstallation>(docs,"installation")?
-        .schema::<crate::operations::Event>(docs,"event")?
-        .schema::<crate::merge::MergeStatus>(docs,"merge")?
-        .schema::<crate::update::UpdateStatus>(docs, "updates")?
-        .schema::<crate::ChangeProgress>(docs, "change")?
-        .schema::<Finalization>(docs, "finalization")?
-        .schema::<Preparation>(docs, "preparation")?
-        .schema::<Inventory>(docs, "inventory")?
-        .schema::<Status>(docs, "status")?
+    c.schema::<Status>(docs, "status")?
+        .schema::<Copied>(docs, "copy")?
+        .schema::<Started>(docs, "started")?
+        .schema::<Comparison>(docs, "comparison")?
         .schema::<Health>(docs, "health")?
+        .schema::<VerifiedInstallation>(docs, "installation")?
+        .schema::<Event>(docs, "event")?
         .schema::<ErrorPayload>(docs, "error")?;
     c.types_from::<Status>()
+        .types_from::<Copied>()
+        .types_from::<Comparison>()
         .types_from::<Health>()
-        .types_from::<crate::operations::Event>()
+        .types_from::<Event>()
         .types_from::<ErrorPayload>();
     c.constant(
         "SLOTS",
-        "The slots, as every recab command and document spells them.",
+        "The roots, as every recab command and document spells them.",
         &Slot::ALL,
     )?;
     c.constant(
@@ -51,19 +53,19 @@ pub fn export() -> Result<Contract> {
         &classes,
     )?;
     c.constant(
-        "STATE_FILE",
-        "Where recab keeps its state on an installed system.",
-        &crate::state_file(),
+        "INSTALLATION_FILE",
+        "Where recab records which partition is root A and which is root B.",
+        &crate::installation_file(),
     )?;
     c.constant(
-        "AUDIT_FILE",
-        "Where recab keeps its audit log (JSON lines) on an installed system.",
-        &crate::target::audit_file(),
+        "OTHER_MOUNT",
+        "Where the other (unlocked) root is mounted read-write on a running A/B system.",
+        &crate::OTHER_MOUNT,
     )?;
     c.constant(
-        "TRIAL_TIMEOUT_SECS",
-        "How long a trial waits for startup to finish.",
-        &crate::TRIAL_TIMEOUT_SECS,
+        "STARTUP_TIMEOUT_SECS",
+        "How long `recab started` and `recab health` wait for startup to finish.",
+        &crate::STARTUP_TIMEOUT_SECS,
     )?;
     Ok(c)
 }

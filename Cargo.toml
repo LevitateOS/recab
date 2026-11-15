@@ -5,13 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Immutable A/B system updates and incremental continuation through Recipe"
+description = "Two root filesystems A and B: the booted root locked, the other unlocked"
 
 [dependencies]
-url = "2"
-distro-contract = { path = "../../distro/contract" }
-tempfile = "3"
-levitate-recipe = { path = "../recipe" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 distro-profile = { path = "../../distro/profile" }

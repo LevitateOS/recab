@@ -1,5 +1,7 @@
-//! Prepare a slot for the installed initramfs's immutable boot. The root is
-//! read-only, including /etc. User data remains on shared /var.
+//! Set a root up for the installed initramfs's locked boot: its fstab
+//! mounts it read-only (including /etc) with the shared /var, and its slot
+//! marker names the root, the shared /var and the other root. User data
+//! stays on the shared /var.
 
 use anyhow::{Context, Result};
 use recinit::installed::IMMUTABLE_CONFIG;
@@ -7,8 +9,17 @@ use std::path::Path;
 
 use crate::error::refuse;
 use crate::filesystem::Root;
-use crate::state::Slot;
 use crate::target::{partuuid, Target};
+use crate::Slot;
+
+/// The files each root has its own version of: they name its own partition.
+pub(crate) const SLOT_FILES: &[&[u8]] = &[b"etc/fstab", IMMUTABLE_CONFIG.as_bytes()];
+
+/// The slot marker of `slot` (`A PARTUUID=<var> PARTUUID=<other root>`),
+/// which the initramfs reads.
+pub(crate) fn slot_marker(slot: Slot, state: &str, other: &str) -> String {
+    format!("{slot} {state} PARTUUID={other}\n")
+}
 
 /// The shared state partition must be mounted separately from the system.
 pub(crate) fn state_partition(target: &Target) -> Result<String> {
@@ -20,24 +31,22 @@ pub(crate) fn state_partition(target: &Target) -> Result<String> {
         .find(|m| m.mount_point == point)
         .ok_or_else(|| {
             refuse(format!(
-                "immutable A/B needs its state partition mounted at '{}'",
+                "A/B needs its shared /var partition mounted at '{}'",
                 point.display()
             ))
         })?;
     use std::os::unix::fs::MetadataExt;
-    if state.fstype != "ext4" || state.root != Path::new("/")
-        || std::fs::metadata(&point)?.dev() != libc::makedev(state.dev.0, state.dev.1) {
-        return Err(refuse(
-            "immutable A/B needs an ext4 state partition at /var",
-        ));
+    if state.fstype != "ext4"
+        || state.root != Path::new("/")
+        || std::fs::metadata(&point)?.dev() != libc::makedev(state.dev.0, state.dev.1)
+    {
+        return Err(refuse("A/B needs an ext4 partition at /var"));
     }
     let state_id = partuuid(Path::new(&state.source))?;
     // An alternate mount of root is not a persistent state partition.
     if let Some(root) = mounts.iter().rev().find(|m| m.mount_point == target.root) {
         if partuuid(Path::new(&root.source))? == state_id {
-            return Err(refuse(
-                "immutable A/B needs different root and /var partitions",
-            ));
+            return Err(refuse("A/B needs different root and /var partitions"));
         }
     }
     Ok(state_id)
@@ -60,9 +69,7 @@ pub(crate) fn check(root: &Path, fstab: &str) -> Result<()> {
             .metadata(Path::new(rel))?
             .is_some_and(|meta| !meta.is_dir())
         {
-            return Err(refuse(format!(
-                "immutable A/B needs '{rel}' to be a real directory"
-            )));
+            return Err(refuse(format!("A/B needs '{rel}' to be a real directory")));
         }
     }
     for rel in ["etc/fstab", IMMUTABLE_CONFIG] {
@@ -70,9 +77,7 @@ pub(crate) fn check(root: &Path, fstab: &str) -> Result<()> {
             .metadata(Path::new(rel))?
             .is_some_and(|meta| !meta.is_file())
         {
-            return Err(refuse(format!(
-                "immutable A/B needs '{rel}' to be a regular file"
-            )));
+            return Err(refuse(format!("A/B needs '{rel}' to be a regular file")));
         }
     }
     render_fstab(fstab, "preflight")?;
@@ -113,9 +118,7 @@ fn render_fstab(fstab: &str, state: &str) -> Result<String> {
                 .iter()
                 .any(|base| path == *base || path.starts_with(&format!("{base}/"))) =>
             {
-                return Err(refuse(format!(
-                    "immutable A/B cannot mount over system path {path}"
-                )));
+                return Err(refuse(format!("A/B cannot mount over system path {path}")));
             }
             _ => lines.push(line.to_string()),
         }
@@ -131,7 +134,9 @@ fn render_fstab(fstab: &str, state: &str) -> Result<String> {
     Ok(lines.join("\n") + "\n")
 }
 
-pub(crate) fn prepare(root: &Path, slot: Slot, state: &str) -> Result<()> {
+/// Write the locked-boot fstab, the slot marker (`other`: the other root's
+/// PARTUUID) and the read-only runtime policy into the root at `root`.
+pub(crate) fn prepare(root: &Path, slot: Slot, state: &str, other: &str) -> Result<()> {
     let opened = Root::open(root)?;
     let fstab = opened
         .optional_text(Path::new("etc/fstab"))?
@@ -140,38 +145,14 @@ pub(crate) fn prepare(root: &Path, slot: Slot, state: &str) -> Result<()> {
     opened
         .entry(Path::new("etc/fstab"), true)?
         .write(render_fstab(&fstab, state)?.as_bytes(), 0o644)?;
-    opened
-        .entry(Path::new(IMMUTABLE_CONFIG), true)?
-        .write(format!("{slot} PARTUUID={state}\n").as_bytes(), 0o644)?;
+    opened.entry(Path::new(IMMUTABLE_CONFIG), true)?.write(
+        slot_marker(slot, &format!("PARTUUID={state}"), other).as_bytes(),
+        0o644,
+    )?;
     let release = opened
         .optional_text(Path::new("etc/os-release"))?
         .context("missing os-release")?;
     let init = distro_profile::os_release_fact(&release, "REC_INIT")?;
     crate::runtime::Policy::check(root, init)?.apply(root)?;
-    Ok(())
-}
-
-pub(crate) fn require_readonly(target: &Target) -> Result<()> {
-    let mounts = target.mount_table()?;
-    let root = mounts
-        .iter()
-        .rev()
-        .find(|mount| mount.mount_point == target.root)
-        .ok_or_else(|| refuse("the running root is not a mount point"))?;
-    if !root.options.split(',').any(|o| o == "ro") {
-        return Err(refuse(
-            "the active system root is writable; immutable boot is required before preparation",
-        ));
-    }
-    for mount in &mounts {
-        if ["etc", "usr", "opt"]
-            .iter()
-            .any(|rel| mount.mount_point.starts_with(target.root.join(rel)))
-        {
-            return Err(refuse(
-                "the active system has a separate configuration/system mount; explicit adoption is required",
-            ));
-        }
-    }
     Ok(())
 }

@@ -3,12 +3,12 @@
 //! efivarfs (or, in a scratch tree, a directory of plain files). Changing
 //! them needs no `bootctl`.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use crate::error::{ErrorClass, classified, or_class};
+use crate::error::{classified, or_class, ErrorClass};
 use crate::target::Firmware;
 
 /// systemd-boot's vendor GUID, which names its EFI variables.
@@ -27,10 +27,6 @@ pub(crate) enum Var {
     Default,
     /// The entry booted once, at the next boot; systemd-boot removes it then.
     OneShot,
-    /// The entry this boot started (set by systemd-boot).
-    Selected,
-    /// recab recovery ticket; lives in recab's own vendor namespace.
-    RecabTrial,
 }
 
 impl Var {
@@ -38,8 +34,6 @@ impl Var {
         match self {
             Var::Default => "LoaderEntryDefault",
             Var::OneShot => "LoaderEntryOneShot",
-            Var::Selected => "LoaderEntrySelected",
-            Var::RecabTrial => "RecabTrial",
         }
     }
 }
@@ -57,12 +51,9 @@ impl EfiVars {
     }
 
     fn path(firmware: &Firmware, var: Var) -> PathBuf {
-        let guid = if var == Var::RecabTrial {
-            "a69e7a1c-44ab-42f5-93ed-836a4c103bad"
-        } else {
-            LOADER_VENDOR_GUID
-        };
-        firmware.efivars.join(format!("{}-{guid}", var.name()))
+        firmware
+            .efivars
+            .join(format!("{}-{LOADER_VENDOR_GUID}", var.name()))
     }
 
     /// The variable's entry id; `None` when it is unset, empty, or there is

@@ -10,7 +10,7 @@
       "type": "string"
     },
     "Startup": {
-      "description": "How system startup ended, as the init adapter reports it.",
+      "description": "How startup ended.",
       "oneOf": [
         {
           "const": "running",
@@ -34,14 +34,14 @@
         },
         {
           "const": "inconclusive",
-          "description": "No verdict: an explicit shutdown or assessment cancellation.",
+          "description": "No verdict: an explicit shutdown or the wait was stopped.",
           "type": "string"
         }
       ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "description": "How startup of the running system ended (`recab health --json`): the\nverdict a trial judges by.",
+  "description": "How startup of the running system ended (`recab health --json`).",
   "properties": {
     "failed": {
       "description": "The units or services that failed (and, on OpenRC, crashed daemons),\nsorted, by bare name; listed even when startup did not finish.",

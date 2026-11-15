@@ -2,7 +2,7 @@
 //! descriptors stay alive through each operation; symlinks are never parents
 //! of writes, and reads that follow links resolve them inside this root.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::ffi::{CString, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -195,19 +195,6 @@ impl Root {
             bail!("system text file exceeds 64 MiB");
         }
         Ok(Some(text))
-    }
-
-    pub fn resolved_path(&self, file: &File) -> Result<PathBuf> {
-        let base = fs::read_link(format!("/proc/self/fd/{}", self.0.as_raw_fd()))?;
-        let location = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
-        Ok(location.strip_prefix(base)?.to_path_buf())
-    }
-
-    pub fn location(&self) -> Result<PathBuf> {
-        Ok(fs::read_link(format!(
-            "/proc/self/fd/{}",
-            self.0.as_raw_fd()
-        ))?)
     }
 
     pub fn device(&self) -> Result<u64> {
@@ -466,7 +453,7 @@ pub(crate) fn check_system_mounts(path: &Path) -> Result<()> {
                 continue;
             }
             let first = relative.components().next().unwrap().as_os_str();
-            if !crate::generation::EXCLUDED.contains(&first.as_bytes()) {
+            if !crate::inventory::EXCLUDED.contains(&first.as_bytes()) {
                 bail!("unexpected mount inside system at '{}'", relative.display());
             }
         }

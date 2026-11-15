@@ -1,8 +1,7 @@
-//! recab's init adapter: what a trial needs from the running init system,
-//! the one from the system's distro profile (the `REC_*` fields of its
-//! os-release). Three operations: wait until startup finished and say how it
-//! ended ([`health`]), reboot ([`reboot`]), and the kernel option that
-//! reboots on a crashing PID 1 ([`crash_option`]).
+//! recab's init adapter: wait until startup of the running system finished
+//! and say how it ended ([`health`]), for the init system of the distro
+//! profile (the `REC_*` fields of its os-release). `recab started` makes the
+//! booted root the boot default only when startup finished.
 //!
 //! systemd and OpenRC are supported.
 
@@ -17,25 +16,32 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::state::Startup;
 use crate::target::Target;
 
-/// The kernel option that turns a crashing PID 1 into a reboot, for an init
-/// that has one; OpenRC's init dying panics the kernel, which `panic=` already
-/// reboots.
-pub fn crash_option(init: InitSystem) -> Option<&'static str> {
-    match init {
-        InitSystem::Systemd => Some("systemd.crash_action=reboot"),
-        InitSystem::Openrc => None,
-    }
+const SYSTEMCTL: &str = "systemctl";
+const RC_STATUS: &str = "rc-status";
+
+/// Seconds `recab started` and `recab health` wait for startup to finish.
+pub const STARTUP_TIMEOUT_SECS: u64 = 900;
+
+/// How startup ended.
+#[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Startup {
+    /// Startup ran to its end with nothing failed.
+    Running,
+    /// Startup ran to its end with something failed.
+    Failed,
+    /// Startup ended in the init's emergency state.
+    Emergency,
+    /// Still starting when the deadline passed.
+    TimedOut,
+    /// No verdict: an explicit shutdown or the wait was stopped.
+    Inconclusive,
 }
 
-/// Seconds startup may take before a trial counts as failed: `recab trial`'s
-/// (and so the trial service's) deadline, and `recab health`'s wait.
-pub const TRIAL_TIMEOUT_SECS: u64 = 900;
-
-/// How startup of the running system ended (`recab health --json`): the
-/// verdict a trial judges by.
+/// How startup of the running system ended (`recab health --json`).
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize)]
 pub struct Health {
@@ -70,8 +76,7 @@ impl Health {
         }
     }
 
-    /// How startup ended, in words (a trial's record and message), for a
-    /// wait of at most `timeout`.
+    /// How startup ended, in words, for a wait of at most `timeout`.
     pub fn describe(&self, timeout: Duration) -> String {
         let how = match self.startup {
             Startup::Running => "finished starting".to_string(),
@@ -100,7 +105,7 @@ pub(crate) fn health(target: &Target, timeout: Duration) -> Result<Health> {
     let _signals = AssessmentSignals::new()?;
     let deadline = Instant::now() + timeout;
     let result = match init {
-        InitSystem::Systemd => systemd_startup(&target.programs.systemctl, deadline),
+        InitSystem::Systemd => systemd_startup(SYSTEMCTL, deadline),
         InitSystem::Openrc => openrc_startup(target, deadline),
     };
     match result {
@@ -251,7 +256,7 @@ fn assess(command: &mut Command, deadline: Instant) -> Result<std::process::Outp
 }
 
 /// Only an explicit shutdown state has no verdict. An unreachable init or an
-/// unrecognized answer is an assessment error, so a confirmed trial recovers.
+/// unrecognized answer is an error.
 fn systemd_startup(systemctl: &str, deadline: Instant) -> Result<Health> {
     let out = assess(
         Command::new(systemctl).args(["is-system-running", "--wait"]),
@@ -397,17 +402,14 @@ fn openrc_failed(target: &Target, deadline: Instant) -> Result<Vec<String>> {
     // rc-status --crashed exits 1 with no output when no daemon crashed,
     // and 0 when it lists crashed services (OpenRC's documented contract).
     // A missing binary, signal, unexpected status or diagnostic is an error.
-    let out = assess(
-        Command::new(&target.programs.rc_status).arg("--crashed"),
-        deadline,
-    )?;
+    let out = assess(Command::new(RC_STATUS).arg("--crashed"), deadline)?;
     let crashed = String::from_utf8_lossy(&out.stdout);
     let no_crashes =
         out.status.code() == Some(1) && crashed.trim().is_empty() && out.stderr.is_empty();
     if (!out.status.success() && !no_crashes) || !out.stderr.is_empty() {
         anyhow::bail!(
             "'{} --crashed' failed ({}): {}",
-            target.programs.rc_status,
+            RC_STATUS,
             target_root::status_text(out.status),
             String::from_utf8_lossy(&out.stderr).trim()
         );
@@ -432,20 +434,4 @@ fn openrc_running(target: &Target) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// Ask for a clean reboot without waiting for it: systemd's, or busybox
-/// init's (AcornOS boots busybox init from an inittab that runs OpenRC).
-pub(crate) fn reboot(init: InitSystem, target: &Target) -> Result<()> {
-    let programs = &target.programs;
-    let mut command = match init {
-        InitSystem::Systemd => {
-            let mut command = Command::new(&programs.systemctl);
-            command.args(["--no-block", "reboot"]);
-            command
-        }
-        InitSystem::Openrc => Command::new(&programs.reboot),
-    };
-    target_root::run(&mut command)?;
-    Ok(())
 }

@@ -1,8 +1,6 @@
 //! The system recab looks at in one run, decided once: the running system,
-//! or a system installed under a root (`init`, `status --root`). Every path,
-//! program and fact recab reads about it comes from here, and each path and
-//! program the scratch-tree tests redirect has its `RECAB_*` variable; no
-//! other module reads the environment, `/`, `/proc` or an os-release.
+//! or a system installed under a root (`init`, `verify-installation`). Every
+//! path and fact recab reads about it comes from here.
 
 use anyhow::{Context, Result};
 use distro_profile::{os_release_fact, os_release_value, InitSystem};
@@ -11,21 +9,8 @@ use std::path::{Path, PathBuf};
 use crate::error::{classified, refuse, ErrorClass};
 use recpart::policy::{ESP_MOUNT, STATE_MOUNT};
 
-/// recab's directory under the state partition's mount point.
+/// recab's directory under the shared `/var` partition.
 const STATE_DIR: &str = "lib/recab";
-const STATE_FILE: &str = "state.json";
-const AUDIT_FILE: &str = "audit.log";
-
-/// recab's state file on an installed system, as an absolute path.
-pub fn state_file() -> String {
-    format!("{STATE_MOUNT}/{STATE_DIR}/{STATE_FILE}")
-}
-
-/// recab's audit log on an installed system, as an absolute path.
-#[cfg(feature = "contracts")]
-pub fn audit_file() -> String {
-    format!("{STATE_MOUNT}/{STATE_DIR}/{AUDIT_FILE}")
-}
 
 /// Which system the run looks at.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,20 +28,8 @@ pub(crate) enum Kind {
 pub(crate) struct Firmware {
     /// `/sys/firmware/efi`, present when the machine booted through UEFI.
     pub efi_dir: PathBuf,
-    /// The variables (efivarfs, or a directory of plain files in a scratch
-    /// tree: which one is read from the filesystem itself).
+    /// The variables (efivarfs).
     pub efivars: PathBuf,
-}
-
-/// The programs recab runs, each named once.
-#[derive(Clone)]
-pub(crate) struct Programs {
-    pub systemctl: String,
-    pub rc_status: String,
-    /// busybox init's reboot.
-    pub reboot: String,
-    pub mount: String,
-    pub umount: String,
 }
 
 #[derive(Clone)]
@@ -64,9 +37,9 @@ pub(crate) struct Target {
     pub kind: Kind,
     /// The system's `/`.
     pub root: PathBuf,
-    /// Its ESP, where the slot entries, loader.conf and kernels live.
+    /// Its ESP, where the entries, loader.conf and kernels live.
     pub esp: PathBuf,
-    /// recab's state directory (state file and audit log).
+    /// recab's directory on the shared `/var` (the installation record).
     pub state_dir: PathBuf,
     /// The run lock: always this machine's, whichever system the run looks at.
     pub lock: PathBuf,
@@ -74,23 +47,12 @@ pub(crate) struct Target {
     pub firmware: Option<Firmware>,
     /// This machine's `/proc`.
     pub proc_dir: PathBuf,
-    /// Where `stage` mounts what it reads and writes.
-    pub stage_dir: PathBuf,
-    /// OpenRC's state directory and its runlevels.
+    /// OpenRC's state directory and the system's runlevels.
     pub openrc_dir: PathBuf,
     pub runlevels_dir: PathBuf,
-    pub programs: Programs,
     /// The os-release, read once.
     os_release: String,
     os_release_path: PathBuf,
-}
-
-fn var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
-fn path(name: &str, default: impl AsRef<Path>) -> PathBuf {
-    var(name).map_or_else(|| default.as_ref().to_path_buf(), PathBuf::from)
 }
 
 /// `absolute` (a path on the system) under `root`.
@@ -99,84 +61,57 @@ fn under(root: &Path, absolute: &str) -> PathBuf {
 }
 
 /// The system's os-release, and the file it came from.
-fn os_release(root: &Path, file: Option<PathBuf>) -> Result<(String, PathBuf)> {
-    let missing = || refuse(format!("'{}' has no os-release", root.display()));
-    match file {
-        Some(file) => {
-            let text = target_root::read_optional(&file)?.ok_or_else(missing)?;
-            Ok((text, file))
-        }
-        None => {
-            let opened = crate::filesystem::Root::open(root)?;
-            let text = match opened.optional_text(Path::new("etc/os-release"))? {
-                Some(text) => text,
-                None => opened
-                    .optional_text(Path::new("usr/lib/os-release"))?
-                    .ok_or_else(missing)?,
-            };
-            Ok((text, under(root, "etc/os-release")))
+fn os_release(root: &Path) -> Result<(String, PathBuf)> {
+    let opened = crate::filesystem::Root::open(root)?;
+    for file in ["etc/os-release", "usr/lib/os-release"] {
+        if let Some(text) = opened.optional_text(Path::new(file))? {
+            return Ok((text, under(root, file)));
         }
     }
+    Err(refuse(format!("'{}' has no os-release", root.display())))
 }
 
 impl Target {
-    /// The running system, with the `RECAB_*` overrides.
+    /// The running system.
     pub fn running() -> Result<Self> {
-        let root = path("RECAB_ROOT", "/");
-        let (os_release, os_release_path) =
-            os_release(&root, var("RECAB_OS_RELEASE_PATH").map(PathBuf::from))?;
-        let efi_dir = path("RECAB_SYS_FIRMWARE_EFI_PATH", "/sys/firmware/efi");
-        let program = |name: &str, default: &str| var(name).unwrap_or_else(|| default.to_string());
+        let root = PathBuf::from("/");
+        let (os_release, os_release_path) = os_release(&root)?;
+        let efi_dir = PathBuf::from("/sys/firmware/efi");
         Ok(Self {
             kind: Kind::Running,
-            esp: path("RECAB_BOOT_ROOT", under(&root, ESP_MOUNT)),
-            state_dir: path("RECAB_STATE_DIR", under(&root, STATE_MOUNT).join(STATE_DIR)),
-            lock: path("RECAB_LOCK_PATH", "/run/lock/recab.lock"),
+            esp: under(&root, ESP_MOUNT),
+            state_dir: under(&root, STATE_MOUNT).join(STATE_DIR),
+            lock: PathBuf::from("/run/lock/recab.lock"),
             firmware: Some(Firmware {
-                efivars: path("RECAB_EFIVARS_PATH", efi_dir.join("efivars")),
+                efivars: efi_dir.join("efivars"),
                 efi_dir,
             }),
-            proc_dir: path("RECAB_PROC_PATH", "/proc"),
-            stage_dir: path("RECAB_STAGE_DIR", "/run/recab"),
-            openrc_dir: path("RECAB_OPENRC_DIR", "/run/openrc"),
-            runlevels_dir: path("RECAB_RUNLEVELS_DIR", under(&root, "etc/runlevels")),
-            programs: Programs {
-                systemctl: program("RECAB_SYSTEMCTL_BIN", "systemctl"),
-                rc_status: program("RECAB_RC_STATUS_BIN", "rc-status"),
-                reboot: program("RECAB_REBOOT_BIN", "reboot"),
-                mount: "mount".to_string(),
-                umount: "umount".to_string(),
-            },
+            proc_dir: PathBuf::from("/proc"),
+            openrc_dir: PathBuf::from("/run/openrc"),
+            runlevels_dir: under(&root, "etc/runlevels"),
             root,
             os_release,
             os_release_path,
         })
     }
 
-    /// The system installed under `root`: its ESP and state where the layout
-    /// mounts them, its os-release, its root the partition mounted at
-    /// `root`. The lock and programs stay this machine's.
+    /// The system installed under `root`: its ESP and `/var` where the
+    /// layout mounts them, its os-release, its root the partition mounted at
+    /// `root`. The lock stays this machine's.
     pub fn installed(root: &Path) -> Result<Self> {
         let running = Self::running()?;
-        let (os_release, os_release_path) = os_release(root, None)?;
+        let (os_release, os_release_path) = os_release(root)?;
         Ok(Self {
             kind: Kind::Installed,
             root: root.to_path_buf(),
             esp: under(root, ESP_MOUNT),
             state_dir: under(root, STATE_MOUNT).join(STATE_DIR),
+            runlevels_dir: under(root, "etc/runlevels"),
             firmware: None,
             os_release,
             os_release_path,
             ..running
         })
-    }
-
-    pub fn state_path(&self) -> PathBuf {
-        self.state_dir.join(STATE_FILE)
-    }
-
-    pub fn audit_path(&self) -> PathBuf {
-        self.state_dir.join(AUDIT_FILE)
     }
 
     /// The kernel command line of the running system.
@@ -189,11 +124,6 @@ impl Target {
         Ok(target_root::mount_table_at(
             &self.proc_dir.join("self/mountinfo"),
         )?)
-    }
-
-    /// Where `stage` mounts `what` (`media`, `image`, `slot-a`).
-    pub fn stage_mount(&self, what: &str) -> PathBuf {
-        self.stage_dir.join(what)
     }
 
     /// The entries' name prefix: the os-release `ID`, lower-cased. `init`
@@ -225,14 +155,33 @@ impl Target {
 
     /// The init system of the distro profile (`REC_INIT`).
     pub fn init(&self) -> Result<InitSystem> {
-        os_release_fact(&self.os_release, "REC_INIT").map_err(|err| self.no_profile(err))
+        os_release_fact(&self.os_release, "REC_INIT").map_err(|err| {
+            classified(
+                ErrorClass::BackendUnavailable,
+                format!("{}: {err}", self.os_release_path.display()),
+            )
+        })
     }
 
-    fn no_profile(&self, err: impl std::fmt::Display) -> anyhow::Error {
-        classified(
-            ErrorClass::BackendUnavailable,
-            format!("{}: {err}", self.os_release_path.display()),
-        )
+    /// Wait for, then hold, the exclusive recab lock (released when dropped).
+    pub fn lock(&self) -> Result<std::fs::File> {
+        use std::os::fd::AsRawFd;
+        if let Some(parent) = self.lock.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating '{}'", parent.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock)
+            .with_context(|| format!("opening lock '{}'", self.lock.display()))?;
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(anyhow::Error::from(std::io::Error::last_os_error())
+                .context(format!("locking '{}'", self.lock.display())));
+        }
+        Ok(file)
     }
 }
 
@@ -240,10 +189,22 @@ impl Target {
 pub(crate) fn partuuid(device: &Path) -> Result<String> {
     target_root::partuuid(device)
         .with_context(|| format!("reading the PARTUUID of '{}'", device.display()))?
+        .map(|id| id.to_ascii_lowercase())
         .ok_or_else(|| {
             refuse(format!(
                 "'{}' has no PARTUUID; root partitions must be GPT partitions",
                 device.display()
             ))
         })
+}
+
+/// Root, for `command`.
+pub(crate) fn require_root(command: &str) -> Result<()> {
+    if !target_root::is_root() {
+        return Err(classified(
+            ErrorClass::Permission,
+            format!("{command} must run as root"),
+        ));
+    }
+    Ok(())
 }

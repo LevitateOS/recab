@@ -1,32 +1,28 @@
-//! In-place continuation synchronization. The caller owns the recab lock and
-//! an unbootable inactive mount. Every attempt compares actual contents again.
+//! Make one root an exact copy of another, in place: only what differs is
+//! written, and what the source lacks is removed. The caller holds the recab
+//! lock and the destination is not booted. Each root keeps its own fstab and
+//! slot marker. Every run compares actual contents again.
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use crate::Slot;
 use crate::error::refuse;
 use crate::filesystem::{self, Entry, Root};
-use crate::generation::{EXCLUDED, Extent, Inventory, MARKER, Node, digest, extents};
+use crate::immutable::SLOT_FILES;
+use crate::inventory::{digest, extents, Extent, Inventory, Node, EXCLUDED};
+use crate::Slot;
 
 const RANGE: u64 = 1024 * 1024;
 
-pub(crate) struct Selection<'a> {
-    pub desired: Inventory,
-    pub removals: &'a [Vec<u8>],
-    pub sources: BTreeMap<Vec<u8>, PathBuf>,
-}
-
-
-/// Logical writes made by the synchronizer, not SSD/controller write amplification.
+/// What a copy wrote: logical writes, not SSD/controller write amplification.
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct SyncReport {
     pub payload_bytes_written: u64,
     pub payload_bytes_compared: u64,
@@ -36,20 +32,9 @@ pub struct SyncReport {
     pub links_created: u64,
     pub entries_removed: u64,
     pub metadata_updates: u64,
-    pub identity_bytes_written: u64,
-    pub plan_bytes_written: u64,
-    /// A killed attempt can have written data before its counters were saved.
-    /// Payload counters cover this attempt; false means earlier writes are unknown.
-    pub accounting_complete: bool,
-    pub resumed: bool,
-    /// Filesystem metadata/journal traffic cannot be inferred from payload writes.
-    pub filesystem_metadata_bytes: Option<u64>,
-    pub filesystem_journal_bytes: Option<u64>,
-    pub recab_state_bytes: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "operation", content = "path", rename_all = "snake_case")]
+#[derive(Debug)]
 enum Operation {
     Remove(Vec<u8>),
     Directory(Vec<u8>),
@@ -58,17 +43,6 @@ enum Operation {
     Symlink(Vec<u8>),
     Metadata(Vec<u8>),
 }
-#[derive(Serialize)]
-struct Journal<'a> {
-    version: u32,
-    preparation: &'a str,
-    source_generation: &'a str,
-    source_inventory: String,
-    destination_partuuid: &'a str,
-    range_bytes: u64,
-    operations: &'a [Operation],
-}
-
 pub(crate) struct Synchronization {
     source: Root,
     destination: Root,
@@ -77,9 +51,8 @@ pub(crate) struct Synchronization {
     operations: Vec<Operation>,
     slot: Slot,
     partuuid: String,
+    other: String,
     temporary: String,
-    selected: bool,
-    sources: BTreeMap<Vec<u8>, PathBuf>,
 }
 
 fn path(bytes: &[u8]) -> &Path {
@@ -93,7 +66,7 @@ fn entry(root: &Root, bytes: &[u8]) -> Result<Entry> {
     }
 }
 fn owned(bytes: &[u8]) -> bool {
-    matches!(bytes, b"etc/fstab" | b"usr/lib/recab/immutable")
+    SLOT_FILES.contains(&bytes)
 }
 fn ranges(node: &Node) -> Vec<Extent> {
     node.extents.clone().unwrap_or_else(|| {
@@ -167,27 +140,7 @@ fn metadata_matches(node: &Node, entry: &Entry) -> Result<bool> {
         && m.mtime_nsec() == node.modified_ns
         && filesystem::xattrs(&entry.path())? == node.xattrs)
 }
-fn assigned_metadata(node: &Node, entry: &Entry, selected: bool) -> Result<Node> {
-    let mut intended = node.clone();
-    if selected
-        && !intended
-            .xattrs
-            .iter()
-            .any(|(n, _)| n == b"security.selinux")
-        && entry.metadata()?.is_some()
-    {
-        for (name, value) in filesystem::xattrs(&entry.path())? {
-            if name == b"security.selinux" {
-                intended.xattrs.push((name, value));
-            }
-        }
-        intended.xattrs.sort();
-    }
-    Ok(intended)
-}
-fn metadata(node: &Node, entry: &Entry, report: &mut SyncReport, selected: bool) -> Result<()> {
-    let intended = assigned_metadata(node, entry, selected)?;
-    let node = &intended;
+fn metadata(node: &Node, entry: &Entry, report: &mut SyncReport) -> Result<()> {
     if metadata_matches(node, entry)? {
         return Ok(());
     }
@@ -226,7 +179,15 @@ fn metadata(node: &Node, entry: &Entry, report: &mut SyncReport, selected: bool)
     Ok(())
 }
 
-fn materialized(source: &Root, bytes: &[u8], slot: Slot, uuid: &str) -> Result<Vec<u8>> {
+/// `bytes` (fstab or the slot marker) as the destination root `slot` (its
+/// PARTUUID `uuid`, the other root's `other`) has it.
+fn materialized(
+    source: &Root,
+    bytes: &[u8],
+    slot: Slot,
+    uuid: &str,
+    other: &str,
+) -> Result<Vec<u8>> {
     let text = source
         .optional_text(path(bytes))?
         .context("slot identity file is missing")?;
@@ -237,21 +198,24 @@ fn materialized(source: &Root, bytes: &[u8], slot: Slot, uuid: &str) -> Result<V
         crate::fstab::for_slot(&text, uuid, "ext4")?.into_bytes()
     } else {
         let fields = text.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 2 {
-            return Err(refuse("invalid immutable slot identity"));
-        }
-        format!("{slot} {}\n", fields[1]).into_bytes()
+        let state = fields
+            .get(1)
+            .ok_or_else(|| refuse("the slot marker does not name the shared /var"))?;
+        crate::immutable::slot_marker(slot, state, other).into_bytes()
     })
 }
 
 impl Synchronization {
-    /// Read and preflight everything before invalidating boot or changing payloads.
+    /// Plan the copy of `source` (read as `desired`) into `destination`
+    /// (root `slot`, PARTUUID `uuid`; `other`: the source root's PARTUUID),
+    /// reading the destination and checking the copy fits.
     pub fn check(
         source: &Path,
+        mut desired: Inventory,
         destination: &Path,
         slot: Slot,
         uuid: &str,
-        id: &str,
+        other: &str,
     ) -> Result<Self> {
         let source_root = Root::open(source)?;
         let destination_root = Root::open(destination)?;
@@ -262,28 +226,14 @@ impl Synchronization {
         {
             return Err(refuse("source and destination identify the same root"));
         }
-        let old_marker = match destination_root.metadata(Path::new(MARKER)) {
-            Err(error)
-                if error.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                    matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))
-                }) =>
-            {
-                None
-            }
-            result => result?,
-        };
-        if old_marker.is_some_and(|m| !m.is_file()) {
-            return Err(refuse("generation marker must be a regular file"));
-        }
-        let mut desired = Inventory::capture(source)?;
-        let observed = Inventory::capture_candidate(destination)?;
-        let temporary = format!(".recab-sync-{id}");
+        let observed = Inventory::capture(destination)?;
+        let temporary = ".recab-copy".to_string();
         for node in &desired.entries {
             if path(&node.path)
                 .components()
                 .any(|c| c.as_os_str() == temporary.as_str())
             {
-                return Err(refuse("source uses the preparation's scratch name"));
+                return Err(refuse("the source uses recab's scratch name"));
             }
             if owned(&node.path)
                 && (node.kind != "file"
@@ -300,7 +250,7 @@ impl Synchronization {
         }
         for node in &mut desired.entries {
             if owned(&node.path) {
-                let bytes = materialized(&source_root, &node.path, slot, uuid)?;
+                let bytes = materialized(&source_root, &node.path, slot, uuid, other)?;
                 node.content = Some(digest(&bytes));
                 node.size = bytes.len() as u64;
                 node.extents = Some(if bytes.is_empty() {
@@ -334,16 +284,17 @@ impl Synchronization {
         // An excluded real directory was not traversed; never recursively erase it
         // to turn it into a symlink, even when the desired source has that link.
         for node in &desired.entries {
-            if !node.path.contains(&b'/') && EXCLUDED.contains(&node.path.as_slice())
+            if !node.path.contains(&b'/')
+                && EXCLUDED.contains(&node.path.as_slice())
                 && destination_root
                     .metadata(path(&node.path))?
                     .is_some_and(|m| m.is_dir())
-                    && node.kind != "dir"
-                {
-                    return Err(refuse(
-                        "cannot replace a shared/runtime directory with a system entry",
-                    ));
-                }
+                && node.kind != "dir"
+            {
+                return Err(refuse(
+                    "cannot replace a shared/runtime directory with a system entry",
+                ));
+            }
         }
         removals.sort_by(|a, b| depth(b).cmp(&depth(a)).then(b.cmp(a)));
         let mut operations = removals
@@ -451,155 +402,13 @@ impl Synchronization {
             operations,
             slot,
             partuuid: uuid.into(),
+            other: other.into(),
             temporary,
-            selected: false,
-            sources: BTreeMap::new(),
         };
         result.capacity()?;
         Ok(result)
     }
 
-    /// A Recipe publication reuses the same range/metadata writer, with an
-    /// explicit bounded selection instead of whole-system deletion semantics.
-    pub(crate) fn selected(
-        source: &Path,
-        destination: &Path,
-        desired: Inventory,
-        removals: &[String],
-        slot: Slot,
-        uuid: &str,
-        id: &str,
-    ) -> Result<Self> {
-        Self::selection(source,destination,Selection {desired, removals: &removals.iter().map(|p|p.as_bytes().to_vec()).collect::<Vec<_>>(), sources: BTreeMap::new()},slot,uuid,id,false)
-    }
-    /// Complete, already resolved merge selection. Every descendant removal is
-    /// explicit; no recursive removal can cross into shared/runtime contents.
-    pub(crate) fn merged(source:&Path,destination:&Path,selection:Selection<'_>,slot:Slot,uuid:&str,id:&str)->Result<Self> {
-        Self::selection(source,destination,selection,slot,uuid,id,true)
-    }
-    fn selection(source:&Path,destination:&Path,selection:Selection<'_>,slot:Slot,uuid:&str,id:&str,tree:bool)->Result<Self> {
-        let Selection { mut desired, removals, sources } = selection;
-        let source = Root::open(source)?;
-        let destination_root = Root::open(destination)?;
-        desired.entries.retain(|n| !n.path.is_empty());
-        let paths = desired
-            .entries
-            .iter()
-            .map(|n| path(&n.path).to_path_buf())
-            .chain(removals.iter().map(|p|path(p).to_path_buf()))
-            .collect::<Vec<_>>();
-        let observed = Inventory::capture_paths(destination, &paths)?;
-        let actual = observed
-            .entries
-            .iter()
-            .map(|n| (n.path.clone(), n))
-            .collect::<BTreeMap<_, _>>();
-        let mut operations = Vec::new();
-        let mut deleting = removals.to_vec();
-        for node in &desired.entries {
-            if actual
-                .get(&node.path)
-                .is_some_and(|old| old.kind != node.kind)
-            {
-                if actual[&node.path].kind == "dir"
-                    && !tree && !destination_root.names(path(&node.path))?.is_empty()
-                {
-                    return Err(refuse(
-                        "selected update cannot replace a populated directory",
-                    ));
-                }
-                deleting.push(node.path.clone());
-            }
-        }
-        deleting.sort_by_key(|p| std::cmp::Reverse(p.len()));
-        deleting.dedup();
-        for p in deleting {
-            if let Some(old) = actual.get(&p) {
-                if old.kind == "dir" && !destination_root.names(path(&p))?.is_empty() {
-                    if !tree { continue; }
-                    for name in destination_root.names(path(&p))? {
-                        let child=path(&p).join(name);
-                        if !removals.iter().any(|r|path(r)==child) {
-                            return Err(refuse("merge deletion has an unselected directory child"));
-                        }
-                    }
-                }
-                operations.push(Operation::Remove(p));
-            }
-        }
-        for node in desired.entries.iter().filter(|n| n.kind == "dir") {
-            operations.push(Operation::Directory(node.path.clone()));
-        }
-        for node in desired
-            .entries
-            .iter()
-            .filter(|n| n.kind != "dir" && n.hardlink.is_none())
-        {
-            operations.push(if node.kind == "file" {
-                Operation::File(node.path.clone())
-            } else {
-                Operation::Symlink(node.path.clone())
-            });
-        }
-        for node in desired.entries.iter().filter(|n| n.hardlink.is_some()) {
-            operations.push(Operation::Link(node.path.clone()));
-        }
-        for node in desired.entries.iter().rev() {
-            operations.push(Operation::Metadata(node.path.clone()));
-        }
-        let result = Self {
-            source,
-            destination: destination_root,
-            desired,
-            observed,
-            operations,
-            slot,
-            partuuid: uuid.into(),
-            temporary: format!(".recab-sync-{id}"),
-            selected: true,
-            sources,
-        };
-        result.capacity()?;
-        Ok(result)
-    }
-    pub(crate) fn verify_selected(&self, destination: &Path) -> Result<()> {
-        let paths = self
-            .desired
-            .entries
-            .iter()
-            .map(|n| path(&n.path).to_path_buf())
-            .collect::<Vec<_>>();
-        let actual = Inventory::capture_paths(destination, &paths)?;
-        if actual.entries.len() != self.desired.entries.len() {
-            return Err(refuse("selected publication is incomplete"));
-        }
-        for wanted in &self.desired.entries {
-            let n = actual
-                .entries
-                .iter()
-                .find(|n| n.path == wanted.path)
-                .unwrap();
-            let mut n = n.clone();
-            if !wanted
-                .xattrs
-                .iter()
-                .any(|(name, _)| name == b"security.selinux")
-            {
-                n.xattrs.retain(|(name, _)| name != b"security.selinux");
-            }
-            if !same_metadata(&n, wanted)
-                || n.content != wanted.content
-                || n.link != wanted.link
-                || n.hardlink != wanted.hardlink
-            {
-                return Err(refuse(format!(
-                    "selected publication mismatch at {}",
-                    path(&wanted.path).display()
-                )));
-            }
-        }
-        Ok(())
-    }
     fn capacity(&self) -> Result<()> {
         let actual: BTreeMap<_, _> = self
             .observed
@@ -730,28 +539,6 @@ impl Synchronization {
         Ok(())
     }
 
-    pub fn save_plan(
-        &self,
-        state: &Path,
-        preparation: &str,
-        source_generation: &str,
-    ) -> Result<(PathBuf, u64, bool)> {
-        let file = state.join(format!("synchronize-{preparation}.json"));
-        let resumed = fs::symlink_metadata(&file).is_ok();
-        let journal = Journal {
-            version: 1,
-            preparation,
-            source_generation,
-            source_inventory: self.desired.digest()?,
-            destination_partuuid: &self.partuuid,
-            range_bytes: RANGE,
-            operations: &self.operations,
-        };
-        let bytes = serde_json::to_vec(&journal)?;
-        target_root::write_durable(&file, &bytes, Some(0o600))?;
-        Ok((file, bytes.len() as u64, resumed))
-    }
-
     fn safe_aliases(&self, node: &Node, m: &fs::Metadata) -> Result<bool> {
         if m.nlink() == 1 {
             return Ok(true);
@@ -790,8 +577,7 @@ impl Synchronization {
                 .iter()
                 .any(|h| ranges(old).iter().any(|data| overlap(h, data).is_some()))
         });
-        let meta_differs =
-            !metadata_matches(&assigned_metadata(node, &target, self.selected)?, &target)?;
+        let meta_differs = !metadata_matches(node, &target)?;
         let detach = match &m {
             Some(m) if !self.safe_aliases(node, m)? => {
                 data_differs
@@ -856,15 +642,14 @@ impl Synchronization {
         }
         trait Input: Read + Seek {}
         impl<T: Read + Seek> Input for T {}
-        let mut input: Box<dyn Input> = if owned(&node.path) && !self.sources.contains_key(&node.path) {
+        let mut input: Box<dyn Input> = if owned(&node.path) {
             Box::new(std::io::Cursor::new(materialized(
                 &self.source,
                 &node.path,
                 self.slot,
                 &self.partuuid,
+                &self.other,
             )?))
-        } else if let Some(source)=self.sources.get(&node.path) {
-            Box::new(levitate_recipe::fsx::open_regular(source)?)
         } else {
             Box::new(entry(&self.source, &node.path)?.open()?)
         };
@@ -896,7 +681,7 @@ impl Synchronization {
         Ok(())
     }
 
-    pub fn apply(&self, mut report: SyncReport) -> Result<SyncReport> {
+    pub fn apply(&self) -> Result<SyncReport> {
         let wanted: BTreeMap<_, _> = self
             .desired
             .entries
@@ -909,6 +694,7 @@ impl Synchronization {
             .iter()
             .map(|n| (n.path.as_slice(), n))
             .collect();
+        let mut report = SyncReport::default();
         let mut removed = false;
         for op in &self.operations {
             if removed && !matches!(op, Operation::Remove(_)) {
@@ -1002,7 +788,6 @@ impl Synchronization {
                         wanted[p.as_slice()],
                         &entry(&self.destination, p)?,
                         &mut report,
-                        self.selected,
                     )?,
                 }
                 Ok(())
@@ -1015,9 +800,7 @@ impl Synchronization {
 
     pub fn verify(&self, destination: &Path) -> Result<()> {
         if Inventory::capture(destination)?.digest()? != self.desired.digest()? {
-            return Err(refuse(
-                "synchronized system does not match the source generation",
-            ));
+            return Err(refuse("the copy does not match the booted root"));
         }
         Ok(())
     }

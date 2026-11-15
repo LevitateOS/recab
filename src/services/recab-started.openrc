@@ -1,0 +1,33 @@
+#!/sbin/openrc-run
+# Packaged by `recab install-unit --init openrc`. It waits for startup to
+# finish, so it runs in the background: startup must not wait for it.
+description="@DESCRIPTION@"
+
+command="/sbin/openrc-run"
+command_args="/etc/init.d/recab-started run_started"
+command_background=true
+pidfile="/run/recab-started.pid"
+output_log="/dev/kmsg"
+error_log="/dev/kmsg"
+extra_commands="run_started"
+
+run_started() {
+    "@RECAB@" started &
+    started_pid=$!
+    # Stopping the service also stops recab.
+    trap 'kill "$started_pid" 2>/dev/null || :; wait "$started_pid" || :; exit 1' HUP INT TERM
+    result=0
+    wait "$started_pid" || result=$?
+    trap - HUP INT TERM
+    if [ "$result" -eq 0 ]; then
+        mark_service_inactive
+    else
+        mark_service_failed
+    fi
+    return "$result"
+}
+
+depend() {
+    # sysfs mounts efivarfs, where the boot default lives.
+    after sysfs
+}

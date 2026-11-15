@@ -49,12 +49,10 @@ classes! {
     /// No UEFI or efivars, efivars not writable, or the running os-release
     /// has no distro profile.
     BackendUnavailable => "backend_unavailable", 20, "RECAB_ERR_BACKEND";
-    /// Refused, or the slots or state could not be read.
+    /// Refused, or the roots or boot entries could not be read.
     StateOrDetection => "state_or_detection", 21, "RECAB_ERR_STATE";
     /// Something changed and something did not; the message says what.
     PartialUpdate => "partial_update", 22, "RECAB_ERR_PARTIAL_UPDATE";
-    /// A trial boot was not healthy and was not committed.
-    TrialFailed => "trial_failed", 23, "RECAB_ERR_TRIAL_FAILED";
 }
 
 /// An error with a stable class. The class travels as a typed value in the
@@ -76,7 +74,10 @@ impl std::error::Error for ClassifiedError {}
 
 /// An error of `class`.
 pub(crate) fn classified(class: ErrorClass, message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(ClassifiedError { class, message: message.into() })
+    anyhow::Error::new(ClassifiedError {
+        class,
+        message: message.into(),
+    })
 }
 
 /// A request recab refuses (exit 21): nothing was changed.

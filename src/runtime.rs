@@ -1,4 +1,5 @@
-//! Explicit runtime exceptions, without a writable /etc overlay.
+//! What a read-only root needs to run: links and drop-ins that keep
+//! services from writing to it. Installed with recab's package and by `init`.
 use crate::error::refuse;
 use crate::filesystem::Root;
 use anyhow::{Context, Result};
@@ -142,7 +143,7 @@ fn add(
         .is_some_and(|text| !known.contains(&text))
     {
         return Err(refuse(format!(
-            "runtime policy '{p}' conflicts with candidate configuration"
+            "runtime policy '{p}' conflicts with the root's configuration"
         )));
     }
     changes.push(Change {
@@ -150,21 +151,4 @@ fn add(
         contents: Some(wanted.into()),
     });
     Ok(())
-}
-
-/// Bind the producer's actual recab executable to the state/boot protocols it
-/// supports. Finalization never executes an inactive binary to ask its version.
-pub(crate) fn package_runtime(root: &Path, bin: &str) -> Result<()> {
-    let opened = Root::open(root)?;
-    let Some(mut file) = opened.open_resolved(Path::new(bin.trim_start_matches('/')))? else {
-        return Ok(());
-    };
-    let (major, minor) = match crate::state::StateSchema::default() {
-        crate::state::StateSchema::Current { major, minor } => (major, minor),
-        _ => unreachable!(),
-    };
-    let record = serde_json::json!({"version":1,"state_major":major,"state_minor_min":0,"state_minor_max":minor,"boot_protocol":3,"binary":bin.trim_start_matches('/'),"binary_digest":crate::generation::hash_reader(&mut file)?});
-    opened
-        .entry(Path::new("usr/lib/recab/runtime.json"), true)?
-        .write(&serde_json::to_vec(&record)?, 0o644)
 }

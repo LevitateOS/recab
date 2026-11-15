@@ -1,15 +1,16 @@
-//! How alike the two systems are. Reads both and changes neither: the other
-//! slot is mounted read-only without replaying its journal, under the run
-//! lock, so no other recab command works on it meanwhile. It is what
-//! `inventory` reads for one system, taken for both and set side by side.
+//! How alike the two roots are. Reads both and changes neither: the other
+//! root is read where it is mounted ([`crate::OTHER_MOUNT`]), else mounted
+//! read-only without replaying its journal, under the run lock.
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::generation::{Inventory, Node};
-use crate::slot_mount::SlotMount;
-use crate::{OtherSystem, Slot, System};
+use crate::ab::Running;
+use crate::inventory::{Inventory, Node};
+use crate::other::{Mounted, OTHER_MOUNT};
+use crate::target::require_root;
+use crate::Slot;
 
 /// The schema of [`Comparison`].
 pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
@@ -18,11 +19,8 @@ pub const COMPARISON_SCHEMA_VERSION: u32 = 1;
 const LISTED: usize = 5000;
 /// Folders are reported down to this many names below `/`.
 const FOLDER_DEPTH: usize = 3;
-/// Each system names its own partition in these; they differ by design.
-const OWN: &[&[u8]] = &[b"etc/fstab", b"usr/lib/recab/immutable"];
-/// Their modification times follow from the slot's own files being written,
-/// as in the generation digest.
-const OWN_TIMES: &[&[u8]] = &[b"etc/fstab", b"usr/lib/recab/immutable"];
+/// Each root names its own partition in these; they differ by design.
+const OWN: &[&[u8]] = crate::immutable::SLOT_FILES;
 
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -34,9 +32,6 @@ pub struct ComparedSystem {
     pub files: u64,
     /// Length of every file, each hard-linked file once.
     pub bytes: u64,
-    /// What the other system is to the running one; absent for the running one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub role: Option<OtherSystem>,
 }
 
 #[cfg_attr(feature = "contracts", derive(schemars::JsonSchema, ts_rs::TS))]
@@ -173,7 +168,7 @@ fn metadata_detail(running: &Node, other: &Node) -> Option<String> {
     // and that is listed by itself.
     if (running.modified, running.modified_ns) != (other.modified, other.modified_ns)
         && running.kind != "dir"
-        && !OWN_TIMES.contains(&running.path.as_slice())
+        && !OWN.contains(&running.path.as_slice())
     {
         detail.push("modification time".into());
     }
@@ -245,13 +240,17 @@ pub(crate) fn set_beside(
                 )),
             )),
             (Some(here), Some(there)) => {
-                if OWN.contains(path) && here.normalized.is_some() && here.normalized == there.normalized {
+                if OWN.contains(path)
+                    && here.normalized.is_some()
+                    && here.normalized == there.normalized
+                {
                     own.push(shown(path));
                     None
                 } else if here.content != there.content || here.link != there.link {
                     Some((DifferenceKind::Content, None))
                 } else {
-                    metadata_detail(here, there).map(|detail| (DifferenceKind::Metadata, Some(detail)))
+                    metadata_detail(here, there)
+                        .map(|detail| (DifferenceKind::Metadata, Some(detail)))
                 }
             }
             (None, None) => None,
@@ -266,7 +265,8 @@ pub(crate) fn set_beside(
             continue;
         };
         if change != DifferenceKind::Metadata
-            && (pair.0.is_some_and(|node| node.kind == "dir") || pair.1.is_some_and(|node| node.kind == "dir"))
+            && (pair.0.is_some_and(|node| node.kind == "dir")
+                || pair.1.is_some_and(|node| node.kind == "dir"))
             && pair.0.map(|node| node.kind.as_str()) != pair.1.map(|node| node.kind.as_str())
         {
             whole_folders.insert(*path);
@@ -278,7 +278,9 @@ pub(crate) fn set_beside(
         differences.push(Difference {
             path: shown(path),
             change,
-            running_bytes: pair.0.map_or(0, |node| whole(node, &running_folders, change)),
+            running_bytes: pair
+                .0
+                .map_or(0, |node| whole(node, &running_folders, change)),
             other_bytes: pair.1.map_or(0, |node| whole(node, &other_folders, change)),
             detail,
         });
@@ -322,31 +324,29 @@ fn tell(events: bool, event: serde_json::Value) {
 }
 
 fn step(events: bool, step: &str, status: &str) {
-    tell(events, serde_json::json!({"event": "step", "step": step, "status": status}));
+    tell(
+        events,
+        serde_json::json!({"event": "step", "step": step, "status": status}),
+    );
 }
 
-/// Read the running system and the other slot and set them side by side.
+/// Read the running system and the other root and set them side by side.
 /// With `events`, each step is reported on stderr as it starts and ends.
 pub fn compare(events: bool) -> Result<Comparison> {
-    // What the other system is, as `status` says it.
-    let role = crate::status::status(None)?.lifecycle.other;
-    let sys = System::locked("compare")?;
-    crate::filesystem::private_mounts()?;
-    let active = sys.boot.selection.active;
-    let inactive = active.other();
-    let side = |slot: Slot, role: Option<OtherSystem>| -> Result<ComparedSystem> {
-        let partuuid = sys.backend.slot_partuuid(&sys.boot, slot)?;
+    require_root("compare")?;
+    let running = Running::read()?;
+    let _lock = running.target.lock()?;
+    let side = |slot: Slot| -> Result<ComparedSystem> {
         Ok(ComparedSystem {
             slot: Some(slot),
-            device: target_root::device_with_tag("PARTUUID", &partuuid)?
+            device: target_root::device_with_tag("PARTUUID", running.record.uuid(slot))?
                 .map(|device| device.display().to_string()),
             files: 0,
             bytes: 0,
-            role,
         })
     };
-    let running = side(active, None)?;
-    let other = side(inactive, Some(role))?;
+    let booted = side(running.booted)?;
+    let other = side(running.other())?;
     tell(
         events,
         serde_json::json!({"event": "plan", "steps": [
@@ -357,22 +357,24 @@ pub fn compare(events: bool) -> Result<Comparison> {
     );
 
     step(events, "running", "running");
-    let running_inventory = Inventory::capture(&sys.target.root)?;
+    let running_inventory = Inventory::capture(&running.target.root)?;
     step(events, "running", "done");
 
     step(events, "other", "running");
-    let mount = SlotMount::open(&sys, inactive, &format!("compare-{}", crate::prepare::new_id()?))?;
-    let point = mount.point.clone();
-    let read = Inventory::capture(&mount.point);
-    let closed = mount.close();
-    // The mount point was made for this run alone.
-    let _ = std::fs::remove_dir(&point);
-    let other_inventory = read?;
-    closed?;
+    let other_inventory = match running.other_mount()? {
+        Some(point) => Inventory::capture(&point)?,
+        None => {
+            crate::filesystem::private_mounts()?;
+            let device = crate::other::device(running.record.uuid(running.other()))?;
+            let point = Path::new(OTHER_MOUNT).with_file_name("compare");
+            let mounted = Mounted::new(&device, &point, "ro,noload,nosuid,nodev,noexec")?;
+            Inventory::capture(&mounted.point)?
+        }
+    };
     step(events, "other", "done");
 
     step(events, "compare", "running");
-    let comparison = set_beside(&running_inventory, &other_inventory, running, other);
+    let comparison = set_beside(&running_inventory, &other_inventory, booted, other);
     step(events, "compare", "done");
     tell(events, serde_json::json!({"event": "done"}));
     Ok(comparison)
@@ -387,7 +389,6 @@ pub fn compare_roots(running: &Path, other: &Path) -> Result<Comparison> {
         device: None,
         files: 0,
         bytes: 0,
-        role: None,
     };
     Ok(set_beside(
         &Inventory::capture(running)?,

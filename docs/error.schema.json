@@ -15,17 +15,12 @@
         },
         {
           "const": "state_or_detection",
-          "description": "Refused, or the slots or state could not be read.",
+          "description": "Refused, or the roots or boot entries could not be read.",
           "type": "string"
         },
         {
           "const": "partial_update",
           "description": "Something changed and something did not; the message says what.",
-          "type": "string"
-        },
-        {
-          "const": "trial_failed",
-          "description": "A trial boot was not healthy and was not committed.",
           "type": "string"
         }
       ]

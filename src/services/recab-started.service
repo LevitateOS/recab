@@ -1,4 +1,5 @@
-# The trial service, packaged by `recab install-unit --init systemd`.
+# Packaged by `recab install-unit --init systemd`. It waits for startup to
+# finish; it must not be part of what startup waits for, so it is Type=exec.
 [Unit]
 Description=@DESCRIPTION@
 DefaultDependencies=no
@@ -8,7 +9,7 @@ IgnoreOnIsolate=yes
 
 [Service]
 Type=exec
-ExecStart=@RECAB@ trial
+ExecStart=@RECAB@ started
 
 [Install]
 WantedBy=@WANTED_BY@

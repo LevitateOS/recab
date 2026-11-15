@@ -1,26 +1,23 @@
 //! `recab init`: set up the boot layout of a freshly installed system, so
 //! the layout recab later reads and rewrites is written by recab: the
-//! target's systemd-boot on its ESP, the entries, the kernel, loader.conf and,
-//! for A/B, recab's state. The trial service comes enabled with recab's
-//! package.
+//! target's systemd-boot on its ESP, the entries, the kernels and
+//! loader.conf.
 //!
-//! A/B initialization delegates to the recoverable installation transaction:
-//! both personalized roots are equivalent and sealed before entries publish.
-//! Mutable: one entry for the one root, with the same options.
+//! A/B: see `installation`. Mutable: one entry for the one root.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::boot::Esp;
 use crate::error::refuse;
-use crate::store::Store;
-use crate::systemd_boot::SystemdBoot;
+use crate::installation::Installation;
 use crate::target::{partuuid, Target};
 use recpart::policy::STATE_MOUNT;
 
 /// The root partitions `init` writes entries for.
 #[derive(Debug, Clone)]
 pub enum InitLayout {
-    /// Slot A's partition (holding the installed system) and slot B's.
+    /// Root A's partition (holding the installed system) and root B's.
     Ab { slot_a: PathBuf, slot_b: PathBuf },
     /// The one root partition of a mutable install.
     Mutable { root_device: PathBuf },
@@ -29,7 +26,7 @@ pub enum InitLayout {
 /// The installed system `init` sets up.
 #[derive(Debug, Clone)]
 pub struct InitRequest {
-    /// The installed system's root, with its ESP and its state partition
+    /// The installed system's root, with its ESP and its `/var` partition
     /// mounted where the layout puts them (`boot/`, `var/`).
     pub root: PathBuf,
     pub layout: InitLayout,
@@ -41,41 +38,39 @@ pub struct InitRequest {
 
 /// Set up the system `target` (installed under `request.root`).
 pub(crate) fn run(target: Target, request: &InitRequest) -> Result<()> {
-    if let InitLayout::Ab { slot_a, slot_b } = &request.layout {
-        return crate::installation::run(target, request, slot_a, slot_b)
-            .map_err(|e| crate::error::or_class(e, crate::error::ErrorClass::StateOrDetection));
+    match &request.layout {
+        InitLayout::Ab { slot_a, slot_b } => {
+            crate::installation::run(target, request, slot_a, slot_b)
+        }
+        InitLayout::Mutable { root_device } => {
+            let uuid = partuuid(root_device)?;
+            check_mounts(&target, &request.layout, &uuid)?;
+            let esp = Esp::new(&target)?;
+            esp.install_loader()?;
+            esp.write_slot(
+                None,
+                &uuid,
+                &request.kernel,
+                request.initrd.as_deref(),
+                &request.options,
+            )?;
+            let id = format!("{}.conf", target.entry_prefix()?);
+            esp.write_loader_default(&id)?;
+            point_firmware(&id)
+        }
     }
-    if Store::new(&target).load()?.is_some() {
-        return Err(refuse(
-            "recab state already exists; init cannot reset an installed generation ledger",
-        ));
-    }
-    let InitLayout::Mutable { root_device } = &request.layout else {
-        unreachable!()
-    };
-    let uuid = partuuid(root_device)?;
-    check_mounts(&target, &request.layout, &uuid)?;
-    let entries = vec![(None, target.os_name()?, uuid)];
-    let entry = SystemdBoot::new(&target).install_layout(
-        &entries,
-        None,
-        &request.kernel,
-        request.initrd.as_deref(),
-        &request.options,
-    )?;
-    point_firmware(&entry)
 }
 
+/// Point this machine's firmware at the installed system's default entry,
+/// unless this machine runs an A/B installation of its own (installing from
+/// an installed system onto another disk): a previous install may have left
+/// systemd-boot variables naming another entry, and they win over loader.conf.
 pub(crate) fn point_firmware(default_entry: &str) -> Result<()> {
-    // The boot selection before recab's state. A previous install may have
-    // left systemd-boot variables naming another entry; they win over
-    // loader.conf. This machine's firmware boots the target only when this
-    // machine is not itself a recab install (installing from the live
-    // medium, not from an installed system onto another disk).
-    let host = SystemdBoot::new(&Target::running()?);
-    if host.is_ab()? {
+    let running = Target::running()?;
+    let host = Esp::new(&running)?;
+    if Installation::read(&running)?.is_some() {
         eprintln!(
-            "recab: note: this machine runs its own A/B install, so its firmware variables were left as they are; \
+            "recab: note: this machine runs its own A/B installation, so its firmware variables were left as they are; \
 the installed system boots '{default_entry}' from its own loader.conf"
         );
     } else if host.firmware_writable() {
@@ -85,8 +80,7 @@ the installed system boots '{default_entry}' from its own loader.conf"
     } else {
         eprintln!(
             "recab: warning: EFI variables are not available here (no efivarfs), so systemd-boot's \
-LoaderEntryDefault and LoaderEntryOneShot left by an earlier install could not be reset to '{default_entry}'; \
-reset them from compatible recovery media before booting this installation"
+LoaderEntryDefault and LoaderEntryOneShot left by an earlier install could not be reset to '{default_entry}'"
         );
     }
     Ok(())
