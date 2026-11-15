@@ -243,7 +243,7 @@ below, including the P11 lifecycle interfaces.
 The starting-point description below records the pre-implementation audit.
 
 Part of P11 was brought forward on 2026-11-10 for the desktop front ends
-(`gui/`): `status --json` schema 7 adds `lifecycle` (one state, what the other
+(`tools/gui/`): `status --json` schema 7 adds `lifecycle` (one state, what the other
 system is, whether a command runs now), `preparation.changes` (every finished
 change, with the caller's `--actor` label), and the text status prints both.
 It is derived from existing state only and adds no operation. Compiled with
@@ -875,7 +875,7 @@ remain unverified.
 ### P11 Expose the lifecycle in CLI and existing frontends
 
 Owners: recab `main.rs`, `status.rs`, `contract.rs`, schemas; `xtask` generation;
-`tui/apps/runtime/recab-tui`; install apps/docs-content. Depends on P05, P09, P10.
+`tools/tui/apps/runtime/recab-tui`; install apps/docs-content. Depends on P05, P09, P10.
 
 - Export operations, events and readiness/action views from recab. Generate
   schemas/TypeScript through the existing contract tooling. Remove UI assumptions
