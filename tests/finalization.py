@@ -207,8 +207,9 @@ try:
         for directory in ['etc','usr/lib/recab','usr/lib64','usr/bin','usr/share','usr/lib/systemd','sbin','var','root','run','tmp','dev','proc','sys','boot','home']:(root/directory).mkdir(parents=True,exist_ok=True)
         (root/'tmp').chmod(0o1777);(root/'root').chmod(0o700)
         for link,target in [('lib','usr/lib'),('lib64','usr/lib64'),('bin','usr/bin')]: (root/link).symlink_to(target)
-        install_elf(root,Path('/usr/bin/true'),'usr/lib/systemd/systemd' if args.init=='systemd' else 'sbin/openrc-init')
-        (root/'sbin/init').symlink_to('../usr/lib/systemd/systemd' if args.init=='systemd' else 'openrc-init')
+        install_elf(root,Path('/usr/bin/true'),'usr/lib/systemd/systemd' if args.init=='systemd' else 'sbin/openrc')
+        if args.init!='systemd': install_elf(root,Path('/usr/bin/true'),'usr/bin/busybox')
+        (root/'sbin/init').symlink_to('../usr/lib/systemd/systemd' if args.init=='systemd' else '../bin/busybox')
         install_elf(root,Path('/usr/bin/true'),'usr/bin/sh');install_elf(root,stripped,'usr/bin/recab')
         (root/'etc/os-release').write_text(f'ID=lev\nNAME=LevitateOS\nREC_INIT={args.init}\nREC_LIBC=glibc\nREC_FLAVOUR=base\nREC_PACKAGES=rpm\nREC_PRIVILEGE=sudo\nREC_DESKTOP=plasma\nREC_KERNEL_LINE=latest\nREC_APPEARANCE=light\n')
         if args.release_builder:

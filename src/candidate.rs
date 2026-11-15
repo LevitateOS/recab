@@ -151,11 +151,13 @@ pub(crate) fn check(request: Request<'_>) -> Result<Checked> {
     }
     let (machine, release) = kernel(kernel_path)?;
     crate::elf::executable(&opened, Path::new("sbin/init"), machine, &libc)?;
+    // OpenRC systems here boot busybox init (`sbin/init`, checked above),
+    // which runs the OpenRC manager; there is no `openrc-init` binary.
     crate::elf::executable(
         &opened,
         Path::new(match init {
             InitSystem::Systemd => "usr/lib/systemd/systemd",
-            InitSystem::Openrc => "sbin/openrc-init",
+            InitSystem::Openrc => "sbin/openrc",
         }),
         machine,
         &libc,
@@ -436,7 +438,9 @@ pub(crate) fn accounts(root: &Root) -> Result<()> {
     }
     for (name, g) in groups {
         for member in g[3].split(',').filter(|s| !s.is_empty()) {
-            if !passwd.contains_key(member) {
+            // Alpine's stock group file names the group itself as a member
+            // (`kvm:…:kvm`); that self-reference is not a missing user.
+            if member != name.as_str() && !passwd.contains_key(member) {
                 return Err(refuse("group contains unknown user"));
             }
         }

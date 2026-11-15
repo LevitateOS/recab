@@ -596,7 +596,7 @@ Ginux producers using a tiny native worker/loader runtime; boot/firmware observa
 
 The previously recorded release-image `ab-update` run on 2026-11-08 passed across seven boots on
 both LevitateOS (systemd) and AcornOS (OpenRC), using fresh A/B installations
-and live-tools images under the libvirt user session with OVMF. All eight
+and test-install-base images under the libvirt user session with OVMF. All eight
 scenarios in `test all` passed on each distro. This is historical evidence for
 those artifacts. It does not validate the current continuation, synchronization,
 matching initial slots, release merge or generation-bound trial recovery.

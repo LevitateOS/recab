@@ -129,7 +129,7 @@ class Updates:
                 else:digest.update(b'f');digest.update(hashlib.sha256(item.read_bytes()).digest())
         walk(source/'usr/lib/modules'/incoming_release)
         (source/'usr/lib/recab/kernel.json').write_text(json.dumps({'version':1,'release':incoming_release,'kernel_digest':incoming_hash,'modules_digest':digest.hexdigest()}))
-        (bundle/'.prepared-product.json').write_text(json.dumps({'product':'base-rootfs','distro_id':'levitate','rootfs_source_dir':'rootfs-source','overlay_dir':'overlay','rootfs_erofs':'filesystem.erofs','overlay_erofs':'overlay.erofs'}))
+        (bundle/'.prepared-product.json').write_text(json.dumps({'product':'test-base-rootfs','distro_id':'levitate','rootfs_source_dir':'rootfs-source','overlay_dir':'overlay','rootfs_erofs':'filesystem.erofs','overlay_erofs':'overlay.erofs'}))
         (bundle/'system-sources.sha256').write_text(hashlib.sha256(b'genuine P08 native fixture').hexdigest()+'\n')
         (bundle/'boot').mkdir();shutil.copyfile(incoming_kernel,bundle/'boot/vmlinuz');shutil.copyfile(incoming_initrd,bundle/'boot/initramfs-installed.img')
         driver=base/'release-input-check'

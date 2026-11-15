@@ -35,7 +35,7 @@ def exercise(h,active):
     for path in ['usr/share/release-linked','usr/share/release-owned']:
         manifest['entries'][path]={'kind':'file','uid':1234,'gid':5678,'mode':0o640,'sha256':hashlib.sha256(owned.read_bytes()).hexdigest(),'xattrs':{'user.release':b'authored'.hex()}}
     (source/'.recipe-target-metadata.json').write_text(json.dumps(manifest))
-    (bundle/'.prepared-product.json').write_text(json.dumps({'product':'base-rootfs','distro_id':'levitate','rootfs_source_dir':'rootfs-source','overlay_dir':'overlay','rootfs_erofs':'filesystem.erofs','overlay_erofs':'overlay.erofs'}))
+    (bundle/'.prepared-product.json').write_text(json.dumps({'product':'test-base-rootfs','distro_id':'levitate','rootfs_source_dir':'rootfs-source','overlay_dir':'overlay','rootfs_erofs':'filesystem.erofs','overlay_erofs':'overlay.erofs'}))
     (bundle/'system-sources.sha256').write_text(hashlib.sha256(b'real native P07 fixture input tree').hexdigest()+'\n')
     (bundle/'boot').mkdir();shutil.copyfile(h['KERNEL'],bundle/'boot/vmlinuz');shutil.copyfile(h['initrd'],bundle/'boot/initramfs-installed.img')
     driver=base/'release-input-check'
