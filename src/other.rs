@@ -16,7 +16,7 @@ use crate::error::refuse;
 pub const OTHER_MOUNT: &str = "/run/recab/other";
 
 /// `BLKROSET`: set a block device's read-only flag.
-const BLKROSET: libc::c_ulong = 0x125d;
+const BLKROSET: libc::Ioctl = 0x125d;
 
 /// The one block device with PARTUUID `uuid`.
 pub(crate) fn device(uuid: &str) -> Result<PathBuf> {
