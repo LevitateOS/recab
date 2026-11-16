@@ -218,7 +218,7 @@ impl Esp {
             }
         }
         let title = match slot {
-            Some(slot) => format!("{} (Slot {slot})", self.target.os_name()?),
+            Some(slot) => format!("{} (root {slot})", self.target.os_name()?),
             None => self.target.os_name()?,
         };
         let entry = Entry::new(
