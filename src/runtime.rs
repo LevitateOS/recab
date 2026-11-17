@@ -1,5 +1,8 @@
 //! What a read-only root needs to run: links and drop-ins that keep
 //! services from writing to it. Installed with recab's package and by `init`.
+//! The NetworkManager part (resolv.conf, the conf.d drop-in) applies only to a
+//! root that has NetworkManager, which the `network` group installs; the boot
+//! step runs after the software step, so a desktop install has it by then.
 use crate::error::refuse;
 use crate::filesystem::Root;
 use anyhow::{Context, Result};
@@ -9,6 +12,9 @@ use std::path::Path;
 const DROPIN: &str = "[Unit]\nConditionKernelCommandLine=!recab.immutable\n";
 const NM_DYNAMIC: &str = "[main]\nrc-manager=symlink\n";
 const NM_STATIC: &str = "[main]\nrc-manager=unmanaged\n";
+/// The `network` group's NetworkManager program, on both OSes (Fedora and
+/// Alpine ship it in usr/sbin; a merged-/usr root may list it in usr/bin).
+const NM_PROGRAMS: &[&str] = &["usr/sbin/NetworkManager", "usr/bin/NetworkManager"];
 const CLOCK: &str = "# recab immutable clock\nclock_adjfile=\"NO\"\n";
 const SKIP_UNITS: &[&str] = &[
     "systemd-remount-fs.service",
@@ -30,7 +36,16 @@ impl Policy {
     pub fn check(root: &Path, init: InitSystem) -> Result<Self> {
         let opened = Root::open(root)?;
         let mut changes = Vec::new();
+        // NetworkManager is the `network` group's, not the base's: a root
+        // without it keeps its resolv.conf as it is, and gets no drop-in.
+        let mut has_nm = false;
+        for program in NM_PROGRAMS {
+            has_nm |= opened.file_type(Path::new(program))?.is_some();
+        }
         for p in ["etc/mtab", "etc/resolv.conf"] {
+            if p == "etc/resolv.conf" && !has_nm {
+                continue;
+            }
             let meta = opened
                 .file_type(Path::new(p))
                 .with_context(|| format!("checking runtime policy {p}"))?;
@@ -60,16 +75,18 @@ impl Policy {
                 }),
             }
         }
-        let static_dns = opened
-            .file_type(Path::new("etc/resolv.conf"))?
-            .is_some_and(|m| m == libc::S_IFREG);
-        add(
-            &opened,
-            &mut changes,
-            "etc/NetworkManager/conf.d/90-recab-immutable.conf",
-            if static_dns { NM_STATIC } else { NM_DYNAMIC },
-            &[NM_STATIC, NM_DYNAMIC],
-        )?;
+        if has_nm {
+            let static_dns = opened
+                .file_type(Path::new("etc/resolv.conf"))?
+                .is_some_and(|m| m == libc::S_IFREG);
+            add(
+                &opened,
+                &mut changes,
+                "etc/NetworkManager/conf.d/90-recab-immutable.conf",
+                if static_dns { NM_STATIC } else { NM_DYNAMIC },
+                &[NM_STATIC, NM_DYNAMIC],
+            )?;
+        }
         if init == InitSystem::Systemd {
             for unit in SKIP_UNITS {
                 add(
