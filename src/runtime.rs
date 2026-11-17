@@ -57,8 +57,8 @@ impl Policy {
             match meta {
                 Some(libc::S_IFLNK) => {
                     let link = opened.entry(Path::new(p), false)?.read_link()?;
-                    if link != Path::new(target)
-                        && !(p == "etc/mtab" && link == Path::new("/proc/mounts"))
+                    if !names_target(&link, "/etc", target)
+                        && !(p == "etc/mtab" && names_target(&link, "/etc", "/proc/mounts"))
                     {
                         return Err(refuse(format!(
                             "{p} does not use the supported runtime target"
@@ -137,6 +137,31 @@ impl Policy {
         }
         Ok(())
     }
+}
+/// Whether the symlink target `link`, resolved lexically from the directory
+/// `dir` (never followed on the host: the root may be mounted elsewhere),
+/// names `wanted`. Absolute and relative spellings (`/proc/self/mounts`,
+/// `../proc/self/mounts`) are both the distributions' own.
+fn names_target(link: &Path, dir: &str, wanted: &str) -> bool {
+    use std::path::Component;
+    let mut parts: Vec<&std::ffi::OsStr> = Vec::new();
+    let start = if link.is_absolute() { "" } else { dir };
+    for c in Path::new(start).components().chain(link.components()) {
+        match c {
+            Component::Normal(n) => parts.push(n),
+            Component::ParentDir => {
+                parts.pop();
+            }
+            _ => {}
+        }
+    }
+    parts
+        .iter()
+        .copied()
+        .eq(Path::new(wanted).components().filter_map(|c| match c {
+            Component::Normal(n) => Some(n),
+            _ => None,
+        }))
 }
 fn add(
     root: &Root,
