@@ -40,7 +40,18 @@ impl Policy {
         // without it keeps its resolv.conf as it is, and gets no drop-in.
         let mut has_nm = false;
         for program in NM_PROGRAMS {
-            has_nm |= opened.file_type(Path::new(program))?.is_some();
+            // A merged-/usr root links usr/sbin to bin, so that spelling is not a directory there; usr/bin finds it.
+            has_nm |= match opened.file_type(Path::new(program)) {
+                Ok(kind) => kind.is_some(),
+                Err(err) => match err
+                    .chain()
+                    .find_map(|e| e.downcast_ref::<std::io::Error>())
+                    .and_then(|io| io.raw_os_error())
+                {
+                    Some(libc::ENOTDIR | libc::ELOOP) => false,
+                    _ => return Err(err),
+                },
+            };
         }
         for p in ["etc/mtab", "etc/resolv.conf"] {
             if p == "etc/resolv.conf" && !has_nm {
